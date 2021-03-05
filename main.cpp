@@ -3,17 +3,13 @@
 
 using namespace cv;
 
-const double PI=3.141592653589793;
-
-float recogn_thresh=0.8;
-
-const int rfactor = 4;
-Size img_shape={160, 120}, display_shape=img_shape*rfactor, features_model_shpae={96, 96};
-
 int main(int argc, char *argv[])
 {
+    float recogn_thresh=0.8;
+    const int rfactor = 4;
+    Size img_shape={160, 120}, display_shape=img_shape*rfactor, features_model_shpae={96, 96};
     String detection_model = "./models/YuFaceDetectNet.onnx";
-    String recognize_model = "./models/nn4.small2.v1.t7";
+    String recognize_model = "./models/openface.nn4.small2.v1.t7";
     String data_path = "./data/";
 
     Detector detector(detection_model, img_shape);
