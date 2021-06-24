@@ -5,7 +5,7 @@ using namespace cv;
 
 int main(int argc, char *argv[])
 {
-    float recogn_thresh=0.8;
+    float recogn_thresh=0.4;
     const int rfactor = 4;
     Size img_shape={160, 120}, display_shape=img_shape*rfactor, features_model_shpae={96, 96};
     String detection_model = "./models/YuFaceDetectNet.onnx";
@@ -14,7 +14,7 @@ int main(int argc, char *argv[])
 
     Detector detector(detection_model, img_shape);
     FeatureExtractor extractor(recognize_model, features_model_shpae);
-    FeatureDatabase<NormSimilarity> database(data_path, detector,extractor,
+    FeatureDatabase<CosSimilarity> database(data_path, detector,extractor,
                                              display_shape, rfactor, recogn_thresh);
 
     cv::VideoCapture cap;
@@ -45,7 +45,7 @@ int main(int argc, char *argv[])
                 float max_similar;
                 std::string max_name;
                 for (const auto& feature : features) {
-                    if (database.select_max_mean_similarity(feature, max_similar,
+                    if (database.select_max_similarity(feature, max_similar,
                                                             max_name)) {
                     } else {
                         max_name = std::string("Unknown");
