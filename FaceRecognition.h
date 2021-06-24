@@ -55,14 +55,21 @@ private:
 bool features_from_img(cv::Mat& img, Detector& detector, FeatureExtractor& extractor,
                        std::vector<cv::Mat>& features, const cv::Size& display_shape, int rfactor);
 
+bool feauture_fusion(std::vector<cv::Mat> &features, cv::Mat &feature);
+
 class Similarity {
 public:
-    virtual double similarity(const cv::Mat& featureA, const cv::Mat& featureB)=0;
+    virtual double similarity(const cv::Mat& feature, const cv::Mat& ref_feature)=0;
 };
 
 class NormSimilarity: public Similarity {
 public:
-    double similarity(const cv::Mat& featureA, const cv::Mat& featureB) override;
+    double similarity(const cv::Mat& feature, const cv::Mat& ref_feature) override;
+};
+
+class CosSimilarity: public Similarity {
+public:
+    double similarity(const cv::Mat& feature, const cv::Mat& ref_feature) override;
 };
 
 template<typename T>
@@ -92,7 +99,14 @@ public:
                 features[0].copyTo(t);
                 temp.emplace_back(std::move(t));
             }
-            feature_database.emplace_back(std::move(temp));
+            cv::Mat fused_feature;
+            if (!temp.empty()) {
+                temp[0].copyTo(fused_feature);
+                feauture_fusion(temp, fused_feature);
+                cv::normalize(fused_feature, temp[0]);
+                temp[0].copyTo(fused_feature);
+            }
+            feature_database.emplace_back(std::move(fused_feature));
         }
         data_len = feature_database.size();
     }
@@ -119,12 +133,30 @@ public:
         }
         return similarity >= threshold;
     }
+
+    bool select_max_similarity(const cv::Mat& feature, float& similarity,
+                                    std::string& name) {
+        double total;
+        similarity = -1.;
+        if (feature.empty()) { return false; }
+        for (int i = 0; i < data_len; ++i) {
+            const cv::Mat &ref_feature = feature_database[i];
+            if (ref_feature.empty()) { continue; }
+            total = similar_calculator->similarity(feature, ref_feature);
+            if (similarity < total) {
+                similarity = total;
+                name = names[i + 2];
+            }
+        }
+        return similarity >= threshold;
+    }
+
     size_t size() const { return data_len; }
     friend void read_directory(const std::string& name, std::vector<std::string> &v);
 private:
     std::string path;
     Similarity *similar_calculator;
-    std::vector<std::vector<cv::Mat>> feature_database;
+    std::vector<cv::Mat> feature_database;
     std::vector<std::string> names;
     size_t data_len;
     float threshold;
