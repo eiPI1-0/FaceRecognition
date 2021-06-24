@@ -4,6 +4,7 @@
 
 #include "FaceRecognition.h"
 
+#include <opencv2/core.hpp>
 #include <utility>
 
 const double PI = 3.141592653589793;
@@ -103,6 +104,17 @@ bool features_from_img(cv::Mat &img, Detector &detector, FeatureExtractor &extra
     return true;
 }
 
+bool feauture_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) {
+    if (features.size() == 1) { feature = features[0]; }
+    feature.setTo(cv::Scalar::all(0.0));
+    for (auto& i: features) {
+        cv::Mat t;
+        cv::normalize(i, t);
+        feature += t;
+    }
+    return true;
+}
+
 FeatureExtractor::FeatureExtractor(const std::string &model_path,
                                    cv::Size input_shape,
                                    cv::dnn::Backend backend,
@@ -122,6 +134,12 @@ cv::Mat FeatureExtractor::extract(const cv::Mat &img) {
     return output;
 }
 
-double NormSimilarity::similarity(const cv::Mat &featureA, const cv::Mat &featureB) {
-    return 2-cv::norm(featureA - featureB);
+double NormSimilarity::similarity(const cv::Mat &feature, const cv::Mat &ref_feature) {
+    cv::Mat t;
+    cv::normalize(feature, t);
+    return 2-cv::norm(t - ref_feature);
+}
+
+double CosSimilarity::similarity(const cv::Mat &feature, const cv::Mat &ref_feature) {
+    return feature.dot(ref_feature) / (cv::norm(feature));
 }
