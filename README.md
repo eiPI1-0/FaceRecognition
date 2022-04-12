@@ -20,7 +20,7 @@ The registered user's data is a subfolder named by user name and filled with the
 
 Path: `FaceRecognition/models/`
 
-Use https://github.com/ShiqiYu/libfacedetection.train/blob/master/tasks/task1/onnx/YuFaceDetectNet.onnx as detection model by default.
+Use https://github.com/ShiqiYu/libfacedetection.train/blob/master/tasks/task1/onnx/yunet_120x160.onnx as detection model by default.
 
 Use https://github.com/pyannote/pyannote-data/blob/master/openface.nn4.small2.v1.t7 as extraction model by default.
 
