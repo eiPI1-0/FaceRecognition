@@ -103,8 +103,6 @@ public:
             if (!temp.empty()) {
                 temp[0].copyTo(fused_feature);
                 feauture_fusion(temp, fused_feature);
-                cv::normalize(fused_feature, temp[0]);
-                temp[0].copyTo(fused_feature);
             }
             feature_database.emplace_back(std::move(fused_feature));
         }
