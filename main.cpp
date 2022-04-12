@@ -8,7 +8,7 @@ int main(int argc, char *argv[])
     float recogn_thresh=0.4;
     const int rfactor = 4;
     Size img_shape={160, 120}, display_shape=img_shape*rfactor, features_model_shpae={96, 96};
-    String detection_model = "./models/YuFaceDetectNet.onnx";
+    String detection_model = "./models/yunet_120x160.onnx";
     String recognize_model = "./models/openface.nn4.small2.v1.t7";
     String data_path = "./data/";
 
