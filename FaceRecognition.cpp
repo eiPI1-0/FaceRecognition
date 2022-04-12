@@ -110,7 +110,7 @@ bool feauture_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) {
     for (auto& i: features) {
         cv::Mat t;
         cv::normalize(i, t);
-        feature += t;
+        cv::normalize(feature+t, feature);
     }
     return true;
 }
