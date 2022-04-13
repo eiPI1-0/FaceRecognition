@@ -55,21 +55,22 @@ private:
 bool features_from_img(cv::Mat& img, Detector& detector, FeatureExtractor& extractor,
                        std::vector<cv::Mat>& features, const cv::Size& display_shape, int rfactor);
 
-bool feauture_fusion(std::vector<cv::Mat> &features, cv::Mat &feature);
-
 class Similarity {
 public:
     virtual double similarity(const cv::Mat& feature, const cv::Mat& ref_feature)=0;
+    virtual bool feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature)=0;
 };
 
 class NormSimilarity: public Similarity {
 public:
     double similarity(const cv::Mat& feature, const cv::Mat& ref_feature) override;
+    bool feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) override;
 };
 
 class CosSimilarity: public Similarity {
 public:
     double similarity(const cv::Mat& feature, const cv::Mat& ref_feature) override;
+    bool feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) override;
 };
 
 template<typename T>
@@ -100,10 +101,7 @@ public:
                 temp.emplace_back(std::move(t));
             }
             cv::Mat fused_feature;
-            if (!temp.empty()) {
-                temp[0].copyTo(fused_feature);
-                feauture_fusion(temp, fused_feature);
-            }
+            similar_calculator->feature_fusion(temp, fused_feature);
             feature_database.emplace_back(std::move(fused_feature));
         }
         data_len = feature_database.size();
