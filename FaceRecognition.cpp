@@ -104,17 +104,6 @@ bool features_from_img(cv::Mat &img, Detector &detector, FeatureExtractor &extra
     return true;
 }
 
-bool feauture_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) {
-    if (features.size() == 1) { feature = features[0]; }
-    feature.setTo(cv::Scalar::all(0.0));
-    for (auto& i: features) {
-        cv::Mat t;
-        cv::normalize(i, t);
-        cv::normalize(feature+t, feature);
-    }
-    return true;
-}
-
 FeatureExtractor::FeatureExtractor(const std::string &model_path,
                                    cv::Size input_shape,
                                    cv::dnn::Backend backend,
@@ -140,6 +129,27 @@ double NormSimilarity::similarity(const cv::Mat &feature, const cv::Mat &ref_fea
     return 2-cv::norm(t - ref_feature);
 }
 
+bool NormSimilarity::feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) {
+    if (features.empty()) { return false; }
+    features[0].copyTo(feature);
+    for (auto& i: features) {
+        feature = (feature + i) / 2.0;
+    }
+    return true;
+}
+
 double CosSimilarity::similarity(const cv::Mat &feature, const cv::Mat &ref_feature) {
     return feature.dot(ref_feature) / (cv::norm(feature));
+}
+
+bool CosSimilarity::feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) {
+    if (features.empty()) { return false; }
+    features[0].copyTo(feature);
+    feature.setTo(cv::Scalar::all(0.0));
+    for (auto& i: features) {
+        cv::Mat t;
+        cv::normalize(i, t);
+        cv::normalize(feature+t, feature);
+    }
+    return true;
 }
