@@ -5,11 +5,11 @@ using namespace cv;
 
 int main(int argc, char *argv[])
 {
-    float recogn_thresh=0.4;
-    const int rfactor = 4;
-    Size img_shape={160, 120}, display_shape=img_shape*rfactor, features_model_shpae={96, 96};
+    float recogn_thresh=0.2;
+    const int rfactor = 5;
+    Size img_shape={160, 120}, display_shape=img_shape*rfactor, features_model_shpae={112, 112};
     String detection_model = "./models/yunet_120x160.onnx";
-    String recognize_model = "./models/openface.nn4.small2.v1.t7";
+    String recognize_model = "./models/mobilefacenet.onnx";
     String data_path = "./data/";
 
     Detector detector(detection_model, img_shape);

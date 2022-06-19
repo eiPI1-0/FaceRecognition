@@ -96,9 +96,12 @@ bool features_from_img(cv::Mat &img, Detector &detector, FeatureExtractor &extra
             features.emplace_back(cv::Mat());
             continue;
         }
-        face_alignment(face, face, i.landmarks.left_eye, i.landmarks.right_eye,
-                       i.landmarks.left_eye, i.landmarks.right_eye);
+        auto left_eye = i.landmarks.left_eye*rfactor;
+        auto right_eye = i.landmarks.right_eye*rfactor;
+        face_alignment(img, face, left_eye, right_eye, left_eye, right_eye);
+        face = cv::Mat(face, face_area);
         features.emplace_back(std::move(extractor.extract(face)));
+        // cv::imshow("algned", face);
     }
 
     return true;
@@ -118,6 +121,7 @@ cv::Mat FeatureExtractor::extract(const cv::Mat &img) {
     cv::Mat blob_faceAligned, output;
     cv::dnn::blobFromImage(img, blob_faceAligned, 1. / 255.,
                            input_shape, cv::Scalar(), true, false);
+    blob_faceAligned = (blob_faceAligned - 0.5) / 0.5;
     model.setInput(blob_faceAligned);
     model.forward().copyTo(output);
     return output;
