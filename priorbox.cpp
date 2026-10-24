@@ -69,9 +69,14 @@ std::vector<Face> PriorBox::decode(const cv::Mat& loc,
                                    const float ignore_score) {
     std::vector<Face> dets; // num * [x1, y1, x2, y2, x_re, y_re, x_le, y_le, x_ml, y_ml, x_n, y_n, x_mr, y_ml]
 
-    float* loc_v = (float*)(loc.data);
-    float* conf_v = (float*)(conf.data);
-    float* iou_v = (float*)(iou.data);
+    if (loc.type() != CV_32F || conf.type() != CV_32F || iou.type() != CV_32F ||
+        !loc.isContinuous() || !conf.isContinuous() || !iou.isContinuous()) {
+        return dets;
+    }
+
+    const float* loc_v = loc.ptr<float>(0);
+    const float* conf_v = conf.ptr<float>(0);
+    const float* iou_v = iou.ptr<float>(0);
     for (auto i = 0; i < priors.size(); ++i) {
         // get score
         float cls_score = conf_v[i*2+1];

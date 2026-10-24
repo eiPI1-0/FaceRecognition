@@ -1,30 +1,30 @@
-//
-// Created by eipi10 on 1/30/21.
-//
-
 #ifndef FACERECOGNITION_FACERECOGNITION_H
 #define FACERECOGNITION_FACERECOGNITION_H
 
 #include <string>
 #include <vector>
-#include <dirent.h>
+#include <memory>
+#include <utility>
+
 #include "priorbox.hpp"
 #include "utils.hpp"
 
 #include "opencv2/opencv.hpp"
 
-void read_directory(const std::string& name, std::vector<std::string> &v);
+class FeatureExtractor;
 
 class Detector {
 public:
     Detector(const std::string& model_path, cv::Size input_shape,
-             float conf_thresh=0.6, float nms_thresh=0.3, int keep_top_k=750,
-             cv::dnn::Backend backend=cv::dnn::DNN_BACKEND_OPENCV,
-             cv::dnn::Target target=cv::dnn::DNN_TARGET_CPU);
+             float conf_thresh = 0.6f, float nms_thresh = 0.3f, int keep_top_k = 750,
+             cv::dnn::Backend backend = cv::dnn::DNN_BACKEND_OPENCV,
+             cv::dnn::Target target = cv::dnn::DNN_TARGET_CPU);
+    // 检测结果的 bbox/landmarks 坐标系相对于 input_shape（160x120）。
     std::vector<Face>& detect(cv::Mat& img);
     size_t size() const;
     std::vector<Face>& faces();
     cv::Size& shape();
+
 private:
     cv::dnn::Net model;
     cv::Size input_shape;
@@ -34,137 +34,136 @@ private:
     std::vector<cv::String> output_names = {"loc", "conf", "iou"};
     std::vector<cv::Mat> output_blobs;
     std::vector<Face> dets;
-    size_t detected_nums;
+    size_t detected_nums = 0;
 };
 
-void face_alignment(const cv::Mat& img, cv::Mat& faceImagAligned,
-                    const cv::Point& left_eye, const cv::Point& right_eye,
-                    const cv::Point& left_eye_ref, const cv::Point& right_eye_ref);
+// 对齐单张人脸 ROI 到固定尺寸（默认 112x112），供嵌入提取使用。
+// left_eye / right_eye 均为 face_roi 内的坐标。
+cv::Mat align_face(const cv::Mat& face_roi,
+                   const cv::Point2f& left_eye,
+                   const cv::Point2f& right_eye,
+                   const cv::Size& output_size = cv::Size(112, 112));
+
+// 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
+// det 的 bbox/landmarks 坐标系与 detection_shape 一致（默认 160x120），
+// 内部自动映射到原图坐标系后再做裁剪与对齐。
+cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
+                             FeatureExtractor& extractor,
+                             const cv::Size& detection_shape,
+                             const cv::Size& output_size = cv::Size(112, 112));
 
 class FeatureExtractor {
 public:
     FeatureExtractor(const std::string& model_path, cv::Size input_shape,
-                     cv::dnn::Backend backend=cv::dnn::DNN_BACKEND_OPENCV,
-                     cv::dnn::Target target=cv::dnn::DNN_TARGET_CPU);
+                     cv::dnn::Backend backend = cv::dnn::DNN_BACKEND_OPENCV,
+                     cv::dnn::Target target = cv::dnn::DNN_TARGET_CPU);
     cv::Mat extract(const cv::Mat& img);
+
 private:
     cv::dnn::Net model;
     cv::Size input_shape;
 };
 
+// 检测 + 逐人脸对齐 + 特征提取。内部会 clone 输入图，不修改调用方传入的 img。
 bool features_from_img(cv::Mat& img, Detector& detector, FeatureExtractor& extractor,
                        std::vector<cv::Mat>& features, const cv::Size& display_shape, int rfactor);
 
 class Similarity {
 public:
-    virtual double similarity(const cv::Mat& feature, const cv::Mat& ref_feature)=0;
-    virtual bool feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature)=0;
+    virtual double similarity(const cv::Mat& feature, const cv::Mat& ref_feature) = 0;
+    virtual bool feature_fusion(std::vector<cv::Mat>& features, cv::Mat& feature) = 0;
+    virtual ~Similarity() = default;
 };
 
-class NormSimilarity: public Similarity {
+class NormSimilarity : public Similarity {
 public:
     double similarity(const cv::Mat& feature, const cv::Mat& ref_feature) override;
-    bool feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) override;
+    bool feature_fusion(std::vector<cv::Mat>& features, cv::Mat& feature) override;
 };
 
-class CosSimilarity: public Similarity {
+class CosSimilarity : public Similarity {
 public:
     double similarity(const cv::Mat& feature, const cv::Mat& ref_feature) override;
-    bool feature_fusion(std::vector<cv::Mat> &features, cv::Mat &feature) override;
+    bool feature_fusion(std::vector<cv::Mat>& features, cv::Mat& feature) override;
 };
+
+// 列出 data_path 下所有人脸注册目录（排除 . / .. 及非目录条目），结果已排序，确保确定性。
+std::vector<std::string> list_person_dirs(const std::string& path);
 
 template<typename T>
 class FeatureDatabase {
 public:
     FeatureDatabase(std::string data_path, Detector& detector,
                     FeatureExtractor& extractor, const cv::Size& display_shape,
-                    int rfactor, float threshold=0.8):
-            path(std::move(data_path)), threshold(threshold), similar_calculator(new T()) {
-        read_directory(path, names);
-        std::vector<std::string> photos;
-        cv::Mat k;
-        std::vector<cv::Mat> features;
-        for (auto i = 2; i < names.size(); ++i) {
-            cv::glob(path + names[i], photos);
-            std::vector<cv::Mat> temp;
-            for (const auto& j: photos) {
-                k = cv::imread(j);
-                if (features_from_img(k, detector, extractor, features,
-                                      display_shape, rfactor)) {
-                    std::cout << "\t" << detector.size() << " faces loaded from: " << j << std::endl;
-                } else {
-                    std::cout << "\tNo faces loaded from: " << j << std::endl;
-                    continue;
-                }
-                cv::Mat t;
-                features[0].copyTo(t);
-                temp.emplace_back(std::move(t));
-            }
-            cv::Mat fused_feature;
-            similar_calculator->feature_fusion(temp, fused_feature);
-            feature_database.emplace_back(std::move(fused_feature));
-        }
-        data_len = feature_database.size();
+                    int rfactor, float threshold = 0.8f)
+        : path(std::move(data_path)), threshold(threshold),
+          similar_calculator(std::make_unique<T>()) {
+        load_database(detector, extractor, display_shape, rfactor);
     }
 
-    ~FeatureDatabase() { free(similar_calculator); }
-
-    bool select_max_mean_similarity(const cv::Mat& feature, float& similarity,
-                                    std::string& name) {
-        double total;
-        similarity = -1.;
-        if (feature.empty()) { return false; }
-        for (int i = 0; i < data_len; ++i) {
-            const std::vector<cv::Mat> &ref_features = feature_database[i];
-            if (ref_features.empty()) { continue; }
-            total = 0.;
-            for (const cv::Mat &ref_feature : ref_features) {
-                total += similar_calculator->similarity(feature, ref_feature);
-            }
-            total /= double(ref_features.size());
-            if (similarity < total) {
-                similarity = total;
-                name = names[i + 2];
-            }
-        }
-        return similarity >= threshold;
-    }
+    ~FeatureDatabase() = default;
 
     bool select_max_similarity(const cv::Mat& feature, float& similarity,
-                                    std::string& name) {
-        double total;
-        similarity = -1.;
-        if (feature.empty()) { return false; }
-        for (int i = 0; i < data_len; ++i) {
-            const cv::Mat &ref_feature = feature_database[i];
-            if (ref_feature.empty()) { continue; }
-            total = similar_calculator->similarity(feature, ref_feature);
-            if (similarity < total) {
-                similarity = total;
-                name = names[i + 2];
+                               std::string& name) {
+        similarity = -1.0f;
+        if (feature.empty()) {
+            return false;
+        }
+        for (const auto& entry : feature_database) {
+            const std::string& person_name = entry.first;
+            const cv::Mat& ref_feature = entry.second;
+            if (ref_feature.empty()) {
+                continue;
+            }
+            double sim = similar_calculator->similarity(feature, ref_feature);
+            if (similarity < sim) {
+                similarity = static_cast<float>(sim);
+                name = person_name;
             }
         }
         return similarity >= threshold;
     }
 
-    size_t size() const { return data_len; }
-    friend void read_directory(const std::string& name, std::vector<std::string> &v);
+    size_t size() const { return feature_database.size(); }
+
 private:
+    void load_database(Detector& detector, FeatureExtractor& extractor,
+                       const cv::Size& display_shape, int rfactor) {
+        std::vector<std::string> person_dirs = list_person_dirs(path);
+
+        std::vector<cv::String> photos;
+        for (const auto& person : person_dirs) {
+            std::vector<cv::Mat> person_features;
+            std::string glob_pattern = path + "/" + person + "/*";
+            cv::glob(glob_pattern, photos);
+            for (const auto& photo : photos) {
+                cv::Mat img = cv::imread(photo);
+                if (img.empty()) {
+                    continue;
+                }
+                std::vector<cv::Mat> feats;
+                if (features_from_img(img, detector, extractor, feats,
+                                      display_shape, rfactor) &&
+                    !feats.empty() && !feats[0].empty()) {
+                    person_features.push_back(feats[0].clone());
+                }
+            }
+            photos.clear();
+
+            if (!person_features.empty()) {
+                cv::Mat fused;
+                if (similar_calculator->feature_fusion(person_features, fused)) {
+                    feature_database.emplace_back(person, std::move(fused));
+                }
+            }
+        }
+    }
+
     std::string path;
-    Similarity *similar_calculator;
-    std::vector<cv::Mat> feature_database;
-    std::vector<std::string> names;
-    size_t data_len;
+    std::unique_ptr<Similarity> similar_calculator;
+    // 每人一份融合后的特征，按人名显式配对，不再依赖 readdir 顺序与 i=2 假设
+    std::vector<std::pair<std::string, cv::Mat>> feature_database;
     float threshold;
 };
 
-class FaceRecognition {
-public:
-    FaceRecognition(float recogn_thresh=0.9);
-private:
-    cv::dnn::Net detector, feature_extractor;
-    float conf_thresh, nms_thresh, recogn_thresh;
-    int keep_top_k;
-};
-
-#endif //FACERECOGNITION_FACERECOGNITION_H
+#endif // FACERECOGNITION_FACERECOGNITION_H

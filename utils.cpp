@@ -1,22 +1,25 @@
 #include "utils.hpp"
 
-// dets is of dimension [num, 15], which is 
-// num * [x1, y1, x2, y2, x_re, y_re, x_le, y_le, x_ml, y_ml, x_n, y_n, x_mr, y_ml, label]
 void nms(std::vector<Face>& dets,
          const float thresh) {
     std::sort(dets.begin(), dets.end(), [](const Face& a, const Face& b) { return a.score > b.score; });
 
-    // std::vector<Face> post_nms;
-    std::vector<bool> isSuppressed(dets.size(), false);
-    for (auto i = 0; i < dets.size(); ++i) {
-        if (isSuppressed[i]) { continue; }
+    std::vector<Face> kept;
+    kept.reserve(dets.size());
+    std::vector<bool> suppressed(dets.size(), false);
 
-        // area of i bbox
-        float area_i = dets[i].bbox.area();
-        for (auto j = i + 1; j < dets.size(); ++j) {
-            if (isSuppressed[j]) { continue; }
+    for (size_t i = 0; i < dets.size(); ++i) {
+        if (suppressed[i]) {
+            continue;
+        }
+        kept.push_back(dets[i]);
 
-            // area of intersection
+        const float area_i = dets[i].bbox.area();
+        for (size_t j = i + 1; j < dets.size(); ++j) {
+            if (suppressed[j]) {
+                continue;
+            }
+
             float ix1 = std::max(dets[i].bbox.top_left.x, dets[j].bbox.top_left.x);
             float iy1 = std::max(dets[i].bbox.top_left.y, dets[j].bbox.top_left.y);
             float ix2 = std::min(dets[i].bbox.bottom_right.x, dets[j].bbox.bottom_right.x);
@@ -24,24 +27,20 @@ void nms(std::vector<Face>& dets,
 
             float iw = ix2 - ix1 + 1;
             float ih = iy2 - iy1 + 1;
-            if (iw <= 0 || ih <= 0) { continue; }
+            if (iw <= 0 || ih <= 0) {
+                continue;
+            }
             float inter = iw * ih;
 
-            // area of j bbox
-            float area_j = dets[j].bbox.area();
-
-            // iou
+            const float area_j = dets[j].bbox.area();
             float iou = inter / (area_i + area_j - inter);
-            if (iou > thresh) { isSuppressed[j] = true; }
+            if (iou > thresh) {
+                suppressed[j] = true;
+            }
         }
-        // post_nms.push_back(dets[i]);
     }
-    // return post_nms;
-    int idx_t = 0;
-    dets.erase(
-        std::remove_if(dets.begin(), dets.end(), [&idx_t, &isSuppressed](const Face& f) { return isSuppressed[idx_t++]; }),
-        dets.end()
-    );
+
+    dets = std::move(kept);
 }
 
 void draw(cv::Mat& img,
