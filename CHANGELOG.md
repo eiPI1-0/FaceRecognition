@@ -49,6 +49,11 @@ than a strict versioning scheme.
   at equal *scene* size the 320 export detects faces the small one misses (0.84 vs nothing);
   that is the tradeoff, and it is documented in the README. This harness is a re-implementation
   and is only comparable to itself, not to the older 0.845 figure.
+- `scripts/get_models.sh --with-yunet-320`: fetches that 320×320 export too, pinned to the
+  opencv_zoo commit that shipped it and sha256-checked like the default model (a mismatch now
+  deletes the partial file and exits non-zero). Re-pinning note: zoo's files are Git-LFS
+  objects, so `raw.githubusercontent.com/<repo>/<commit>/<path>` returns the 131-byte pointer —
+  `github.com/<repo>/raw/<commit>/<path>` serves the content.
 - **Both head decoders check their layout contract.** `PriorBox::decode` used to return an
   empty face list when the outputs had the wrong type/layout — indistinguishable from "no
   faces in this frame" — and when the model's anchor count differed from the prior grid the
