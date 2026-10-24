@@ -61,8 +61,24 @@ build/
     └── ...
 ```
 
-**Detector** — YuNet, 160×120 input:
-<https://github.com/ShiqiYu/libfacedetection.train/blob/master/tasks/task1/onnx/yunet_120x160.onnx>
+The detector can be fetched automatically:
+
+```sh
+./scripts/get_models.sh          # → build/models/yunet_120x160.onnx, checksum-verified
+```
+
+**Detector** — YuNet, 160×120 input. Upstream restructured `ShiqiYu/libfacedetection.train`
+and deleted the old `tasks/task1/onnx/` path, so a branch-name URL 404s; the file is pinned
+to the commit that shipped it:
+
+```
+https://raw.githubusercontent.com/ShiqiYu/libfacedetection.train/1688402dbd9b9fc4a3a6793810f558b7407ff384/tasks/task1/onnx/yunet_120x160.onnx
+sha256 50ef07f702a31741ca46a4c0d947773b64143b9362780237bf0d427d6c79bab7   345478 bytes
+```
+
+Other YuNet exports exist (opencv_zoo `2023mar`, and community re-exports of the 120×160
+shape). They are **not drop-in here**: the zoo model is 320×320 with a different prior-box
+layout, and at least one 120×160 re-export fails to parse in OpenCV 4.13's ONNX importer.
 
 Its contract, as consumed by `PriorBox::decode`:
 
@@ -91,20 +107,27 @@ so a differently-aligned model will silently degrade.
 ## Run
 
 ```sh
-./main <camera_id> [cpu|cuda|openvino] [batch|nobatch]
+./main <source> [cpu|cuda|openvino] [batch|nobatch]
 ```
+
+`<source>` is either a **camera index** (any integer) or anything `cv::VideoCapture`
+accepts — an image file, a video file, a camera device path, a URL/stream. A still image
+is processed as its single frame; for non-camera sources the window stays open on the last
+frame until you press `Esc`, instead of exiting immediately.
 
 ```sh
-./main 0                 # camera 0, CPU backend
-./main 0 cuda            # CUDA backend (needs OpenCV built with CUDA)
-./main 0 openvino        # Inference Engine backend
-./main 0 nobatch         # force per-face forward passes
+./main 0                          # camera 0, CPU backend
+./main 1 cuda                     # CUDA backend (needs OpenCV built with CUDA)
+./main 0 openvino                 # Inference Engine backend
+./main 0 nobatch                  # force per-face forward passes
+./main photo.jpg                  # single image
+./main clip.mp4                   # video file
+./main "rtsp://host/stream"       # stream
 ```
 
-All paths are **relative to the working directory**, so run the binary from `build/`.
-
-The camera id is parsed from the **first character** of the argument, so ids are
-limited to a single digit (`0`–`9`).
+All model/data paths are **relative to the working directory**, so run the binary from
+`build/`. A display is required (`cv::imshow`); on a headless machine use `xvfb-run` or an
+`Xvfb` display.
 
 Headless sanity check (no camera attached):
 
@@ -112,7 +135,7 @@ Headless sanity check (no camera attached):
 ./main 1
 # Loaded 2 person(s) from ./data/
 # ...
-# Cannot open the camera.
+# Cannot open source: 1        (exit status != 0)
 ```
 
 `Loaded N person(s)` confirms the models and the registration set loaded. Everything
@@ -226,8 +249,11 @@ Current baseline to beat: **within 0.848 / between −0.068 / margin 0.916**.
 
 ## Limitations
 
-- **Input is a camera device only.** No image-file or video-file input path yet, and the
-  camera id is read from a single character (ids `0`–`9` only).
+- Frames from **every** source are resized to a fixed 960×720 **without preserving aspect
+  ratio**; a portrait photo is stretched, which costs detection quality. Letterboxing to a
+  4:3 canvas is the fix and is not implemented.
+- Requires a display: the only output is an `imshow` window (no headless/batch mode that
+  writes annotated files).
 - `blobFromImage` resizes without preserving aspect ratio; a portrait photo squashed into
   160×120 detects noticeably worse than a 4:3 face. Letterboxing would fix this.
 - YuNet's landmarks are coarse: fit residuals are 3–5 px and detection boxes jitter by

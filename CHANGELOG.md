@@ -4,7 +4,7 @@ Notable changes to this repository. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses release tags rather
 than a strict versioning scheme.
 
-## v1.0.0 — unreleased
+## v1.0.0 — 2026-10-24
 
 ### Fixed
 
@@ -53,6 +53,15 @@ than a strict versioning scheme.
   (occlusion), so boxes stay continuous.
 - **Backend configuration** (`DNNConfig`): `./main <id> [cpu|cuda|openvino]`, with CPU as
   the zero-config default.
+- **Any input source, not just a camera index**: the first argument is an integer camera
+  index (no longer truncated to one digit) or anything `cv::VideoCapture` accepts — image
+  file, video file, device path, URL/stream. For non-camera sources the window holds on the
+  last frame instead of exiting instantly. Verified: a still image and a 3-frame MP4 both
+  run through the full pipeline; a two-person composite resolves both identities correctly.
+- **`scripts/get_models.sh`**: fetches the exact YuNet detector this project is built
+  against (pinned to the upstream commit that shipped it — the old branch path 404s after
+  upstream restructured) and verifies its sha256. Idempotent.
+- `-h` / `--help`; unknown options now print usage instead of a bare message.
 - **Batch embedding** (`FeatureExtractor::extract_batch`) — one forward pass for all faces
   in a frame. Auto-disabled on CPU targets because OpenCV's CPU backend runs the graph per
   sample and rebuilds internal blobs on batch-size changes (measured 1.31× *slower* on a
@@ -66,6 +75,8 @@ than a strict versioning scheme.
 
 ### Changed
 
+- Failing to open the input source now exits with a non-zero status and names the source
+  (previously it printed "Cannot open the camera." and returned success).
 - `features_from_img` no longer mutates the caller's `cv::Mat` (it clones internally).
 - The unused, unimplemented `FaceRecognition` shell class and `read_directory` were
   removed.
@@ -84,8 +95,9 @@ than a strict versioning scheme.
 
 ### Known limitations
 
-Camera-device input only (no image/video file path), single-digit camera ids, fixed
-160×120 detection so small/distant faces are missed, aspect ratio not preserved by
-`blobFromImage`, `O(N)` linear scan over enrolled identities, and no automated tests.
+Frames from any source are stretched to a fixed 960×720 (`blobFromImage` and the display
+resize do not preserve aspect ratio, so portrait inputs lose detection quality); detection
+runs at a fixed 160×120, so small/distant faces are missed; `O(N)` linear scan over enrolled
+identities; a display is required for the only output path; and there are no automated tests.
 The bundled sample data (2 identities × 1 photo) is a regression signal, not an accuracy
 benchmark.
