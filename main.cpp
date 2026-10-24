@@ -117,12 +117,13 @@ int main(int argc, char *argv[])
             break;
         }
 
-        // 统一缩放到 display_shape：
+        // 统一 letterbox 到 display_shape（保持长宽比 + 居中补黑边）：
         //  (1) draw()/putText() 按 rfactor 把 160x120 检测坐标映射到图像坐标，
-        //      该假设要求图像恰好是 input_shape * rfactor；
-        //  (2) 注册照片也是按 display_shape 预处理后再检测的，
-        //      blobFromImage 不保持长宽比，两者尺度必须一致特征才可比。
-        cv::resize(im, im, display_shape);
+        //      该假设要求图像恰好是 input_shape * rfactor —— 补边后正好满足，
+        //      且补边是居中的，坐标无需额外偏移；
+        //  (2) 注册照片走同样的预处理，两者尺度一致特征才可比；
+        //  (3) 直接拉伸会把竖构图人脸横向拉扁，检测分数明显下降。
+        im = letterbox(im, display_shape);
 
         cvtm.start();
 

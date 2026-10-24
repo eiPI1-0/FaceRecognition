@@ -75,6 +75,20 @@ than a strict versioning scheme.
 
 ### Changed
 
+- **Preprocessing now preserves aspect ratio**: `letterbox()` (in `utils.cpp`) scales a
+  frame into the 960×720 canvas and centres it on black padding, replacing the straight
+  stretch. Both paths use it — the live loop and `features_from_img` (registration) — so
+  the two stay comparable. Downscales use `INTER_AREA`; upscaling a 4:3 camera frame is
+  byte-for-byte the old behaviour.
+  Measured (paired A/B, same 12 warps per identity, one run):
+  within-identity 0.805 → **0.845**, between −0.019 → **−0.029**, margin 0.824 → **0.874**.
+  Attribution: swapping only the interpolation (`INTER_LINEAR` → `INTER_AREA`) gave
+  0.800 / 0.824, i.e. no gain — the improvement comes from not distorting the face.
+  A two-person composite (its query feature is preprocessing-invariant) now matches its
+  own identities at **0.959 / 0.843** where the stretched gallery gave 0.586 / 0.696,
+  while wrong-identity scores stay near 0. Cost: 0.21 → 0.27 ms/frame.
+  Consequence: enrollment features move (cosine 0.83 between the two conventions), but the
+  gallery is rebuilt from photos at every startup, so nothing needs migrating.
 - Failing to open the input source now exits with a non-zero status and names the source
   (previously it printed "Cannot open the camera." and returned success).
 - `features_from_img` no longer mutates the caller's `cv::Mat` (it clones internally).

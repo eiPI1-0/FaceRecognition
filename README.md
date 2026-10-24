@@ -153,6 +153,8 @@ detected, aligned and embedded; the per-person feature is the mean of the
 
 More photos per person ⇒ more stable fused feature. Accuracy is dominated by how close
 the recognition environment (distance, lighting, camera) is to the registration photos.
+The gallery is rebuilt from the photos on every startup — there is no cached feature file,
+so changes to the preprocessing convention need no migration step.
 
 ---
 
@@ -163,7 +165,7 @@ Tunables live in `main.cpp`, plus tracker constructor arguments:
 | knob | default | effect |
 |---|---|---|
 | `recogn_thresh` | `0.2` | cosine threshold above which a match is reported. After the alignment fix, same-identity scores sit near 1.0 and cross-identity near 0, so there is wide headroom. |
-| `rfactor` | `6` | display frame = `input_shape × rfactor` = 960×720. Also the scale the camera frame is resized to. |
+| `rfactor` | `6` | display frame = `input_shape × rfactor` = 960×720. Also the canvas every input frame is letterboxed onto. |
 | detector `conf_thresh` / `nms_thresh` / `keep_top_k` | `0.6` / `0.3` / `750` | detection sensitivity and box suppression. |
 | `FaceTracker(iou, detect_every, max_lost, min_hits)` | `0.45, 1, 15, 1` | see below. |
 
@@ -188,9 +190,9 @@ MobileFaceNet embed  4.47 ms/face     ← this dominates
 ## Performance (this machine, CPU, single face)
 
 ```
-detect              0.93 ms
-embed per face      4.47 ms
-resize 960×720      0.05 ms
+detect                    0.93 ms
+embed per face            4.47 ms
+letterbox onto 960×720    0.27 ms   (a plain stretch-resize was 0.21 ms)
 ```
 
 Batch embedding is **auto-disabled on CPU targets**: OpenCV's CPU backend executes the
@@ -218,11 +220,11 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 - **Detection coordinates are always in detector-input space (160×120)**, never in the
   image you passed to `detect()`. `align_detection(img, det, detection_shape)` maps them
   for you; pass the *same image* you detected on.
-- **`main.cpp` must resize the camera frame to `display_shape`** before tracking and
-  drawing: `draw()`/`putText()` scale detection coords by `rfactor`, which is only valid
-  when the frame is exactly `input_shape × rfactor`. The resize also keeps inference
-  preprocessing identical to registration, which matters because `blobFromImage` does
-  **not** preserve aspect ratio.
+- **Every input frame is letterboxed onto `display_shape`** (`letterbox()` in `utils.cpp`)
+  before tracking and drawing, and registration goes through the same helper — the two
+  paths must preprocess identically or the features are not comparable. The padding is
+  centred and the canvas is exactly `input_shape × rfactor`, so `draw()`/`putText()`
+  scaling detection coords by `rfactor` stays exact with no extra offset.
 - **`CosSimilarity::similarity` returns `‖ref‖ · cos(query, ref)`**, not a cosine — it
   divides only by `norm(feature)` and assumes the *stored* side is unit-length (the
   fusion normalizes it). Comparing two raw embeddings returns ≈15, not a value in [0,1].
@@ -235,27 +237,31 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 
 ### How changes are validated
 
-There is no test harness, so verification is: `make`, then `./main 99` (expect
-`Loaded N person(s)`), then a throwaway program in `build/` linked against
+There is no test harness, so verification is: `make`, then `./main 1` (expect
+`Loaded N person(s)` followed by `Cannot open source: 1` and a non-zero exit), then a throwaway program in `build/` linked against
 `../FaceRecognition.cpp ../priorbox.cpp ../utils.cpp` that registers from `./data/` and
 re-recognizes each registration photo (expect that photo's own person as top match); an
 `hconcat` of two people's photos exercises multi-face index mapping. For any
 alignment/embedding change, embed ~12 warped variants of each identity (±25° rotation,
 0.85–1.15 scale, small translations, brightness ±40) and compare mean **within-identity**
 vs **between-identity** true cosine (`a.dot(b)/(‖a‖‖b‖)`, *not* `CosSimilarity`).
-Current baseline to beat: **within 0.848 / between −0.068 / margin 0.916**.
+Current baseline (letterbox pipeline, warp seed `12345`, 13 samples per identity):
+**within 0.845 / between −0.029 / margin 0.874**; the same harness run against the old
+stretch preprocessing scored 0.805 / −0.019 / 0.824. These numbers are harness-specific —
+compare only against a re-run of the same generator (an earlier, different augmentation
+draw produced 0.848 / −0.068 / 0.916, which is not comparable).
 
 ---
 
 ## Limitations
 
-- Frames from **every** source are resized to a fixed 960×720 **without preserving aspect
-  ratio**; a portrait photo is stretched, which costs detection quality. Letterboxing to a
-  4:3 canvas is the fix and is not implemented.
+- Frames from any source are letterboxed onto a fixed 960×720 canvas, so **aspect ratio is
+  preserved**; non-4:3 sources get black bars in the window. The price of that simplicity:
+  the detector still runs on the whole padded frame at 160×120, so on an extreme aspect
+  (portrait phone frame) the face occupies fewer detector pixels than a crop-aware
+  pipeline would give it.
 - Requires a display: the only output is an `imshow` window (no headless/batch mode that
   writes annotated files).
-- `blobFromImage` resizes without preserving aspect ratio; a portrait photo squashed into
-  160×120 detects noticeably worse than a 4:3 face. Letterboxing would fix this.
 - YuNet's landmarks are coarse: fit residuals are 3–5 px and detection boxes jitter by
   ~5 px frame to frame. Identity assignment is robust to this; box edges are not perfectly
   still.

@@ -1,4 +1,5 @@
 #include "utils.hpp"
+#include <cmath>
 
 void nms(std::vector<Face>& dets,
          const float thresh) {
@@ -87,4 +88,28 @@ void draw(cv::Mat& img,
         cv::circle(img, point2f2point(faces[i].landmarks.nose_tip, rfactor),    radius, landmarks_color[3], thickness);
         cv::circle(img, point2f2point(faces[i].landmarks.mouth_right, rfactor), radius, landmarks_color[4], thickness);
     }
+}
+
+cv::Mat letterbox(const cv::Mat& img, const cv::Size& size, const cv::Scalar& border) {
+    if (img.empty() || size.width <= 0 || size.height <= 0) {
+        return cv::Mat();
+    }
+
+    const double scale = std::min(static_cast<double>(size.width) / img.cols,
+                                  static_cast<double>(size.height) / img.rows);
+    const int w = std::max(1, static_cast<int>(std::lround(img.cols * scale)));
+    const int h = std::max(1, static_cast<int>(std::lround(img.rows * scale)));
+
+    cv::Mat scaled;
+    // 缩小用 INTER_AREA（普通线性缩小会混叠，小人脸首当其冲），放大用 INTER_LINEAR
+    cv::resize(img, scaled, cv::Size(w, h), 0.0, 0.0,
+               scale < 1.0 ? cv::INTER_AREA : cv::INTER_LINEAR);
+
+    const int left = (size.width - w) / 2;
+    const int top = (size.height - h) / 2;
+    cv::Mat out;
+    cv::copyMakeBorder(scaled, out, top, size.height - h - top,
+                       left, size.width - w - left,
+                       cv::BORDER_CONSTANT, border);
+    return out;
 }

@@ -289,8 +289,9 @@ bool features_from_img(cv::Mat& img, Detector& detector, FeatureExtractor& extra
                        std::vector<cv::Mat>& features, const cv::Size& display_shape,
                        int rfactor) {
     // 内部 clone，避免修改调用方传入的原始图像
-    cv::Mat work = img.clone();
-    cv::resize(work, work, display_shape);
+    // letterbox：保持长宽比缩放到 display_shape 并补边。
+    // 与 main.cpp 的实时预处理完全一致，注册/推理尺度才可比。
+    cv::Mat work = letterbox(img, display_shape);
 
     detector.detect(work);
     if (detector.size() == 0) {
