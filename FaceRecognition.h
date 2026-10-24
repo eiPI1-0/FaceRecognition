@@ -26,9 +26,14 @@ struct DNNConfig {
 
 class Detector {
 public:
+    // output_names: 检测头三个输出张量的名字（本仓库的 YuNet 导出是 loc/conf/iou）。
+    // 换模型时若名字不同可改配置（detector.out_*）；但若头本身是按层拆开的
+    // cls_*/obj_*/bbox_*/kps_*，那是另一种解码方案，改名字救不回来
+    // （PriorBox::decode 会明确报错，而不是静默返回 0 张脸）。
     Detector(const std::string& model_path, cv::Size input_shape,
              float conf_thresh = 0.6f, float nms_thresh = 0.3f, int keep_top_k = 750,
-             const DNNConfig& config = DNNConfig::cpu());
+             const DNNConfig& config = DNNConfig::cpu(),
+             std::vector<cv::String> output_names = {"loc", "conf", "iou"});
     // 检测结果的 bbox/landmarks 坐标系相对于 input_shape（160x120）。
     std::vector<Face>& detect(cv::Mat& img);
     size_t size() const;
@@ -41,7 +46,7 @@ private:
     float conf_thresh, nms_thresh;
     int keep_top_k;
     PriorBox pb;
-    std::vector<cv::String> output_names = {"loc", "conf", "iou"};
+    std::vector<cv::String> output_names;
     std::vector<cv::Mat> output_blobs;
     std::vector<Face> dets;
     size_t detected_nums = 0;
@@ -62,10 +67,11 @@ cv::Mat align_detection(const cv::Mat& img, const Face& det,
                         const cv::Size& output_size = cv::Size(112, 112));
 
 // 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
+// 对齐尺寸取自 extractor.inputSize()（单一真源）：嵌入模型的输入形状改了，对齐几何
+// 就跟着改，warpAffine 直接产出模型要的尺寸，blobFromImage 不再二次插值。
 cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
                              FeatureExtractor& extractor,
-                             const cv::Size& detection_shape,
-                             const cv::Size& output_size = cv::Size(112, 112));
+                             const cv::Size& detection_shape);
 
 // 对齐并提取全部人脸特征。返回的 features[i] 与 dets[i] 一一对应，
 // 对齐失败的人脸对应空 Mat。batch/逐张策略由 extractor.batch_mode() 决定。

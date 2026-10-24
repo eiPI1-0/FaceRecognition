@@ -33,6 +33,13 @@ than a strict versioning scheme.
   (`--set dnn.backend=openvino` on an OpenCV without that plugin) and a missing model file
   now print `Fatal: …` and exit non-zero; a missing data directory warns instead of
   loading 0 persons in silence.
+- `detector.out_loc` / `out_conf` / `out_iou`: the detector head's output tensor names are
+  config keys, so a differently-*named* fused YuNet head is a config change.
+- **The detector-head contract is checked, not assumed.** `PriorBox::decode` used to return an
+  empty face list when the outputs had the wrong type/layout — indistinguishable from "no
+  faces in this frame" — and when the model's anchor count differed from the prior grid the
+  decode loop read past the end of the tensors (UB). It now names both counts and stops
+  (`prior grid has 5875 anchors … the model returned loc=457 conf=800 iou=1600 …`).
 - **Zero new dependencies.** The loader is ~35 lines of flat parsing rather than
   `cv::FileStorage`, which refuses any file that does not begin with a `%YAML:1.0`
   signature (it sniffs content and ignores the `.yml` extension) and throws when it
@@ -40,6 +47,13 @@ than a strict versioning scheme.
 
 ### Changed
 
+- `embedder.input_w/h` is now a *geometry* knob, not just a blob resize: the aligned crop is
+  warped to exactly the size the extractor declares, instead of always 112×112 and being
+  resampled again. `extract_face_feature(s)` take their output size from
+  `FeatureExtractor::inputSize()`, so there is no second place where the 112 lives. At 112 the
+  change is bit-identical (measured `maxabsdiff = 0` against the previous path on both
+  identities), and a foreign embedder at its native shape works (opencv_zoo SFace, 128-d,
+  self-match 2/2).
 - Precedence is built-in defaults < `--config` file < command line; the
   `cpu|cuda|openvino` and `batch|nobatch` tokens are folded into the same ordered override
   list instead of carrying dedicated variables.

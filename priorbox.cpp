@@ -1,5 +1,7 @@
 #include "priorbox.hpp"
 
+#include <string>
+
 PriorBox::PriorBox(const cv::Size& input_shape,
                    const cv::Size& output_shape) {
     // initialize
@@ -69,9 +71,24 @@ std::vector<Face> PriorBox::decode(const cv::Mat& loc,
                                    const float ignore_score) {
     std::vector<Face> dets; // num * [x1, y1, x2, y2, x_re, y_re, x_le, y_le, x_ml, y_ml, x_n, y_n, x_mr, y_ml]
 
+    // 头/先验网格的契约必须显式检查：返回空会被读成"没检测到脸"（与真漏检不可区分），
+    // 而且契约破坏时下面的循环会越界读 loc_v/conf_v/iou_v（UB）。
     if (loc.type() != CV_32F || conf.type() != CV_32F || iou.type() != CV_32F ||
         !loc.isContinuous() || !conf.isContinuous() || !iou.isContinuous()) {
-        return dets;
+        CV_Error(cv::Error::StsBadArg,
+                 "PriorBox::decode: loc/conf/iou must be continuous CV_32F vectors "
+                 "(check detector.out_loc/out_conf/out_iou)");
+    }
+    if (loc.total() != priors.size() * 14 || conf.total() != priors.size() * 2 ||
+        iou.total() != priors.size()) {
+        CV_Error(cv::Error::StsBadArg,
+                 "PriorBox::decode: prior grid has " + std::to_string(priors.size()) +
+                 " anchors for detector input " + std::to_string(in_w) + "x" + std::to_string(in_h) +
+                 ", the model returned loc=" + std::to_string(loc.total() / 14) +
+                 " conf=" + std::to_string(conf.total() / 2) +
+                 " iou=" + std::to_string(iou.total()) +
+                 ": either detector.input_w/h disagrees with this export, or the model uses a"
+                 " different head (per-level cls_*/obj_*/bbox_*/kps_*) that needs its own decoder");
     }
 
     const float* loc_v = loc.ptr<float>(0);

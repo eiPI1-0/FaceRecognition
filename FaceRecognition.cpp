@@ -14,9 +14,18 @@
 
 Detector::Detector(const std::string& model_path, cv::Size input_shape, float conf_thresh,
                    float nms_thresh, int keep_top_k,
-                   const DNNConfig& config) :
+                   const DNNConfig& config, std::vector<cv::String> output_names) :
         model(cv::dnn::readNet(model_path)), input_shape(std::move(input_shape)), conf_thresh(conf_thresh),
-        nms_thresh(nms_thresh), keep_top_k(keep_top_k), pb(input_shape, input_shape) {
+        nms_thresh(nms_thresh), keep_top_k(keep_top_k), pb(input_shape, input_shape),
+        output_names(std::move(output_names)) {
+    if (this->output_names.size() != 3) {
+        CV_Error(cv::Error::StsBadArg, "Detector: needs exactly 3 output names (loc, conf, iou)");
+    }
+    for (const auto& name : this->output_names) {
+        if (name.empty()) {
+            CV_Error(cv::Error::StsBadArg, "Detector: empty detector output name");
+        }
+    }
     model.setPreferableBackend(config.backend);
     model.setPreferableTarget(config.target);
 }
@@ -233,9 +242,8 @@ cv::Mat align_detection(const cv::Mat& img, const Face& det,
 // 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
 cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
                              FeatureExtractor& extractor,
-                             const cv::Size& detection_shape,
-                             const cv::Size& output_size) {
-    cv::Mat aligned = align_detection(img, det, detection_shape, output_size);
+                             const cv::Size& detection_shape) {
+    cv::Mat aligned = align_detection(img, det, detection_shape, extractor.inputSize());
     if (aligned.empty()) {
         return {};
     }

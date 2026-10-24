@@ -13,9 +13,9 @@ paths.data_dir: data/
 # --- model contract ---
 # MODEL CONTRACT: only change together with the model file.
 detector.input_w: 160
-# PriorBox::decode assumes the YuNet 160x120 prior-box layout
+# the prior grid (strides 8/16/32/64) is derived from these; if the model's anchor count disagrees, PriorBox::decode stops with a message
 detector.input_h: 120
-# align_face() targets the same 112x112 ArcFace template
+# the aligned crop is warped to exactly this size (ArcFace reference template scaled to it), so the model must be trained on that crop
 embedder.input_w: 112
 embedder.input_h: 112
 
@@ -24,6 +24,14 @@ embedder.input_h: 112
 detector.conf_thresh: 0.60
 detector.nms_thresh: 0.30
 detector.keep_top_k: 750
+
+# --- model contract ---
+# fused box+landmark tensor, 14 floats per anchor ('loc')
+detector.out_loc: loc
+# 2-class score tensor ('conf')
+detector.out_conf: conf
+# objectness tensor ('iou'); a head split per level (cls_8/obj_8/bbox_8/kps_8...) is a different decode scheme, renaming cannot bridge it
+detector.out_iou: iou
 
 # --- recognition ---
 # cosine above which a match is reported; after the alignment fix same-identity sits near 1.0 and cross-identity near 0

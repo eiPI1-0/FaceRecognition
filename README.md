@@ -200,6 +200,42 @@ With that line `./build/main 0 --config build/config.yml` works from the repo ro
 `--set paths.root=<dir>` does the same from the command line (relative to your shell's cwd).
 Absolute values are used as given.
 
+### Swapping models
+
+Configuration covers the **shape** axis completely; it cannot cover the **graph contract**
+axis. Measured behaviour:
+
+Works by editing the yml only:
+
+- **any input size** for a YuNet-160×120-style graph — verified at 320×320, 224×224 and
+  128×96. The graph is shape-dynamic, and the prior grid (strides 8/16/32/64 over
+  floor-halved feature maps) equals the graph's own anchor count at every size. Set
+  `detector.input_w/h`, and `display.rfactor` so the canvas stays a sane size.
+- **the tensor names** of a fused head — `detector.out_loc` / `out_conf` / `out_iou`.
+- **any ArcFace-convention embedder, at its native shape** — `paths.embedder_model` plus
+  `embedder.input_w/h`. The aligned crop is warped to exactly that size, so the model must
+  have been trained on that crop. Feature length is irrelevant (fusion and cosine are
+  dimension-agnostic): verified by dropping in opencv_zoo SFace, whose output is 128-d
+  instead of 512-d — self-match still 2/2.
+
+Not reachable from config, because it is a different graph:
+
+- the detector head must be **fused**: one `loc` (14 floats per anchor — 4 box + 5 × 2
+  landmarks), one `conf` (2 per anchor), one `iou` (1 per anchor), over 4 levels at strides
+  8/16/32/64. opencv_zoo's `face_detection_yunet_2023mar.onnx` instead exports per-level
+  `cls_8 … kps_32`; that is a different decoding *scheme*, so it needs its own decoder, and
+  renaming cannot bridge it.
+- **normalization is fixed per stage**: detector scale 1.0, no mean, BGR; embedder `1/255`
+  then `(x − 0.5) / 0.5` on RGB — which is what InsightFace-family exports expect
+  (mean/std 127.5).
+- **alignment is the ArcFace 5-point template** with a square ROI of 3.2 × eye distance. An
+  embedder trained on a different crop (MTCNN/RetinaFace) runs without any error and scores
+  badly — the one failure mode that stays silent, so check your scores after a swap.
+
+`PriorBox::decode` checks that contract instead of trusting it: when the tensors do not hold
+exactly one row per prior it stops and names both counts, which turns a wrong model/shape
+pair into a message rather than an out-of-bounds read.
+
 ---
 
 ## Registration
@@ -293,6 +329,18 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
   that leap ahead of the face and then lose association.
 - **Alignment ROI must be square and ≈3.2 × eye distance**, centred on the landmark
   centroid. The ArcFace 112×112 window spans much more than a tight detector bbox.
+- **The aligned crop size comes from `FeatureExtractor::inputSize()`**, not from a literal:
+  `embedder.input_w/h` is a geometry knob (the warp produces exactly the size the model
+  wants — one interpolation, not two). Changing it only makes sense together with a model
+  trained on that crop.
+- **`PriorBox::decode` asserts the head contract** (`loc.total() == priors*14`,
+  `conf.total() == priors*2`, `iou.total() == priors`). Before that check the decode loop
+  indexed past the end of the tensors whenever the model's anchor count differed from the
+  prior grid, and a type mismatch returned an empty face list that looked like "no faces".
+- **The prior grid agreeing with the graph is an empirical fact**, not a theorem: strides
+  8/16/32/64 over floor-halved feature maps matched this YuNet export at 160×120, 320×320,
+  224², 200², 150², 128² and 640². A different export can use the same strides and still
+  split its head per level — then only the decoder is wrong, not the config.
 - **`knobs()` in `config.cpp` is the only list of tunables.** File parsing, `--set`,
   range validation and `--dump-config` are all generated from it, so adding a tunable
   means adding a struct field *and* a table entry — never a bespoke parse branch.

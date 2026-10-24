@@ -38,7 +38,8 @@ int run_pipeline(const PipelineConfig& cfg, const std::string& source) {
     const int rfactor = cfg.rfactor;
 
     Detector detector(cfg.detector_model, img_shape, cfg.conf_thresh, cfg.nms_thresh,
-                      cfg.keep_top_k, dnn_config);
+                      cfg.keep_top_k, dnn_config,
+                      {cfg.out_loc, cfg.out_conf, cfg.out_iou});
     FeatureExtractor extractor(cfg.embedder_model, cfg.embedder_input(), dnn_config);
     if (cfg.batch_mode != 0) {
         extractor.set_batch_mode(cfg.batch_mode > 0);

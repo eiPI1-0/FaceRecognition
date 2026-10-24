@@ -28,6 +28,8 @@ struct PipelineConfig {
     float conf_thresh = 0.6f;
     float nms_thresh  = 0.3f;
     int   keep_top_k  = 750;
+    // 检测头三个输出张量的名字（本仓库的 YuNet 导出：loc / conf / iou）
+    std::string out_loc = "loc", out_conf = "conf", out_iou = "iou";
 
     // 识别与显示
     float recogn_thresh = 0.2f;

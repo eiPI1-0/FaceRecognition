@@ -103,9 +103,11 @@ const std::vector<Knob>& knobs() {
         {"detector.input_w", &PipelineConfig::detector_input_w, 32, 1024,
          "model contract", "MODEL CONTRACT: only change together with the model file."},
         {"detector.input_h", &PipelineConfig::detector_input_h, 32, 1024,
-         "model contract", "PriorBox::decode assumes the YuNet 160x120 prior-box layout"},
+         "model contract", "the prior grid (strides 8/16/32/64) is derived from these; if the "
+                           "model's anchor count disagrees, PriorBox::decode stops with a message"},
         {"embedder.input_w", &PipelineConfig::embedder_input_w, 32, 512,
-         "model contract", "align_face() targets the same 112x112 ArcFace template"},
+         "model contract", "the aligned crop is warped to exactly this size (ArcFace reference "
+                           "template scaled to it), so the model must be trained on that crop"},
         {"embedder.input_h", &PipelineConfig::embedder_input_h, 32, 512,
          "model contract", ""},
 
@@ -115,6 +117,18 @@ const std::vector<Knob>& knobs() {
          "detection", ""},
         {"detector.keep_top_k", &PipelineConfig::keep_top_k, 1, 10000,
          "detection", ""},
+
+        {"detector.out_loc", &PipelineConfig::out_loc,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "model contract", "fused box+landmark tensor, 14 floats per anchor ('loc')"},
+        {"detector.out_conf", &PipelineConfig::out_conf,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "model contract", "2-class score tensor ('conf')"},
+        {"detector.out_iou", &PipelineConfig::out_iou,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "model contract", "objectness tensor ('iou'); a head split per level "
+                           "(cls_8/obj_8/bbox_8/kps_8...) is a different decode scheme, renaming "
+                           "cannot bridge it"},
 
         {"recognize.thresh", &PipelineConfig::recogn_thresh, 0.0, 1.0,
          "recognition", "cosine above which a match is reported; after the alignment fix "
