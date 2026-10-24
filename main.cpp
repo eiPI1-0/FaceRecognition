@@ -52,8 +52,13 @@ int main(int argc, char *argv[])
                                             display_shape, rfactor, recogn_thresh);
     std::cout << "Loaded " << database.size() << " person(s) from " << data_path << std::endl;
 
-    // 人脸跟踪器：每 5 帧全图检测一次，中间帧用 IoU 关联 + 匀速预测
-    FaceTracker tracker(0.45f, 5, 15, 3);
+    // 跟踪器参数（实测于本机 CPU，960x720 帧，1 张人脸）：
+    //   YuNet 检测 0.93 ms/帧，MobileFaceNet 提特征 4.47 ms/脸 —— 提取才是瓶颈，
+    //   跳过检测每帧只省 ~0.75 ms，却让框最大误差从 5.9px 涨到 18px。
+    // 故默认每帧检测：跟踪器用于维持 ID、平滑，以及在检测漏掉人脸（遮挡等）时
+    // 用匀速预测补帧。硬件较弱时可调大 detect_every 换取性能，代价是框的跟随延迟。
+    // min_hits=1 => 首次检测到即出框，避免新人脸要等 N 次确认才显示。
+    FaceTracker tracker(0.45f, /*detect_every=*/1, /*max_lost=*/15, /*min_hits=*/1);
 
     cv::VideoCapture cap;
     cv::Mat im;
@@ -76,6 +81,13 @@ int main(int argc, char *argv[])
             if (im.empty()) {
                 break;
             }
+
+            // 统一缩放到 display_shape：
+            //  (1) draw()/putText() 按 rfactor 把 160x120 检测坐标映射到图像坐标，
+            //      该假设要求图像恰好是 input_shape * rfactor；
+            //  (2) 注册照片也是按 display_shape 预处理后再检测的，
+            //      blobFromImage 不保持长宽比，两者尺度必须一致特征才可比。
+            cv::resize(im, im, display_shape);
 
             cvtm.start();
 
