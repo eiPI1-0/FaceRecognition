@@ -3,11 +3,12 @@
 # Unknown keys are rejected with the nearest valid ones.
 
 # --- paths ---
-# relative paths resolve against the config file's directory
-paths.detector_model: ./models/yunet_120x160.onnx
-paths.embedder_model: ./models/mobilefacenet.onnx
+# relative asset paths below resolve against this. Default: the working directory. `paths.root: .` inside a config file anchors the assets next to that file, which lets the binary run from any cwd.
+# relative paths resolve against paths.root (default: cwd)
+paths.detector_model: models/yunet_120x160.onnx
+paths.embedder_model: models/mobilefacenet.onnx
 # one subfolder per enrolled person
-paths.data_dir: ./data/
+paths.data_dir: data/
 
 # --- model contract ---
 # MODEL CONTRACT: only change together with the model file.

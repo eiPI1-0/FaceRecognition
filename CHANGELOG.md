@@ -4,6 +4,51 @@ Notable changes to this repository. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses release tags rather
 than a strict versioning scheme.
 
+## [Unreleased]
+
+### Added
+
+- **A configuration layer.** 15 tunables lived as loose locals in `main.cpp`, plus 6 bare
+  literals inside constructor calls, so nothing represented "this pipeline's settings":
+  nothing to pass, nothing to validate in one place, no A/B without recompiling. They are
+  now fields of `PipelineConfig`, each described **once** in `knobs()` (`config.cpp`) with
+  its dotted key, member pointer, range and documentation. The config-file parser, the
+  `--set` overrides, range validation and `--dump-config` are all generated from that one
+  table, so there is no second key list that could drift.
+- `--config <path>`: flat `key: value` file with `#` comments. An unknown key warns and
+  names the nearest valid key (`recogn_thresh` → "did you mean `recognize.thresh`"); a
+  wrong type or out-of-range value stops with `file:line`, the key and the allowed range.
+- `--set key=value`: repeatable, one-off override (the tuning loop this project actually
+  runs). An unknown key there is a hard stop rather than a warning.
+- `--dump-config`: prints the effective configuration after file and CLI inputs.
+  `config.example.yml` is its output and is committed, so the shipped example can never
+  disagree with the built-in defaults. Dumping then loading the same file changes nothing.
+- `paths.root`: all relative `paths.*` values resolve against it, defaulting to the working
+  directory — deliberately *not* the config file's directory, so a file that only tweaks
+  thresholds cannot silently move your assets. Anchoring is opt-in: `paths.root: .` inside
+  the file (that value is file-relative) makes `./build/main 0 --config build/config.yml`
+  work from anywhere, retiring the least discoverable constraint this project had ("you must
+  run from `build/`").
+- Loud failure where there used be core dumps: an unavailable backend
+  (`--set dnn.backend=openvino` on an OpenCV without that plugin) and a missing model file
+  now print `Fatal: …` and exit non-zero; a missing data directory warns instead of
+  loading 0 persons in silence.
+- **Zero new dependencies.** The loader is ~35 lines of flat parsing rather than
+  `cv::FileStorage`, which refuses any file that does not begin with a `%YAML:1.0`
+  signature (it sniffs content and ignores the `.yml` extension) and throws when it
+  disagrees — and this way file and `--set` share one parse-and-validate path.
+
+### Changed
+
+- Precedence is built-in defaults < `--config` file < command line; the
+  `cpu|cuda|openvino` and `batch|nobatch` tokens are folded into the same ordered override
+  list instead of carrying dedicated variables.
+- `main()` is argument parsing and configuration only; the pipeline moved into
+  `run_pipeline()`, with a single `cv::Exception` catch at the boundary.
+- Documentation and the tuning table now refer to config keys instead of `main.cpp` lines.
+
+---
+
 ## v1.0.0 — 2026-10-24
 
 ### Fixed

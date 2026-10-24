@@ -87,11 +87,12 @@ const std::vector<Knob>& knobs() {
     static const std::vector<Knob> table = {
         {"paths.root", &PipelineConfig::asset_root,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
-         "paths", "relative asset paths are resolved against this; empty means the config "
-                  "file's directory, or the working directory when no config file is given"},
+         "paths", "relative asset paths below resolve against this. Default: the working "
+                  "directory. `paths.root: .` inside a config file anchors the assets next "
+                  "to that file, which lets the binary run from any cwd."},
         {"paths.detector_model", &PipelineConfig::detector_model,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
-         "paths", "relative paths resolve against the config file's directory"},
+         "paths", "relative paths resolve against paths.root (default: cwd)"},
         {"paths.embedder_model", &PipelineConfig::embedder_model,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
          "paths", ""},
@@ -263,6 +264,17 @@ bool load_config(const std::string& path, PipelineConfig& cfg,
             return false;
         }
     }
+
+    // paths.root 写在配置文件里时，它自己相对该文件解析；命令行上的相对 root 相对 cwd。
+    // 其余相对资产路径一律相对最终 root 解析（见 resolve_asset_paths）。
+    if (!cfg.asset_root.empty()) {
+        std::filesystem::path root(cfg.asset_root);
+        if (root.is_relative()) {
+            const std::filesystem::path file_dir = std::filesystem::path(path).parent_path();
+            root = file_dir.empty() ? root : (file_dir / root);
+            cfg.asset_root = root.lexically_normal().string();
+        }
+    }
     return true;
 }
 
@@ -361,6 +373,12 @@ void dump_config(std::ostream& os, const PipelineConfig& cfg) {
                 if (nl) { os.write(line, nl - line) << "\n"; line = nl + 1; }
                 else { os << line << "\n"; line = nullptr; }
             }
+        }
+        // paths.root 未锚定时不写出来：写了 `.` 会在别处加载这份 dump 时把资产锚到
+        // 该文件目录，round-trip 就变了。省略 = 保持"未指定"状态。
+        if (k.key == std::string("paths.root") &&
+            (knob_as_string(k, cfg).empty() || knob_as_string(k, cfg) == ".")) {
+            continue;
         }
         os << k.key << ": ";
         if (const auto* p = std::get_if<StrMember>(&k.member)) {

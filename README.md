@@ -108,6 +108,7 @@ so a differently-aligned model will silently degrade.
 
 ```sh
 ./main <source> [cpu|cuda|openvino] [batch|nobatch]
+             [--config <path>] [--set key=value] [--dump-config]
 ```
 
 `<source>` is either a **camera index** (any integer) or anything `cv::VideoCapture`
@@ -123,11 +124,15 @@ frame until you press `Esc`, instead of exiting immediately.
 ./main photo.jpg                  # single image
 ./main clip.mp4                   # video file
 ./main "rtsp://host/stream"       # stream
+./main 0 --config config.yml      # load a config file (see Configuration)
+./main 0 --set recognize.thresh=0.35 --set tracker.detect_every=3
+./main --dump-config              # print the effective config and exit
 ```
 
-All model/data paths are **relative to the working directory**, so run the binary from
-`build/`. A display is required (`cv::imshow`); on a headless machine use `xvfb-run` or an
-`Xvfb` display.
+A display is required (`cv::imshow`); on a headless machine use `xvfb-run` or an `Xvfb`
+display. Model/data paths are relative to the working directory, so by default run the
+binary from `build/`; set `paths.root` (in a config file or with `--set`) to anchor them
+elsewhere (see [Configuration](#configuration)).
 
 Headless sanity check (no camera attached):
 
@@ -142,6 +147,58 @@ Headless sanity check (no camera attached):
 OpenCV prints between those two lines (FFmpeg "Camera index out of range", GStreamer
 video-position warnings) is backend noise from probing devices, not a bug in this
 program.
+
+---
+
+## Configuration
+
+Every tunable is one entry in a single table (`knobs()` in `config.cpp`) with a dotted key.
+The **same key** is used in the config file, in `--set`, and in `--dump-config` output —
+there is one list, generated from that table, so it cannot drift out of sync.
+
+Precedence: **built-in defaults < `--config` file < command line** (a later flag wins).
+
+```sh
+./main --dump-config > config.example.yml    # the shipped example is generated, never hand-written
+./main 0 --config config.example.yml
+./main 0 --set recognize.thresh=0.35 --set tracker.detect_every=3
+./main 0 cuda batch                          # shorthand for --set dnn.backend=cuda --set dnn.batch_mode=1
+```
+
+The file format is flat `key: value` lines with `#` comments — no YAML parser, no nesting:
+
+```yaml
+paths.data_dir: ./data/        # one subfolder per enrolled person
+recognize.thresh: 0.20
+detector.conf_thresh: 0.60
+tracker.detect_every: 1
+```
+
+Run `./main --dump-config` for the complete list of keys, their defaults and what each one
+does; it is generated from the table, so it is always current and self-documenting.
+
+How bad input is handled, deliberately:
+
+| input | result |
+|---|---|
+| unknown key in a file | warning naming the nearest valid key (`recogn_thresh` → “did you mean `recognize.thresh`”), then ignored |
+| wrong type / out-of-range value | hard stop naming `file:line`, the key and the allowed range |
+| unknown key after `--set` | hard stop — you typed it, you should hear about it |
+| missing data dir | warning (`no one will be recognized`) |
+| bad backend or missing model file | readable `Fatal: …`, non-zero exit — not a core dump |
+
+**Paths.** Relative `paths.*` values are resolved against `paths.root`, which defaults to
+the **working directory** — so a config file that only changes thresholds never moves your
+assets. Anchoring is explicit; say so in the file:
+
+```yaml
+paths.root: .            # relative to this file's directory
+paths.data_dir: ./data/
+```
+
+With that line `./build/main 0 --config build/config.yml` works from the repo root, and
+`--set paths.root=<dir>` does the same from the command line (relative to your shell's cwd).
+Absolute values are used as given.
 
 ---
 
@@ -160,14 +217,15 @@ so changes to the preprocessing convention need no migration step.
 
 ## Tuning
 
-Tunables live in `main.cpp`, plus tracker constructor arguments:
+Tunables are config keys (defaults in `config.hpp`, full list via `--dump-config`); the
+ones worth knowing:
 
-| knob | default | effect |
+| key | default | effect |
 |---|---|---|
-| `recogn_thresh` | `0.2` | cosine threshold above which a match is reported. After the alignment fix, same-identity scores sit near 1.0 and cross-identity near 0, so there is wide headroom. |
-| `rfactor` | `6` | display frame = `input_shape × rfactor` = 960×720. Also the canvas every input frame is letterboxed onto. |
-| detector `conf_thresh` / `nms_thresh` / `keep_top_k` | `0.6` / `0.3` / `750` | detection sensitivity and box suppression. |
-| `FaceTracker(iou, detect_every, max_lost, min_hits)` | `0.45, 1, 15, 1` | see below. |
+| `recognize.thresh` | `0.2` | cosine threshold above which a match is reported. After the alignment fix, same-identity scores sit near 1.0 and cross-identity near 0, so there is wide headroom. |
+| `display.rfactor` | `6` | display frame = `detector input × rfactor` = 960×720; the letterbox canvas and the coord scale for `draw()`/`putText()`. |
+| `detector.conf_thresh` / `detector.nms_thresh` / `detector.keep_top_k` | `0.6` / `0.3` / `750` | detection sensitivity and box suppression. |
+| `tracker.iou` / `tracker.detect_every` / `tracker.max_lost` / `tracker.min_hits` | `0.45` / `1` / `15` / `1` | see below. |
 
 `detect_every` is the main performance/accuracy dial. Measured here (CPU, 960×720,
 one face):
@@ -207,11 +265,12 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 
 | File | Role |
 |---|---|
-| `main.cpp` | CLI parsing, tunables, camera loop |
+| `main.cpp` | CLI parsing, config application, capture loop |
+| `config.hpp` / `config.cpp` | `PipelineConfig` + the `knobs()` table — every tunable described once, driving file parsing, `--set`, validation and `--dump-config` |
 | `FaceRecognition.h` / `.cpp` | `DNNConfig`, `Detector`, `FeatureExtractor`, `Similarity`, header-only `FeatureDatabase<T>`; alignment (`align_face`, `align_detection`), `extract_face_feature(s)`, `list_person_dirs` |
 | `face_tracker.hpp` / `.cpp` | `FaceTracker` — IoU greedy matching + constant-velocity prediction |
 | `priorbox.hpp` / `.cpp` | YuNet prior-box generation and raw-output decoding |
-| `utils.hpp` / `.cpp` | `nms()`, `draw()` |
+| `utils.hpp` / `.cpp` | `nms()`, `draw()`, `letterbox()` |
 | `face_def.hpp` | POD types: `BndBox_xyxy` / `BndBox_xywh`, `Landmarks_5`, `Face` |
 
 ### Contributor notes (the traps in this codebase)
@@ -234,6 +293,15 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
   that leap ahead of the face and then lose association.
 - **Alignment ROI must be square and ≈3.2 × eye distance**, centred on the landmark
   centroid. The ArcFace 112×112 window spans much more than a tight detector bbox.
+- **`knobs()` in `config.cpp` is the only list of tunables.** File parsing, `--set`,
+  range validation and `--dump-config` are all generated from it, so adding a tunable
+  means adding a struct field *and* a table entry — never a bespoke parse branch.
+  `config.hpp` is app-level: it must not be pulled into `FaceRecognition.h`, because
+  `FeatureDatabase<T>` is a header-only template and every consumer would recompile.
+- **Relative `paths.*` values are resolved against `paths.root`** (default: the config
+  file's directory, else the working directory), in one place, after defaults, file and
+  `--set` have all been applied. Resolving earlier — or per source — produces the
+  half-resolved mix that made this project unrunnable outside `build/`.
 
 ### How changes are validated
 
@@ -278,7 +346,7 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
 ## Changes
 
 See [CHANGELOG.md](CHANGELOG.md) for what this revision fixed, added and measured
-(older revisions are in `git log`; nothing is tagged yet).
+(older revisions are in `git log`; releases are tagged, latest `v1.0.0`).
 
 ## License
 
