@@ -3,10 +3,18 @@
 #include <charconv>
 #include "FaceRecognition.h"
 #include "face_tracker.hpp"
+#include "config.hpp"
 
 using namespace cv;
 
 namespace {
+
+// 后端名 -> 后端配置。合法性已由 validate_config 保证，这里只做映射。
+DNNConfig make_dnn_config(const std::string& backend) {
+    if (backend == "cuda") return DNNConfig::cuda();
+    if (backend == "openvino") return DNNConfig::openvino();
+    return DNNConfig::cpu();
+}
 
 void print_usage(const char* argv0) {
     std::cout << "Usage: " << argv0
@@ -27,22 +35,22 @@ int main(int argc, char *argv[])
 
     const std::string source = argv[1];   // 摄像头索引，或图片/视频/URL 路径
 
-    DNNConfig dnn_config = DNNConfig::cpu();
-    int batch_mode = 0;  // 0=auto(按后端), 1=强制 batch, -1=强制逐张
+    // 全部可调项的唯一来源是 PipelineConfig；key 名单见 config.cpp 的 knob 表。
+    PipelineConfig cfg;
     bool show_help = false;
 
     for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
+        const std::string arg = argv[i];
         if (arg == "cpu") {
-            dnn_config = DNNConfig::cpu();
+            cfg.backend = "cpu";
         } else if (arg == "cuda") {
-            dnn_config = DNNConfig::cuda();
+            cfg.backend = "cuda";
         } else if (arg == "openvino") {
-            dnn_config = DNNConfig::openvino();
+            cfg.backend = "openvino";
         } else if (arg == "batch") {
-            batch_mode = 1;
+            cfg.batch_mode = 1;
         } else if (arg == "nobatch") {
-            batch_mode = -1;
+            cfg.batch_mode = -1;
         } else if (arg == "-h" || arg == "--help") {
             show_help = true;
         } else {
@@ -56,32 +64,36 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    float recogn_thresh = 0.2f;
-    const int rfactor = 6;
-    Size img_shape = {160, 120};
-    Size display_shape = img_shape * rfactor;
-    Size features_model_shape = {112, 112};
-    String detection_model = "./models/yunet_120x160.onnx";
-    String recognize_model = "./models/mobilefacenet.onnx";
-    String data_path = "./data/";
-
-    Detector detector(detection_model, img_shape, 0.6f, 0.3f, 750, dnn_config);
-    FeatureExtractor extractor(recognize_model, features_model_shape, dnn_config);
-    if (batch_mode != 0) {
-        extractor.set_batch_mode(batch_mode > 0);
+    std::string cfg_err;
+    std::vector<std::string> cfg_warnings;
+    if (!validate_config(cfg, cfg_err, cfg_warnings)) {
+        std::cerr << "Invalid config: " << cfg_err << std::endl;
+        return -1;
+    }
+    for (const auto& warning : cfg_warnings) {
+        std::cerr << "config warning: " << warning << std::endl;
     }
 
-    FeatureDatabase<CosSimilarity> database(data_path, detector, extractor,
-                                            display_shape, rfactor, recogn_thresh);
-    std::cout << "Loaded " << database.size() << " person(s) from " << data_path << std::endl;
+    const DNNConfig dnn_config = make_dnn_config(cfg.backend);
+    const Size img_shape = cfg.detector_input();
+    const Size display_shape = cfg.display_shape();
+    const int rfactor = cfg.rfactor;
 
-    // 跟踪器参数（实测于本机 CPU，960x720 帧，1 张人脸）：
-    //   YuNet 检测 0.93 ms/帧，MobileFaceNet 提特征 4.47 ms/脸 —— 提取才是瓶颈，
-    //   跳过检测每帧只省 ~0.75 ms，却让框最大误差从 5.9px 涨到 18px。
-    // 故默认每帧检测：跟踪器用于维持 ID、平滑，以及在检测漏掉人脸（遮挡等）时
-    // 用匀速预测补帧。硬件较弱时可调大 detect_every 换取性能，代价是框的跟随延迟。
-    // min_hits=1 => 首次检测到即出框，避免新人脸要等 N 次确认才显示。
-    FaceTracker tracker(0.45f, /*detect_every=*/1, /*max_lost=*/15, /*min_hits=*/1);
+    Detector detector(cfg.detector_model, img_shape, cfg.conf_thresh, cfg.nms_thresh,
+                      cfg.keep_top_k, dnn_config);
+    FeatureExtractor extractor(cfg.embedder_model, cfg.embedder_input(), dnn_config);
+    if (cfg.batch_mode != 0) {
+        extractor.set_batch_mode(cfg.batch_mode > 0);
+    }
+
+    FeatureDatabase<CosSimilarity> database(cfg.data_dir, detector, extractor,
+                                            display_shape, rfactor, cfg.recogn_thresh);
+    std::cout << "Loaded " << database.size() << " person(s) from " << cfg.data_dir << std::endl;
+
+    // 跟踪器默认值来自实测（本机 CPU，960x720，1 张人脸）：YuNet 检测 0.93 ms/帧，
+    // MobileFaceNet 提特征 4.47 ms/脸 —— 提取才是瓶颈，跳过检测每帧只省 ~0.75 ms，
+    // 却让框最大误差从 5.9px 涨到 18px，故默认每帧检测。详见 knob 表里的注释。
+    FaceTracker tracker(cfg.tracker_iou, cfg.detect_every, cfg.max_lost, cfg.min_hits);
 
     // 纯数字（不限一位）→ 摄像头索引；其它一律交给 VideoCapture，
     // 它接受图片、视频、URL、GStreamer 流水线等。注意单个数字 "0".."9" 若按

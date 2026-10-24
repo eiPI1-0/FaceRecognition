@@ -9,5 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-add_executable(main main.cpp priorbox.cpp utils.cpp FaceRecognition.cpp face_tracker.cpp)
+add_executable(main
+    main.cpp
+    config.cpp
+    priorbox.cpp
+    utils.cpp
+    FaceRecognition.cpp
+    face_tracker.cpp
+)
 target_link_libraries(main ${OpenCV_LIBS})
