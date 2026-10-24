@@ -212,19 +212,39 @@ Works by editing the yml only:
   floor-halved feature maps) equals the graph's own anchor count at every size. Set
   `detector.input_w/h`, and `display.rfactor` so the canvas stays a sane size.
 - **the tensor names** of a fused head — `detector.out_loc` / `out_conf` / `out_iou`.
+- **the other YuNet head layout** — `face_detection_yunet_2023mar.onnx` (320×320, outputs split
+  per level as `cls_8 … kps_32`) is decoded too: the head type is inferred from the model's own
+  layer names, so the only keys to change are `paths.detector_model`, `detector.input_w/h` (a
+  multiple of the largest stride, 32) and `display.rfactor` (3 gives a 960×960 canvas). No key
+  says which head it is — an unrecognized head is an error listing the names the model exposes.
 - **any ArcFace-convention embedder, at its native shape** — `paths.embedder_model` plus
   `embedder.input_w/h`. The aligned crop is warped to exactly that size, so the model must
   have been trained on that crop. Feature length is irrelevant (fusion and cosine are
   dimension-agnostic): verified by dropping in opencv_zoo SFace, whose output is 128-d
   instead of 512-d — self-match still 2/2.
 
-Not reachable from config, because it is a different graph:
+Two head layouts are understood: **fused** (one `loc` of 14 floats per anchor — 4 box + 5 × 2
+landmarks — plus `conf` (2 per anchor) and `iou` (1 per anchor), 4 levels at strides
+8/16/32/64) and **per-level** (`cls_{s}/obj_{s}/bbox_{s}/kps_{s}`, one anchor per cell, strides
+taken from the names). Anything else is an error at startup.
 
-- the detector head must be **fused**: one `loc` (14 floats per anchor — 4 box + 5 × 2
-  landmarks), one `conf` (2 per anchor), one `iou` (1 per anchor), over 4 levels at strides
-  8/16/32/64. opencv_zoo's `face_detection_yunet_2023mar.onnx` instead exports per-level
-  `cls_8 … kps_32`; that is a different decoding *scheme*, so it needs its own decoder, and
-  renaming cannot bridge it.
+Don't expect a free accuracy win from the bigger export — measured on the same scene, with the
+face placed at equal size **in detector space** (not equal size in the scene):
+
+| face size in detector pixels | pinned YuNet 120×160 (fused) | zoo 2023mar 320×320 (per-level) |
+|---|---|---|
+| ~76 px | — | detected, score 0.84 |
+| ~38 px | detected, score 0.51 | not detected |
+| ~19 px | score 0.20 | not detected |
+
+The per-level export's advantage is that a 320×320 input gives a 4:3 scene ~2.7× more detector
+pixels per face, so on the *same* scene it detects faces the small export misses; at equal
+detector pixels this export is the weaker one below ~50 px. On the augmentation harness (26
+samples, seed `12345`) the two are a wash: within 0.902 / between −0.039 / margin 0.941 for
+fused@160×120 vs 0.901 / −0.034 / 0.935 for per-level@320×320, zero detection misses either way.
+
+What stays fixed regardless of head:
+
 - **normalization is fixed per stage**: detector scale 1.0, no mean, BGR; embedder `1/255`
   then `(x − 0.5) / 0.5` on RGB — which is what InsightFace-family exports expect
   (mean/std 127.5).
@@ -232,9 +252,9 @@ Not reachable from config, because it is a different graph:
   embedder trained on a different crop (MTCNN/RetinaFace) runs without any error and scores
   badly — the one failure mode that stays silent, so check your scores after a swap.
 
-`PriorBox::decode` checks that contract instead of trusting it: when the tensors do not hold
-exactly one row per prior it stops and names both counts, which turns a wrong model/shape
-pair into a message rather than an out-of-bounds read.
+Both decoders check their layout contract instead of trusting it: when the tensors do not match
+the grid implied by `detector.input_w/h` they stop and name the sizes, which turns a wrong
+model/shape pair into a message rather than an out-of-bounds read.
 
 ---
 
@@ -306,6 +326,7 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 | `FaceRecognition.h` / `.cpp` | `DNNConfig`, `Detector`, `FeatureExtractor`, `Similarity`, header-only `FeatureDatabase<T>`; alignment (`align_face`, `align_detection`), `extract_face_feature(s)`, `list_person_dirs` |
 | `face_tracker.hpp` / `.cpp` | `FaceTracker` — IoU greedy matching + constant-velocity prediction |
 | `priorbox.hpp` / `.cpp` | YuNet prior-box generation and raw-output decoding |
+| `detector_head.hpp` / `.cpp` | head strategy: fused (via `PriorBox`) vs per-level YuNet-G, inferred from the model's layer names |
 | `utils.hpp` / `.cpp` | `nms()`, `draw()`, `letterbox()` |
 | `face_def.hpp` | POD types: `BndBox_xyxy` / `BndBox_xywh`, `Landmarks_5`, `Face` |
 
@@ -337,6 +358,11 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
   `conf.total() == priors*2`, `iou.total() == priors`). Before that check the decode loop
   indexed past the end of the tensors whenever the model's anchor count differed from the
   prior grid, and a type mismatch returned an empty face list that looked like "no faces".
+- **The decode scheme is inferred, never configured.** `make_detector_head()` looks at
+  `net.getLayerNames()`: the configured `detector.out_*` names → fused; a complete
+  `cls_{s}/obj_{s}/bbox_{s}/kps_{s}` family → per-level with strides from the names. Adding a
+  third layout means adding a class, not a key. The per-level grid is `input / stride`, so input
+  dims must be divisible by the largest stride (OpenCV's own implementation pads instead).
 - **The prior grid agreeing with the graph is an empirical fact**, not a theorem: strides
   8/16/32/64 over floor-halved feature maps matched this YuNet export at 160×120, 320×320,
   224², 200², 150², 128² and 640². A different export can use the same strides and still

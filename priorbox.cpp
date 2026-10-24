@@ -68,7 +68,7 @@ std::vector<BndBox_xywh> PriorBox::generate_priors() {
 std::vector<Face> PriorBox::decode(const cv::Mat& loc,
                                    const cv::Mat& conf,
                                    const cv::Mat& iou,
-                                   const float ignore_score) {
+                                   const float ignore_score) const {
     std::vector<Face> dets; // num * [x1, y1, x2, y2, x_re, y_re, x_le, y_le, x_ml, y_ml, x_n, y_n, x_mr, y_ml]
 
     // 头/先验网格的契约必须显式检查：返回空会被读成"没检测到脸"（与真漏检不可区分），

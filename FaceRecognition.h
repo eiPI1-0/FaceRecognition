@@ -6,7 +6,7 @@
 #include <memory>
 #include <utility>
 
-#include "priorbox.hpp"
+#include "detector_head.hpp"
 #include "utils.hpp"
 
 #include "opencv2/opencv.hpp"
@@ -26,10 +26,9 @@ struct DNNConfig {
 
 class Detector {
 public:
-    // output_names: 检测头三个输出张量的名字（本仓库的 YuNet 导出是 loc/conf/iou）。
-    // 换模型时若名字不同可改配置（detector.out_*）；但若头本身是按层拆开的
-    // cls_*/obj_*/bbox_*/kps_*，那是另一种解码方案，改名字救不回来
-    // （PriorBox::decode 会明确报错，而不是静默返回 0 张脸）。
+    // output_names: 融合头三个输出张量的名字（本仓库的 YuNet 导出是 loc/conf/iou），
+    // 只对融合头生效。按层拆开的头（cls_{s}/obj_{s}/bbox_{s}/kps_{s}）由模型自己的层名
+    // 推断并自动解码，不需要也不能用这三个名字描述。两种头都认不出来时构造即抛异常。
     Detector(const std::string& model_path, cv::Size input_shape,
              float conf_thresh = 0.6f, float nms_thresh = 0.3f, int keep_top_k = 750,
              const DNNConfig& config = DNNConfig::cpu(),
@@ -45,8 +44,7 @@ private:
     cv::Size input_shape;
     float conf_thresh, nms_thresh;
     int keep_top_k;
-    PriorBox pb;
-    std::vector<cv::String> output_names;
+    std::unique_ptr<DetectorHead> head;   // 解码方案，构造时从模型的输出层名推断
     std::vector<cv::Mat> output_blobs;
     std::vector<Face> dets;
     size_t detected_nums = 0;

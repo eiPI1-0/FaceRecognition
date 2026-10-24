@@ -26,11 +26,11 @@ detector.nms_thresh: 0.30
 detector.keep_top_k: 750
 
 # --- model contract ---
-# fused box+landmark tensor, 14 floats per anchor ('loc')
+# fused head only: box+landmark tensor, 14 floats per anchor ('loc')
 detector.out_loc: loc
 # 2-class score tensor ('conf')
 detector.out_conf: conf
-# objectness tensor ('iou'); a head split per level (cls_8/obj_8/bbox_8/kps_8...) is a different decode scheme, renaming cannot bridge it
+# fused head only: objectness tensor ('iou'). A per-level head (cls_8/obj_8/bbox_8/kps_8...) is detected from the model's own layer names and decoded automatically - these three keys do not apply to it
 detector.out_iou: iou
 
 # --- recognition ---

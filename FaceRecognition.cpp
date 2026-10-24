@@ -16,16 +16,16 @@ Detector::Detector(const std::string& model_path, cv::Size input_shape, float co
                    float nms_thresh, int keep_top_k,
                    const DNNConfig& config, std::vector<cv::String> output_names) :
         model(cv::dnn::readNet(model_path)), input_shape(std::move(input_shape)), conf_thresh(conf_thresh),
-        nms_thresh(nms_thresh), keep_top_k(keep_top_k), pb(input_shape, input_shape),
-        output_names(std::move(output_names)) {
-    if (this->output_names.size() != 3) {
+        nms_thresh(nms_thresh), keep_top_k(keep_top_k) {
+    if (output_names.size() != 3) {
         CV_Error(cv::Error::StsBadArg, "Detector: needs exactly 3 output names (loc, conf, iou)");
     }
-    for (const auto& name : this->output_names) {
+    for (const auto& name : output_names) {
         if (name.empty()) {
             CV_Error(cv::Error::StsBadArg, "Detector: empty detector output name");
         }
     }
+    head = make_detector_head(model.getLayerNames(), input_shape, output_names);
     model.setPreferableBackend(config.backend);
     model.setPreferableTarget(config.target);
 }
@@ -33,8 +33,8 @@ Detector::Detector(const std::string& model_path, cv::Size input_shape, float co
 std::vector<Face>& Detector::detect(cv::Mat& img) {
     cv::Mat blob = cv::dnn::blobFromImage(img, 1.0, input_shape, cv::Scalar());
     model.setInput(blob);
-    model.forward(output_blobs, output_names);
-    dets = pb.decode(output_blobs[0], output_blobs[1], output_blobs[2], conf_thresh);
+    model.forward(output_blobs, head->outputNames());
+    dets = head->decode(output_blobs, conf_thresh);
     if (!dets.empty()) {
         nms(dets, nms_thresh);
         if (dets.size() > keep_top_k) {

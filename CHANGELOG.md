@@ -33,9 +33,23 @@ than a strict versioning scheme.
   (`--set dnn.backend=openvino` on an OpenCV without that plugin) and a missing model file
   now print `Fatal: …` and exit non-zero; a missing data directory warns instead of
   loading 0 persons in silence.
-- `detector.out_loc` / `out_conf` / `out_iou`: the detector head's output tensor names are
-  config keys, so a differently-*named* fused YuNet head is a config change.
-- **The detector-head contract is checked, not assumed.** `PriorBox::decode` used to return an
+- `detector.out_loc` / `out_conf` / `out_iou`: the fused head's output tensor names are config
+  keys, so a differently-*named* fused YuNet head is a config change.
+- **A second detector head: per-level YuNet-G** (`cls_{s}/obj_{s}/bbox_{s}/kps_{s}`, one anchor
+  per cell) — i.e. opencv_zoo `face_detection_yunet_2023mar.onnx` now works from the config file
+  alone (`paths.detector_model`, `detector.input_w/h=320`, `display.rfactor=3`). Which head a
+  model uses is **inferred from its own layer names**, not configured: `make_detector_head()`
+  picks fused if the configured names are present, per-level if a complete `cls/obj/bbox/kps`
+  family is, and errors listing the model's outputs otherwise. The decode formulas follow
+  OpenCV 4.13 `modules/objdetect/src/face_detect.cpp` (`FaceDetectorYNImpl::postProcess`).
+  Measured with the same augmentation harness (seed `12345`, 26 samples, zero detection misses
+  both): fused@160×120 within 0.902 / between −0.039 / margin 0.941; per-level@320×320
+  0.901 / −0.034 / 0.935 — the bigger input is not a free win. On a small-face ladder at equal
+  *detector-space* size, the pinned 120×160 export wins (score 0.51 at 38 px vs nothing), while
+  at equal *scene* size the 320 export detects faces the small one misses (0.84 vs nothing);
+  that is the tradeoff, and it is documented in the README. This harness is a re-implementation
+  and is only comparable to itself, not to the older 0.845 figure.
+- **Both head decoders check their layout contract.** `PriorBox::decode` used to return an
   empty face list when the outputs had the wrong type/layout — indistinguishable from "no
   faces in this frame" — and when the model's anchor count differed from the prior grid the
   decode loop read past the end of the tensors (UB). It now names both counts and stops
@@ -60,6 +74,11 @@ than a strict versioning scheme.
 - `main()` is argument parsing and configuration only; the pipeline moved into
   `run_pipeline()`, with a single `cv::Exception` catch at the boundary.
 - Documentation and the tuning table now refer to config keys instead of `main.cpp` lines.
+
+---
+
+- `Detector` no longer owns a `PriorBox`; it owns a `DetectorHead` resolved at construction, so
+  adding a third layout is one class, not another config key. `PriorBox::decode` became `const`.
 
 ---
 

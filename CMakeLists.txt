@@ -13,6 +13,7 @@ add_executable(main
     main.cpp
     config.cpp
     priorbox.cpp
+    detector_head.cpp
     utils.cpp
     FaceRecognition.cpp
     face_tracker.cpp
