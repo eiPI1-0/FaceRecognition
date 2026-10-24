@@ -1,10 +1,12 @@
 #include "config.hpp"
 
+
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 namespace {
 
@@ -24,6 +26,13 @@ int edit_distance(const std::string& a, const std::string& b) {
 }
 
 // 去掉分隔符，让 `recogn_thresh` 与 `recognize.thresh` 在拼写纠错时等价
+std::string trim(const std::string& s) {
+    const size_t b = s.find_first_not_of(" \t\r");
+    if (b == std::string::npos) return std::string();
+    const size_t e = s.find_last_not_of(" \t\r");
+    return s.substr(b, e - b + 1);
+}
+
 std::string normalize_key(const std::string& key) {
     std::string out;
     out.reserve(key.size());
@@ -199,6 +208,57 @@ bool set_knob(const Knob& knob, const std::string& value, PipelineConfig& cfg, s
 
     err = std::string(knob.key) + ": unsupported knob type";
     return false;
+}
+
+bool load_config(const std::string& path, PipelineConfig& cfg,
+                 std::string& err, std::vector<std::string>& warnings) {
+    // 手写 flat 解析器，而不是 cv::FileStorage：后者要求文件以 `%YAML:1.0` 签名开头
+    // （只按内容嗅探、不看 .yml 扩展名），否则抛异常 —— 对一个人手编辑的配置文件是
+    // 多余的怪癖。且这样 parse + 区间校验与 --set 完全共用一份实现。
+    std::ifstream in(path);
+    if (!in) {
+        err = "cannot open config file: " + path;
+        return false;
+    }
+
+    int line_no = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        ++line_no;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        line = trim(line);
+        if (line.empty()) continue;
+
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            err = path + ":" + std::to_string(line_no) + ": expected 'key: value', got '" + line + "'";
+            return false;
+        }
+        const std::string key = trim(line.substr(0, colon));
+        std::string value = trim(line.substr(colon + 1));
+        if (value.size() >= 2 && value.front() == value.back() &&
+            (value.front() == '"' || value.front() == '\'')) {
+            value = value.substr(1, value.size() - 2);   // 允许 YAML 式引号
+        }
+
+        const Knob* knob = nullptr;
+        std::vector<std::string> candidates;
+        if (!find_knob(key, &knob, &candidates)) {
+            std::string msg = path + ":" + std::to_string(line_no) + ": unknown key '" + key + "'";
+            if (!candidates.empty()) {
+                msg += "; did you mean";
+                for (const auto& c : candidates) msg += " '" + c + "'";
+            }
+            warnings.push_back(msg + " (ignored)");
+            continue;
+        }
+        if (!set_knob(*knob, value, cfg, err)) {
+            err = path + ":" + std::to_string(line_no) + ": " + err;
+            return false;
+        }
+    }
+    return true;
 }
 
 bool validate_config(const PipelineConfig& cfg, std::string& err,

@@ -71,6 +71,11 @@ bool find_knob(const std::string& key, const Knob** knob, std::vector<std::strin
 // 从字符串设值（--set 用），带类型与区间校验；失败时 err 带 key 名与实际值。
 bool set_knob(const Knob& knob, const std::string& value, PipelineConfig& cfg, std::string& err);
 
+// 读 flat 点分 key 的配置文件（cv::FileStorage，零新依赖）。未知 key -> 警告并给候选；
+// 类型不符或越界 -> 硬失败，err 指名 key。文件不存在也失败（显式给的路径必须存在）。
+bool load_config(const std::string& path, PipelineConfig& cfg,
+                 std::string& err, std::vector<std::string>& warnings);
+
 // 区间校验 + 后端合法性 + 模型契约警告。返回 false 时 err 指名 key。
 bool validate_config(const PipelineConfig& cfg, std::string& err, std::vector<std::string>& warnings);
 

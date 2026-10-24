@@ -18,62 +18,20 @@ DNNConfig make_dnn_config(const std::string& backend) {
 
 void print_usage(const char* argv0) {
     std::cout << "Usage: " << argv0
-              << " <source> [cpu|cuda|openvino] [batch|nobatch]\n"
+              << " <source> [cpu|cuda|openvino] [batch|nobatch] [--config <path>]\n"
+              << "                   [--set key=value] [--dump-config]\n"
               << "  <source>           camera index (e.g. 0) or an image/video path or a URL\n"
               << "  cpu|cuda|openvino  DNN backend (default: cpu)\n"
-              << "  batch|nobatch      force batch embedding (default: auto by backend)\n";
+              << "  batch|nobatch      force batch embedding (default: auto by backend)\n"
+              << "  --config <path>    load a config file (flat `key: value` lines)\n"
+              << "  --set key=value    override one knob; repeatable\n"
+              << "  --dump-config      print the effective config and exit\n"
+              << "Precedence: built-in defaults < --config < CLI options.\n"
+              << "Run `--dump-config` for the full list of keys and what they do.\n";
 }
 
-}  // namespace
-
-int main(int argc, char *argv[])
-{
-    if (argc < 2) {
-        print_usage(argv[0]);
-        return -1;
-    }
-
-    const std::string source = argv[1];   // 摄像头索引，或图片/视频/URL 路径
-
-    // 全部可调项的唯一来源是 PipelineConfig；key 名单见 config.cpp 的 knob 表。
-    PipelineConfig cfg;
-    bool show_help = false;
-
-    for (int i = 2; i < argc; ++i) {
-        const std::string arg = argv[i];
-        if (arg == "cpu") {
-            cfg.backend = "cpu";
-        } else if (arg == "cuda") {
-            cfg.backend = "cuda";
-        } else if (arg == "openvino") {
-            cfg.backend = "openvino";
-        } else if (arg == "batch") {
-            cfg.batch_mode = 1;
-        } else if (arg == "nobatch") {
-            cfg.batch_mode = -1;
-        } else if (arg == "-h" || arg == "--help") {
-            show_help = true;
-        } else {
-            std::cerr << "Unknown option: " << arg << std::endl;
-            print_usage(argv[0]);
-            return -1;
-        }
-    }
-    if (show_help) {
-        print_usage(argv[0]);
-        return 0;
-    }
-
-    std::string cfg_err;
-    std::vector<std::string> cfg_warnings;
-    if (!validate_config(cfg, cfg_err, cfg_warnings)) {
-        std::cerr << "Invalid config: " << cfg_err << std::endl;
-        return -1;
-    }
-    for (const auto& warning : cfg_warnings) {
-        std::cerr << "config warning: " << warning << std::endl;
-    }
-
+// 建流水线 + 跑循环。异常（模型读盘失败、后端不可用）由 main 的 catch 统一兜住。
+int run_pipeline(const PipelineConfig& cfg, const std::string& source) {
     const DNNConfig dnn_config = make_dnn_config(cfg.backend);
     const Size img_shape = cfg.detector_input();
     const Size display_shape = cfg.display_shape();
@@ -179,3 +137,121 @@ int main(int argc, char *argv[])
 
     return 0;
 }
+
+}  // namespace
+
+int main(int argc, char *argv[])
+{
+    // 全部可调项的唯一来源是 PipelineConfig；key 名单见 config.cpp 的 knob 表。
+    // 优先级：内置默认 < 配置文件 < 命令行。故命令行覆盖项先记下来，加载文件之后再应用。
+    PipelineConfig cfg;
+    std::string source;        // 摄像头索引，或图片/视频/URL 路径
+    std::string config_path;
+    // CLI 覆盖按出现顺序记录，全部在配置文件之后应用 => 优先级
+    // 内置默认 < 配置文件 < 命令行（后出现的覆盖先出现的）。
+    // backend/batch 这类便捷 token 也走同一条通道，不另设专用变量。
+    std::vector<std::pair<std::string, std::string>> overrides;
+    bool show_help = false;
+    bool dump_only = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "cpu" || arg == "cuda" || arg == "openvino") {
+            overrides.emplace_back("dnn.backend", arg);
+        } else if (arg == "batch") {
+            overrides.emplace_back("dnn.batch_mode", "1");
+        } else if (arg == "nobatch") {
+            overrides.emplace_back("dnn.batch_mode", "-1");
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            std::string assignment = (arg == "--set") ? ((i + 1 < argc) ? argv[++i] : std::string())
+                                                      : arg.substr(std::string("--set=").size());
+            const size_t eq = assignment.find('=');
+            if (eq == std::string::npos) {
+                std::cerr << "--set expects key=value, got '" << assignment << "'" << std::endl;
+                return -1;
+            }
+            overrides.emplace_back(assignment.substr(0, eq), assignment.substr(eq + 1));
+        } else if (arg == "--config") {
+            if (i + 1 >= argc) {
+                std::cerr << "--config expects a path" << std::endl;
+                return -1;
+            }
+            config_path = argv[++i];
+        } else if (arg.rfind("--config=", 0) == 0) {
+            config_path = arg.substr(std::string("--config=").size());
+        } else if (arg == "--dump-config") {
+            dump_only = true;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else if (arg.rfind("--", 0) == 0) {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            print_usage(argv[0]);
+            return -1;
+        } else if (!source.empty()) {
+            std::cerr << "More than one source: " << source << " and " << arg << std::endl;
+            return -1;
+        } else {
+            source = arg;
+        }
+    }
+
+    if (show_help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    std::string cfg_err;
+    std::vector<std::string> cfg_warnings;
+    if (!config_path.empty() && !load_config(config_path, cfg, cfg_err, cfg_warnings)) {
+        std::cerr << "Invalid config: " << cfg_err << std::endl;
+        return -1;
+    }
+    for (const auto& override : overrides) {
+        const Knob* knob = nullptr;
+        std::vector<std::string> candidates;
+        if (!find_knob(override.first, &knob, &candidates)) {
+            std::cerr << "Unknown knob: " << override.first;
+            if (!candidates.empty()) {
+                std::cerr << "; did you mean";
+                for (const auto& c : candidates) std::cerr << " " << c;
+            } else {
+                std::cerr << "; valid keys:";
+                for (const auto& k : knobs()) std::cerr << " " << k.key;
+            }
+            std::cerr << std::endl;
+            return -1;
+        }
+        if (!set_knob(*knob, override.second, cfg, cfg_err)) {
+            std::cerr << "Invalid config: " << cfg_err << std::endl;
+            return -1;
+        }
+    }
+
+    if (!validate_config(cfg, cfg_err, cfg_warnings)) {
+        std::cerr << "Invalid config: " << cfg_err << std::endl;
+        return -1;
+    }
+    for (const auto& warning : cfg_warnings) {
+        std::cerr << "config warning: " << warning << std::endl;
+    }
+
+    if (dump_only) {
+        dump_config(std::cout, cfg);
+        return 0;
+    }
+    if (source.empty()) {
+        std::cerr << "No source given." << std::endl;
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    try {
+        return run_pipeline(cfg, source);
+    } catch (const cv::Exception& e) {
+        // 模型文件缺失、后端没编进 OpenCV（本机既无 cuda 也无 openvino 插件）都会抛
+        // cv::Exception。配置项让这些变成用户可犯的错，所以要报清原因而非 core dump。
+        std::cerr << "Fatal: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
