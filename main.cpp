@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <charconv>
+#include <filesystem>
 #include "FaceRecognition.h"
 #include "face_tracker.hpp"
 #include "config.hpp"
@@ -226,6 +227,16 @@ int main(int argc, char *argv[])
             return -1;
         }
     }
+
+    // 所有输入都应用完了，才解析资产路径：默认值/配置文件/--set 里的相对路径
+    // 统一挂到 paths.root 上，而 root 未指定时取配置文件所在目录（没有配置文件就是 cwd）。
+    const std::string default_root =
+        config_path.empty()
+            ? std::string(".")
+            : (std::filesystem::path(config_path).parent_path().empty()
+                   ? std::string(".")
+                   : std::filesystem::path(config_path).parent_path().string());
+    resolve_asset_paths(cfg, default_root);
 
     if (!validate_config(cfg, cfg_err, cfg_warnings)) {
         std::cerr << "Invalid config: " << cfg_err << std::endl;

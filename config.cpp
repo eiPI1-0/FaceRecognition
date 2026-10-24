@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 
 namespace {
@@ -84,6 +85,10 @@ const std::vector<Knob>& knobs() {
     // key 命名 = 配置文件里的 key = --set 的 key = dump 的 key，三者同一字符串。
     // 表顺序 = dump 顺序；group 变化处打印一行分节标题，comment 写在该 key 上方。
     static const std::vector<Knob> table = {
+        {"paths.root", &PipelineConfig::asset_root,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "paths", "relative asset paths are resolved against this; empty means the config "
+                  "file's directory, or the working directory when no config file is given"},
         {"paths.detector_model", &PipelineConfig::detector_model,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
          "paths", "relative paths resolve against the config file's directory"},
@@ -261,6 +266,28 @@ bool load_config(const std::string& path, PipelineConfig& cfg,
     return true;
 }
 
+void resolve_asset_paths(PipelineConfig& cfg, const std::string& default_root) {
+    namespace fs = std::filesystem;
+    const std::string root_str = cfg.asset_root.empty() ? default_root : cfg.asset_root;
+    const fs::path root = root_str.empty() ? fs::path(".") : fs::path(root_str);
+    cfg.asset_root = root.lexically_normal().string();
+
+    // 成员指针常量不能靠 auto 推导，显式写类型
+    const StrMember paths[] = {&PipelineConfig::detector_model, &PipelineConfig::embedder_model,
+                               &PipelineConfig::data_dir};
+    for (StrMember member : paths) {
+        std::string& value = cfg.*member;
+        const fs::path p(value);
+        if (!p.is_absolute()) {
+            value = (root / p).lexically_normal().string();
+        }
+    }
+    // data_dir 是拼接前缀用，保证结尾有分隔符
+    if (!cfg.data_dir.empty() && cfg.data_dir.back() != '/') {
+        cfg.data_dir.push_back('/');
+    }
+}
+
 bool validate_config(const PipelineConfig& cfg, std::string& err,
                      std::vector<std::string>& warnings) {
     for (const auto& k : knobs()) {
@@ -285,6 +312,13 @@ bool validate_config(const PipelineConfig& cfg, std::string& err,
         err = "display.rfactor: " + std::to_string(cfg.rfactor) +
               " gives a display frame smaller than the detector input";
         return false;
+    }
+
+    // 资产不存在时不静默跑成 0 人 —— 这是配置项最容易犯的错。
+    std::error_code ec;
+    if (!std::filesystem::exists(cfg.data_dir, ec)) {
+        warnings.push_back("data dir does not exist: " + cfg.data_dir +
+                           " (no one will be recognized)");
     }
 
     // 模型契约警告：用默认模型文件名却给了别的输入尺寸，几乎一定是接错。

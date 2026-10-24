@@ -13,7 +13,9 @@
 // 库层（FaceRecognition.h）绝不包含本头：FeatureDatabase<T> 是 header-only 模板，
 // 把 app 层概念漏进库头 = 每次调参全量重编。
 struct PipelineConfig {
-    // 资产路径（默认相对当前工作目录；带 --config 时相对配置文件所在目录）
+    // 资产路径。三条相对路径都相对 asset_root 解析（见 resolve_asset_paths）；
+    // asset_root 为空表示"未指定"，由调用方给默认值（无配置文件时就是 "."）。
+    std::string asset_root;
     std::string detector_model = "./models/yunet_120x160.onnx";
     std::string embedder_model = "./models/mobilefacenet.onnx";
     std::string data_dir       = "./data/";
@@ -75,6 +77,10 @@ bool set_knob(const Knob& knob, const std::string& value, PipelineConfig& cfg, s
 // 类型不符或越界 -> 硬失败，err 指名 key。文件不存在也失败（显式给的路径必须存在）。
 bool load_config(const std::string& path, PipelineConfig& cfg,
                  std::string& err, std::vector<std::string>& warnings);
+
+// 把三条相对资产路径挂到 asset_root 上（绝对路径原样保留）。在所有输入
+// （默认值 / 配置文件 / --set）都应用完之后调用一次，避免"半解析"的歧义。
+void resolve_asset_paths(PipelineConfig& cfg, const std::string& default_root);
 
 // 区间校验 + 后端合法性 + 模型契约警告。返回 false 时 err 指名 key。
 bool validate_config(const PipelineConfig& cfg, std::string& err, std::vector<std::string>& warnings);
