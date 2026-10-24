@@ -47,11 +47,11 @@ private:
     size_t detected_nums = 0;
 };
 
-// 对齐单张人脸 ROI 到固定尺寸（默认 112x112），供嵌入提取使用。
-// left_eye / right_eye 均为 face_roi 内的坐标。
+// 用 5 个关键点做相似变换（旋转+缩放+平移，与 ArcFace/MobileFaceNet 训练时的
+// 对齐约定一致），把 face_roi 对齐到 output_size（默认 112x112）。
+// lm 中的关键点均为 face_roi 内坐标。返回对齐后的人脸；几何退化时返回空 Mat。
 cv::Mat align_face(const cv::Mat& face_roi,
-                   const cv::Point2f& left_eye,
-                   const cv::Point2f& right_eye,
+                   const Landmarks_5& lm,
                    const cv::Size& output_size = cv::Size(112, 112));
 
 // 纯函数：根据原图 + 检测框，对齐单人脸到固定尺寸（默认 112x112），不提取特征。

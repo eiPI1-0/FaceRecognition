@@ -3,12 +3,14 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
-const double PI = 3.141592653589793;
+
 
 Detector::Detector(const std::string& model_path, cv::Size input_shape, float conf_thresh,
                    float nms_thresh, int keep_top_k,
@@ -69,41 +71,110 @@ std::vector<std::string> list_person_dirs(const std::string& path) {
     return dirs;
 }
 
-// 对齐单张人脸：在 face_roi 内根据双眼位置做仿射变换，输出固定尺寸的人脸图。
-// 参考模板：双眼水平，位于输出图像上方 40% 处，间距占宽度的 30%。
+namespace {
+
+// ArcFace 标准 5 点参考模板（112x112 帧），嵌入模型训练时使用的对齐约定。
+// 槽位顺序：[0]=眼睛A, [1]=眼睛B, [2]=嘴A, [3]=鼻, [4]=嘴B
+// 数值来源：insightface / ArcFace 默认 arcface_src。
+const float ARC_TEMPLATE[5][2] = {
+    {38.2946f, 51.6963f},
+    {73.5318f, 51.5014f},
+    {41.5493f, 92.3655f},
+    {56.0252f, 71.7366f},
+    {70.7299f, 92.5066f},
+};
+
+// 最小二乘拟合相似变换（旋转+均匀缩放+平移，4 自由度），把 src 映射到 dst。
+// 闭式解：把 (a+bi) 当作复数缩放因子，a = Σdot/A，b = Σcross/A。
+cv::Mat fit_similarity(const std::array<cv::Point2f, 5>& src,
+                       const std::array<cv::Point2f, 5>& dst,
+                       double* rms_out) {
+    cv::Point2f sc(0.f, 0.f), dc(0.f, 0.f);
+    for (int i = 0; i < 5; ++i) { sc += src[i]; dc += dst[i]; }
+    sc *= 0.2f;
+    dc *= 0.2f;
+
+    double A = 0.0, C = 0.0, B = 0.0;
+    for (int i = 0; i < 5; ++i) {
+        double px = src[i].x - sc.x, py = src[i].y - sc.y;
+        double qx = dst[i].x - dc.x, qy = dst[i].y - dc.y;
+        A += px * px + py * py;
+        C += px * qx + py * qy;
+        B += px * qy - py * qx;
+    }
+    if (A < 1e-9) {
+        return {};
+    }
+
+    const double a = C / A;
+    const double b = B / A;
+    const double tx = dc.x - (a * sc.x - b * sc.y);
+    const double ty = dc.y - (b * sc.x + a * sc.y);
+
+    if (rms_out) {
+        double rss = 0.0;
+        for (int i = 0; i < 5; ++i) {
+            double x = a * src[i].x - b * src[i].y + tx;
+            double y = b * src[i].x + a * src[i].y + ty;
+            rss += (x - dst[i].x) * (x - dst[i].x) + (y - dst[i].y) * (y - dst[i].y);
+        }
+        *rms_out = std::sqrt(rss / 5.0);
+    }
+
+    return (cv::Mat_<double>(2, 3) << a, -b, tx, b, a, ty);
+}
+
+}  // namespace
+
+// 用 5 点相似变换对齐人脸。
 cv::Mat align_face(const cv::Mat& face_roi,
-                   const cv::Point2f& left_eye,
-                   const cv::Point2f& right_eye,
+                   const Landmarks_5& lm,
                    const cv::Size& output_size) {
-    if (face_roi.empty()) {
+    if (face_roi.empty() || output_size.width <= 0 || output_size.height <= 0) {
         return {};
     }
 
-    float dx = right_eye.x - left_eye.x;
-    float dy = right_eye.y - left_eye.y;
-    float dist = std::sqrt(dx * dx + dy * dy);
-    if (dist < 1e-3f) {
-        return {};
+    // 模板按输出尺寸缩放（模板定义在 112x112 帧）
+    const float fx = static_cast<float>(output_size.width) / 112.0f;
+    const float fy = static_cast<float>(output_size.height) / 112.0f;
+    std::array<cv::Point2f, 5> dst;
+    for (int i = 0; i < 5; ++i) {
+        dst[i] = cv::Point2f(ARC_TEMPLATE[i][0] * fx, ARC_TEMPLATE[i][1] * fy);
     }
 
-    // 参考眼睛位置（输出图像坐标系）
-    cv::Point2f left_ref(output_size.width * 0.35f, output_size.height * 0.40f);
-    cv::Point2f right_ref(output_size.width * 0.65f, output_size.height * 0.40f);
-    float ref_dist = right_ref.x - left_ref.x;
+    std::array<cv::Point2f, 5> base;
+    base[0] = lm.right_eye;
+    base[1] = lm.left_eye;
+    base[2] = lm.mouth_left;
+    base[3] = lm.nose_tip;
+    base[4] = lm.mouth_right;
 
-    double scale = ref_dist / dist;
-    double angle = std::atan2(dy, dx) * 180.0 / PI;
+    // YuNet 的 left/right 指人物自身左右，模板槽位按图像方位定义，两者可能左右相反
+    //（镜像照片、大角度侧脸时更明显）。这里枚举眼睛/嘴的两两交换，取拟合残差最小的
+    // 配对，避免靠命名约定硬猜。
+    cv::Mat best;
+    double best_rms = std::numeric_limits<double>::max();
+    for (int swap_eyes = 0; swap_eyes < 2; ++swap_eyes) {
+        for (int swap_mouth = 0; swap_mouth < 2; ++swap_mouth) {
+            std::array<cv::Point2f, 5> src = base;
+            if (swap_eyes) std::swap(src[0], src[1]);
+            if (swap_mouth) std::swap(src[2], src[4]);
 
-    cv::Point2f center = (left_eye + right_eye) * 0.5f;
-    cv::Mat rot = cv::getRotationMatrix2D(center, angle, scale);
-
-    // 平移：将人脸双眼中点对齐到参考双眼中点
-    cv::Point2f ref_center = (left_ref + right_ref) * 0.5f;
-    rot.at<double>(0, 2) += ref_center.x - center.x;
-    rot.at<double>(1, 2) += ref_center.y - center.y;
+            double rms = 0.0;
+            cv::Mat M = fit_similarity(src, dst, &rms);
+            if (M.empty()) continue;
+            if (rms < best_rms) {
+                best_rms = rms;
+                best = M;
+            }
+        }
+    }
+    if (best.empty()) {
+        return {};
+    }
 
     cv::Mat aligned;
-    cv::warpAffine(face_roi, aligned, rot, output_size);
+    cv::warpAffine(face_roi, aligned, best, output_size);
     return aligned;
 }
 
@@ -116,30 +187,47 @@ cv::Mat align_detection(const cv::Mat& img, const Face& det,
         return {};
     }
 
-    // 将检测坐标系 (detection_shape) 映射到原图坐标系
-    float sx = static_cast<float>(img.cols) / detection_shape.width;
-    float sy = static_cast<float>(img.rows) / detection_shape.height;
+    // 将关键点从检测坐标系 (detection_shape) 映射到原图坐标系
+    const float sx = static_cast<float>(img.cols) / detection_shape.width;
+    const float sy = static_cast<float>(img.rows) / detection_shape.height;
 
-    cv::Point2f tl(det.bbox.top_left.x * sx, det.bbox.top_left.y * sy);
-    cv::Point2f br(det.bbox.bottom_right.x * sx, det.bbox.bottom_right.y * sy);
-    cv::Rect face_area(cv::Point(cvRound(tl.x), cvRound(tl.y)),
-                       cv::Point(cvRound(br.x), cvRound(br.y)));
+    Landmarks_5 lm;
+    lm.right_eye    = cv::Point2f(det.landmarks.right_eye.x * sx,    det.landmarks.right_eye.y * sy);
+    lm.left_eye     = cv::Point2f(det.landmarks.left_eye.x * sx,     det.landmarks.left_eye.y * sy);
+    lm.mouth_left   = cv::Point2f(det.landmarks.mouth_left.x * sx,   det.landmarks.mouth_left.y * sy);
+    lm.nose_tip     = cv::Point2f(det.landmarks.nose_tip.x * sx,     det.landmarks.nose_tip.y * sy);
+    lm.mouth_right  = cv::Point2f(det.landmarks.mouth_right.x * sx,  det.landmarks.mouth_right.y * sy);
 
-    cv::Mat face_roi;
-    try {
-        face_roi = img(face_area);
-    } catch (const cv::Exception&) {
+    const float eye_dist = cv::norm(lm.left_eye - lm.right_eye);
+    if (eye_dist < 1e-3f) {
         return {};
     }
 
-    // 眼睛点映射到原图，再减去 ROI 左上角得到 ROI 内坐标
-    cv::Point2f roi_tl(static_cast<float>(face_area.x), static_cast<float>(face_area.y));
-    cv::Point2f left_eye(det.landmarks.left_eye.x * sx - roi_tl.x,
-                         det.landmarks.left_eye.y * sy - roi_tl.y);
-    cv::Point2f right_eye(det.landmarks.right_eye.x * sx - roi_tl.x,
-                          det.landmarks.right_eye.y * sy - roi_tl.y);
+    // 取方形 ROI：112x112 模板窗口对应约 3.2 倍眼距（模板眼距 35.24px），
+    // 紧致 bbox 会裁掉旋转/缩放后需要的像素。
+    const float side = 3.2f * eye_dist;
+    cv::Point2f center = (lm.right_eye + lm.left_eye + lm.mouth_left +
+                          lm.nose_tip + lm.mouth_right) * 0.2f;
 
-    return align_face(face_roi, left_eye, right_eye, output_size);
+    cv::Rect face_area(cvRound(center.x - side * 0.5f), cvRound(center.y - side * 0.5f),
+                       cvRound(side), cvRound(side));
+    // 越界时收缩到图内（相似变换由关键点决定，收缩只影响可见像素，不改变对齐结果）
+    face_area &= cv::Rect(0, 0, img.cols, img.rows);
+    if (face_area.area() <= 0) {
+        return {};
+    }
+
+    cv::Mat face_roi = img(face_area);
+
+    // 关键点转成 ROI 内坐标
+    const cv::Point2f roi_tl(static_cast<float>(face_area.x), static_cast<float>(face_area.y));
+    lm.right_eye   -= roi_tl;
+    lm.left_eye    -= roi_tl;
+    lm.mouth_left  -= roi_tl;
+    lm.nose_tip    -= roi_tl;
+    lm.mouth_right -= roi_tl;
+
+    return align_face(face_roi, lm, output_size);
 }
 
 // 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。

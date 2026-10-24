@@ -106,22 +106,23 @@ std::vector<Face> PriorBox::decode(const cv::Mat& loc,
         float y2 = (cy + h / 2) * out_h;
         face.bbox = { {x1, y1}, {x2, y2} };
 
-        // get landmarks, loc->[right_eye, left_eye, mouth_left, nose, mouth_right]
+        // YuNet 关键点顺序: loc->[right_eye, left_eye, nose, mouth_left, mouth_right]
+        // 注意 8,9 是鼻子而非嘴（历史版本在此处把 nose 与 mouth_left 接反了）
         float x_re = (priors[i].center.x + loc_v[i*14+ 4] * variance[0] * priors[i].w) * out_w;
         float y_re = (priors[i].center.y + loc_v[i*14+ 5] * variance[0] * priors[i].h) * out_h;
         float x_le = (priors[i].center.x + loc_v[i*14+ 6] * variance[0] * priors[i].w) * out_w;
         float y_le = (priors[i].center.y + loc_v[i*14+ 7] * variance[0] * priors[i].h) * out_h;
-        float x_ml = (priors[i].center.x + loc_v[i*14+ 8] * variance[0] * priors[i].w) * out_w;
-        float y_ml = (priors[i].center.y + loc_v[i*14+ 9] * variance[0] * priors[i].h) * out_h;
-        float x_n  = (priors[i].center.x + loc_v[i*14+10] * variance[0] * priors[i].w) * out_w;
-        float y_n  = (priors[i].center.y + loc_v[i*14+11] * variance[0] * priors[i].h) * out_h;
+        float x_n  = (priors[i].center.x + loc_v[i*14+ 8] * variance[0] * priors[i].w) * out_w;
+        float y_n  = (priors[i].center.y + loc_v[i*14+ 9] * variance[0] * priors[i].h) * out_h;
+        float x_ml = (priors[i].center.x + loc_v[i*14+10] * variance[0] * priors[i].w) * out_w;
+        float y_ml = (priors[i].center.y + loc_v[i*14+11] * variance[0] * priors[i].h) * out_h;
         float x_mr = (priors[i].center.x + loc_v[i*14+12] * variance[0] * priors[i].w) * out_w;
         float y_mr = (priors[i].center.y + loc_v[i*14+13] * variance[0] * priors[i].h) * out_h;
         face.landmarks = {
-            {x_re, y_re}, // right eye
-            {x_le, y_le}, // left eye
-            {x_ml, y_ml}, // mouth left
-            {x_n,  y_n },  // nose
+            {x_re, y_re}, // right eye  (人物的右眼，位于图像左侧)
+            {x_le, y_le}, // left eye   (人物的左眼，位于图像右侧)
+            {x_ml, y_ml}, // mouth left (人物的左嘴角，位于图像右侧)
+            {x_n,  y_n }, // nose
             {x_mr, y_mr}  // mouth right
         };
 
