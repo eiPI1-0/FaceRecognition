@@ -68,6 +68,11 @@ The detector can be fetched automatically:
 ./scripts/get_models.sh --with-yunet-320   # + the 320x320 per-level export (see "Swapping models")
 ```
 
+A model path that points at nothing, at an empty file (what a failed `curl -o` leaves behind),
+or at a Git LFS pointer is reported by the knob that names it — `Invalid config:
+paths.detector_model: model file … is a Git LFS pointer (131 bytes), not weights` — instead of
+surfacing as an ONNX importer stack.
+
 **Detector** — YuNet, 160×120 input. Upstream restructured `ShiqiYu/libfacedetection.train`
 and deleted the old `tasks/task1/onnx/` path, so a branch-name URL 404s; the file is pinned
 to the commit that shipped it:
@@ -77,7 +82,8 @@ https://raw.githubusercontent.com/ShiqiYu/libfacedetection.train/1688402dbd9b9fc
 sha256 50ef07f702a31741ca46a4c0d947773b64143b9362780237bf0d427d6c79bab7   345478 bytes
 ```
 
-opencv_zoo's exports (`2023mar`, `2026may`) work as alternate detectors but are **not drop-in
+opencv_zoo's exports (`2023mar`, and `2026may` — the same weights re-exported with dynamic
+input dims, for OpenCV 5's ONNX Runtime engine) work as alternate detectors but are **not drop-in
 defaults** — they are 320×320 with a per-level head, so they need the config keys listed under
 "Swapping models"; `--with-yunet-320` fetches the first one, pinned and checksummed. A
 community re-export of the 120×160 shape is a different matter: at least one fails to parse in
@@ -224,7 +230,9 @@ Works by editing the yml only:
   model rather than a hardcoded grid, other per-level exports run unchanged: zoo's newer
   `face_detection_yunet_2026may.onnx` was tried with no code or config change beyond the model
   path, and detects and self-matches (1.000) at both 320×320 and 160×160 — it is not fetched by
-  the script and has not been put through the numbers below.
+  the script and has not been put through the numbers below. OpenCV 4's DNN is shape-agnostic,
+  so either of those runs at **any** input size divisible by 32 (`detector.input_w/h`); the model
+  was trained at 320×320, so quality away from that size is unmeasured, not guaranteed.
 - **any ArcFace-convention embedder, at its native shape** — `paths.embedder_model` plus
   `embedder.input_w/h`. The aligned crop is warped to exactly that size, so the model must
   have been trained on that crop. Feature length is irrelevant (fusion and cosine are

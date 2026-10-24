@@ -54,6 +54,11 @@ than a strict versioning scheme.
   deletes the partial file and exits non-zero). Re-pinning note: zoo's files are Git-LFS
   objects, so `raw.githubusercontent.com/<repo>/<commit>/<path>` returns the 131-byte pointer —
   `github.com/<repo>/raw/<commit>/<path>` serves the content.
+- Model files are sniffed before the network is built: a missing path, a 0-byte file (a failed
+  `curl -o`) or a 131-byte Git LFS pointer each used to arrive as an ONNX importer assertion.
+  They now stop as `Invalid config: paths.<key>: model file <path> is a Git LFS pointer …` —
+  named by the knob that points at them, and deliberately *not* checked by `--dump-config`,
+  which should work on a clone with no weights yet.
 - **Both head decoders check their layout contract.** `PriorBox::decode` used to return an
   empty face list when the outputs had the wrong type/layout — indistinguishable from "no
   faces in this frame" — and when the model's anchor count differed from the prior grid the

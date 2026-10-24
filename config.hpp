@@ -87,6 +87,11 @@ void resolve_asset_paths(PipelineConfig& cfg, const std::string& default_root);
 // 区间校验 + 后端合法性 + 模型契约警告。返回 false 时 err 指名 key。
 bool validate_config(const PipelineConfig& cfg, std::string& err, std::vector<std::string>& warnings);
 
+// 模型文件能不能真被加载：不存在 / 0 字节 / 其实是个 Git LFS 指针。
+// 与 validate_config 分开，因为 --dump-config 不需要模型在场；而这些检查只在真要跑
+// 流水线时才该拦。报的错带 knob 名，用户才知道改哪一行。
+bool check_model_files(const PipelineConfig& cfg, std::string& err);
+
 // 把当前配置写成 flat 点分 key 的 YAML 风格文本（可读、可 grep、与 --set 同构）。
 void dump_config(std::ostream& os, const PipelineConfig& cfg);
 

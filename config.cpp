@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 
@@ -363,6 +364,58 @@ bool validate_config(const PipelineConfig& cfg, std::string& err,
     if (cfg.detect_every > 1) {
         warnings.push_back("tracker.detect_every > 1 trades ~0.75 ms/frame for box lag "
                            "(measured: max box error 5.9px at 1, ~18px at 5)");
+    }
+    return true;
+}
+
+namespace {
+
+// 三种"文件在但读不出模型"的形态，都会在 OpenCV 的 ONNX importer 里变成一句天书：
+// 下载失败留下的 0 字节文件、git-lfs 没 pull 时权重位置上的 131 字节指针、
+// 以及截断/HTML 错误页。这里按字节嗅一下，报出成因与出路。
+bool sniff_model_file(const std::string& path, std::string& problem) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::uintmax_t size = fs::file_size(path, ec);
+    if (ec) {
+        problem = "cannot be read (" + ec.message() + ")";
+        return false;
+    }
+    if (size == 0) {
+        problem = "is empty (0 bytes) - a failed download usually leaves this";
+        return false;
+    }
+    if (size < 1024) {
+        std::ifstream in(path, std::ios::binary);
+        std::string head(64, '\0');
+        in.read(&head[0], static_cast<std::streamsize>(head.size()));
+        const auto n = static_cast<size_t>(in.gcount());
+        head.resize(n);
+        if (head.rfind("version https://git-lfs", 0) == 0) {
+            problem = "is a Git LFS pointer (" + std::to_string(size) +
+                      " bytes), not weights - run `git lfs pull`, or download through "
+                      "github.com/<repo>/raw/<commit>/<path>, which serves the content";
+            return false;
+        }
+        problem = "is only " + std::to_string(size) + " bytes, too small to be an ONNX model";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool check_model_files(const PipelineConfig& cfg, std::string& err) {
+    const struct { const char* key; const std::string* path; } models[] = {
+        {"paths.detector_model", &cfg.detector_model},
+        {"paths.embedder_model", &cfg.embedder_model},
+    };
+    for (const auto& m : models) {
+        std::string problem;
+        if (!sniff_model_file(*m.path, problem)) {
+            err = std::string(m.key) + ": model file " + *m.path + " " + problem;
+            return false;
+        }
     }
     return true;
 }

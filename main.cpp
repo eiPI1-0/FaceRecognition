@@ -251,6 +251,14 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // 模型文件在场且真是权重，才值得去建流水线：否则报错来自 OpenCV 的 importer，
+    // 用户看不出是哪个 knob 指错了。
+    std::string asset_err;
+    if (!check_model_files(cfg, asset_err)) {
+        std::cerr << "Invalid config: " << asset_err << std::endl;
+        return -1;
+    }
+
     try {
         return run_pipeline(cfg, source);
     } catch (const cv::Exception& e) {
