@@ -54,23 +54,45 @@ cv::Mat align_face(const cv::Mat& face_roi,
                    const cv::Point2f& right_eye,
                    const cv::Size& output_size = cv::Size(112, 112));
 
-// 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
+// 纯函数：根据原图 + 检测框，对齐单人脸到固定尺寸（默认 112x112），不提取特征。
 // det 的 bbox/landmarks 坐标系与 detection_shape 一致（默认 160x120），
 // 内部自动映射到原图坐标系后再做裁剪与对齐。
+cv::Mat align_detection(const cv::Mat& img, const Face& det,
+                        const cv::Size& detection_shape,
+                        const cv::Size& output_size = cv::Size(112, 112));
+
+// 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
 cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
                              FeatureExtractor& extractor,
                              const cv::Size& detection_shape,
                              const cv::Size& output_size = cv::Size(112, 112));
+
+// 对齐并提取全部人脸特征。返回的 features[i] 与 dets[i] 一一对应，
+// 对齐失败的人脸对应空 Mat。batch/逐张策略由 extractor.batch_mode() 决定。
+std::vector<cv::Mat> extract_face_features(const cv::Mat& img,
+                                           const std::vector<Face>& dets,
+                                           FeatureExtractor& extractor,
+                                           const cv::Size& detection_shape);
 
 class FeatureExtractor {
 public:
     FeatureExtractor(const std::string& model_path, cv::Size input_shape,
                      const DNNConfig& config = DNNConfig::cpu());
     cv::Mat extract(const cv::Mat& img);
+    // 批量提取：一次 forward 处理多张对齐后的人脸（均应为 input_shape 尺寸）。
+    // 返回与输入等长的特征向量，顺序一一对应。
+    std::vector<cv::Mat> extract_batch(const std::vector<cv::Mat>& imgs);
+
+    // 是否使用 batch 前向。仅对 GPU/NPU 等异步后端有收益；
+    // OpenCV CPU 后端逐样本执行图，batch 反而因内部 blob 重建而变慢。
+    void set_batch_mode(bool enabled) { batch_mode_ = enabled; }
+    bool batch_mode() const { return batch_mode_; }
+    cv::Size inputSize() const { return input_shape; }
 
 private:
     cv::dnn::Net model;
     cv::Size input_shape;
+    bool batch_mode_ = false;
 };
 
 // 检测 + 逐人脸对齐 + 特征提取。内部会 clone 输入图，不修改调用方传入的 img。

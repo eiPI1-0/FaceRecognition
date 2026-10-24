@@ -107,13 +107,11 @@ cv::Mat align_face(const cv::Mat& face_roi,
     return aligned;
 }
 
-// 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
-// det 的 bbox/landmarks 坐标系与 detection_shape 一致（默认 160x120），
-// 内部自动映射到原图坐标系后再做裁剪与对齐。
-cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
-                             FeatureExtractor& extractor,
-                             const cv::Size& detection_shape,
-                             const cv::Size& output_size) {
+// 纯函数：根据原图 + 检测框，对齐单人脸到固定尺寸（默认 112x112），不提取特征。
+// det 的 bbox/landmarks 坐标系与 detection_shape 一致（默认 160x120）。
+cv::Mat align_detection(const cv::Mat& img, const Face& det,
+                        const cv::Size& detection_shape,
+                        const cv::Size& output_size) {
     if (img.empty()) {
         return {};
     }
@@ -141,11 +139,62 @@ cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
     cv::Point2f right_eye(det.landmarks.right_eye.x * sx - roi_tl.x,
                           det.landmarks.right_eye.y * sy - roi_tl.y);
 
-    cv::Mat aligned = align_face(face_roi, left_eye, right_eye, output_size);
+    return align_face(face_roi, left_eye, right_eye, output_size);
+}
+
+// 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
+cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
+                             FeatureExtractor& extractor,
+                             const cv::Size& detection_shape,
+                             const cv::Size& output_size) {
+    cv::Mat aligned = align_detection(img, det, detection_shape, output_size);
     if (aligned.empty()) {
         return {};
     }
     return extractor.extract(aligned);
+}
+
+std::vector<cv::Mat> extract_face_features(const cv::Mat& img,
+                                           const std::vector<Face>& dets,
+                                           FeatureExtractor& extractor,
+                                           const cv::Size& detection_shape) {
+    std::vector<cv::Mat> features(dets.size());
+    if (dets.empty()) {
+        return features;
+    }
+
+    // 先对齐全部人脸，只保留对齐成功的，并记住其原始下标
+    const cv::Size out_size = extractor.inputSize();
+    std::vector<cv::Mat> aligned;
+    std::vector<int> index_map;
+    aligned.reserve(dets.size());
+    index_map.reserve(dets.size());
+    for (int d = 0; d < static_cast<int>(dets.size()); ++d) {
+        cv::Mat a = align_detection(img, dets[d], detection_shape, out_size);
+        if (!a.empty()) {
+            aligned.push_back(std::move(a));
+            index_map.push_back(d);
+        }
+    }
+    if (aligned.empty()) {
+        return features;
+    }
+
+    std::vector<cv::Mat> feats;
+    if (extractor.batch_mode()) {
+        feats = extractor.extract_batch(aligned);
+    } else {
+        feats.reserve(aligned.size());
+        for (const auto& m : aligned) {
+            feats.push_back(extractor.extract(m));
+        }
+    }
+
+    // 按原始下标写回，保证 features[i] 与 dets[i] 对应
+    for (size_t k = 0; k < feats.size() && k < index_map.size(); ++k) {
+        features[index_map[k]] = std::move(feats[k]);
+    }
+    return features;
 }
 
 bool features_from_img(cv::Mat& img, Detector& detector, FeatureExtractor& extractor,
@@ -160,35 +209,8 @@ bool features_from_img(cv::Mat& img, Detector& detector, FeatureExtractor& extra
         return false;
     }
 
-    features.clear();
-    for (const Face& det : detector.faces()) {
-        // det.bbox 处于 input_shape (160x120) 坐标系，work = input_shape * rfactor
-        cv::Point2f tl = det.bbox.top_left * rfactor;
-        cv::Point2f br = det.bbox.bottom_right * rfactor;
-        cv::Rect face_area(cv::Point(cvRound(tl.x), cvRound(tl.y)),
-                           cv::Point(cvRound(br.x), cvRound(br.y)));
-
-        cv::Mat face_roi;
-        try {
-            face_roi = work(face_area);
-        } catch (const cv::Exception&) {
-            features.emplace_back();
-            continue;
-        }
-
-        // 眼睛点从 input_shape 坐标系映射到 work，再减去 ROI 左上角得到 ROI 内坐标
-        cv::Point2f roi_tl(static_cast<float>(face_area.x), static_cast<float>(face_area.y));
-        cv::Point2f left_eye = det.landmarks.left_eye * rfactor - roi_tl;
-        cv::Point2f right_eye = det.landmarks.right_eye * rfactor - roi_tl;
-
-        cv::Mat aligned = align_face(face_roi, left_eye, right_eye, cv::Size(112, 112));
-        if (aligned.empty()) {
-            features.emplace_back();
-        } else {
-            features.emplace_back(extractor.extract(aligned));
-        }
-    }
-
+    // features[i] 与 detector.faces()[i] 一一对应
+    features = extract_face_features(work, detector.faces(), extractor, detector.shape());
     return true;
 }
 
@@ -199,6 +221,9 @@ FeatureExtractor::FeatureExtractor(const std::string& model_path,
         input_shape(std::move(input_shape)) {
     model.setPreferableBackend(config.backend);
     model.setPreferableTarget(config.target);
+    // 实测：CPU 后端 batch 无收益（OpenCV 逐样本跑图 + 内部 blob 重建），
+    // 仅 GPU/NPU 等异步后端启用批量前向。
+    batch_mode_ = (config.target != cv::dnn::DNN_TARGET_CPU);
 }
 
 cv::Mat FeatureExtractor::extract(const cv::Mat& img) {
@@ -209,6 +234,37 @@ cv::Mat FeatureExtractor::extract(const cv::Mat& img) {
     model.setInput(blob_faceAligned);
     model.forward().copyTo(output);
     return output;
+}
+
+std::vector<cv::Mat> FeatureExtractor::extract_batch(const std::vector<cv::Mat>& imgs) {
+    std::vector<cv::Mat> results;
+    if (imgs.empty()) {
+        return results;
+    }
+
+    // 所有输入均为对齐后的 112x112 人脸，尺寸一致，可构建 batch blob
+    cv::Mat blob;
+    cv::dnn::blobFromImages(imgs, blob, 1. / 255.,
+                            input_shape, cv::Scalar(), true, false);
+    blob = (blob - 0.5) / 0.5;
+
+    model.setInput(blob);
+    cv::Mat output = model.forward();
+
+    // 将 batch 输出拆分为每张人脸一份特征向量
+    int num = static_cast<int>(imgs.size());
+    int dims = output.dims;
+    int per_sample = 1;
+    for (int d = 1; d < dims; ++d) {
+        per_sample *= output.size[d];
+    }
+
+    cv::Mat flat = output.reshape(1, num); // num x per_sample
+    results.reserve(num);
+    for (int i = 0; i < num; ++i) {
+        results.push_back(flat.row(i).clone());
+    }
+    return results;
 }
 
 double NormSimilarity::similarity(const cv::Mat& feature, const cv::Mat& ref_feature) {
