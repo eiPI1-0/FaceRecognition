@@ -12,11 +12,11 @@ const double PI = 3.141592653589793;
 
 Detector::Detector(const std::string& model_path, cv::Size input_shape, float conf_thresh,
                    float nms_thresh, int keep_top_k,
-                   cv::dnn::Backend backend, cv::dnn::Target target) :
+                   const DNNConfig& config) :
         model(cv::dnn::readNet(model_path)), input_shape(std::move(input_shape)), conf_thresh(conf_thresh),
         nms_thresh(nms_thresh), keep_top_k(keep_top_k), pb(input_shape, input_shape) {
-    model.setPreferableBackend(backend);
-    model.setPreferableTarget(target);
+    model.setPreferableBackend(config.backend);
+    model.setPreferableTarget(config.target);
 }
 
 std::vector<Face>& Detector::detect(cv::Mat& img) {
@@ -194,12 +194,11 @@ bool features_from_img(cv::Mat& img, Detector& detector, FeatureExtractor& extra
 
 FeatureExtractor::FeatureExtractor(const std::string& model_path,
                                    cv::Size input_shape,
-                                   cv::dnn::Backend backend,
-                                   cv::dnn::Target target) :
+                                   const DNNConfig& config) :
         model(cv::dnn::readNet(model_path)),
         input_shape(std::move(input_shape)) {
-    model.setPreferableBackend(backend);
-    model.setPreferableTarget(target);
+    model.setPreferableBackend(config.backend);
+    model.setPreferableTarget(config.target);
 }
 
 cv::Mat FeatureExtractor::extract(const cv::Mat& img) {

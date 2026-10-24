@@ -6,9 +6,27 @@ using namespace cv;
 
 int main(int argc, char *argv[])
 {
+    // 解析命令行参数：./main <camera_id> [backend: cpu|cuda|openvino] [target: cpu|cuda|openvino|vpuc]
     if (argc < 2) {
-        std::cerr << "Usage: ./main <camera_id>" << std::endl;
+        std::cerr << "Usage: ./main <camera_id> [backend: cpu|cuda|openvino] [target: cpu|cuda|openvino|vpuc]" << std::endl;
         return -1;
+    }
+
+    // 默认后端配置
+    DNNConfig dnn_config = DNNConfig::cpu();
+
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "cpu") {
+            dnn_config = DNNConfig::cpu();
+        } else if (arg == "cuda") {
+            dnn_config = DNNConfig::cuda();
+        } else if (arg == "openvino") {
+            dnn_config = DNNConfig::openvino();
+        } else {
+            std::cerr << "Unknown backend/target: " << arg << std::endl;
+            return -1;
+        }
     }
 
     float recogn_thresh = 0.2f;
@@ -20,8 +38,8 @@ int main(int argc, char *argv[])
     String recognize_model = "./models/mobilefacenet.onnx";
     String data_path = "./data/";
 
-    Detector detector(detection_model, img_shape);
-    FeatureExtractor extractor(recognize_model, features_model_shape);
+    Detector detector(detection_model, img_shape, 0.6f, 0.3f, 750, dnn_config);
+    FeatureExtractor extractor(recognize_model, features_model_shape, dnn_config);
     FeatureDatabase<CosSimilarity> database(data_path, detector, extractor,
                                             display_shape, rfactor, recogn_thresh);
 

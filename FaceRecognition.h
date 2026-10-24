@@ -13,12 +13,22 @@
 
 class FeatureExtractor;
 
+// DNN 推理后端配置，统一管理 Detector / FeatureExtractor 的硬件加速选项。
+struct DNNConfig {
+    cv::dnn::Backend backend = cv::dnn::DNN_BACKEND_OPENCV;
+    cv::dnn::Target target = cv::dnn::DNN_TARGET_CPU;
+
+    // 常用预设
+    static DNNConfig cpu() { return {cv::dnn::DNN_BACKEND_OPENCV, cv::dnn::DNN_TARGET_CPU}; }
+    static DNNConfig cuda() { return {cv::dnn::DNN_BACKEND_CUDA, cv::dnn::DNN_TARGET_CUDA}; }
+    static DNNConfig openvino() { return {cv::dnn::DNN_BACKEND_INFERENCE_ENGINE, cv::dnn::DNN_TARGET_MYRIAD}; }
+};
+
 class Detector {
 public:
     Detector(const std::string& model_path, cv::Size input_shape,
              float conf_thresh = 0.6f, float nms_thresh = 0.3f, int keep_top_k = 750,
-             cv::dnn::Backend backend = cv::dnn::DNN_BACKEND_OPENCV,
-             cv::dnn::Target target = cv::dnn::DNN_TARGET_CPU);
+             const DNNConfig& config = DNNConfig::cpu());
     // 检测结果的 bbox/landmarks 坐标系相对于 input_shape（160x120）。
     std::vector<Face>& detect(cv::Mat& img);
     size_t size() const;
@@ -55,8 +65,7 @@ cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
 class FeatureExtractor {
 public:
     FeatureExtractor(const std::string& model_path, cv::Size input_shape,
-                     cv::dnn::Backend backend = cv::dnn::DNN_BACKEND_OPENCV,
-                     cv::dnn::Target target = cv::dnn::DNN_TARGET_CPU);
+                     const DNNConfig& config = DNNConfig::cpu());
     cv::Mat extract(const cv::Mat& img);
 
 private:
