@@ -4,7 +4,7 @@ Notable changes to this repository. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses release tags rather
 than a strict versioning scheme.
 
-## [Unreleased]
+## v1.1.0 — 2026-10-27
 
 ### Added
 

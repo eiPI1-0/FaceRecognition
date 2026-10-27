@@ -494,7 +494,7 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
 ## Changes
 
 See [CHANGELOG.md](CHANGELOG.md) for what this revision fixed, added and measured
-(older revisions are in `git log`; releases are tagged, latest `v1.0.0`).
+(older revisions are in `git log`; releases are tagged, latest `v1.1.0`).
 
 ## License
 
