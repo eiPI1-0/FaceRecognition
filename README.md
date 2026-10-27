@@ -7,7 +7,7 @@ no dlib, no ncnn, no TensorFlow/PyTorch runtime. One dependency, one binary.
 camera frame ──▶ YuNet detector ──▶ 5-point similarity alignment ──▶ MobileFaceNet
                    (160×120)              (112×112 crop)                (512-d embedding)
                                                   │
-                              IoU tracker (IDs, smoothing, gap filling)
+              tracker (two-gate association, stable IDs, gap filling)
                                                   │
                                     cosine similarity vs. per-person fused feature
 ```
@@ -107,9 +107,6 @@ This repository does not redistribute the weights; supply any MobileFaceNet ONNX
 matching that contract. It must be a model trained with **ArcFace-style 5-point
 alignment** — the aligner here targets the standard ArcFace 112×112 reference template,
 so a differently-aligned model will silently degrade.
-
-`build/models/openface.nn4.small2.v1.t7` is a leftover from an earlier revision and is
-**unused** by `main.cpp`.
 
 ---
 
@@ -267,6 +264,15 @@ What stays fixed regardless of head:
 - **alignment is the ArcFace 5-point template** with a square ROI of 3.2 × eye distance. An
   embedder trained on a different crop (MTCNN/RetinaFace) runs without any error and scores
   badly — the one failure mode that stays silent, so check your scores after a swap.
+- **a face at the frame edge keeps its geometry.** The similarity transform comes from the
+  landmarks, so clipping the ROI never changes the warp — the only question is what to put
+  where the window sticks out of the frame. `align.border` chooses that fill; measured over
+  312 edge-clipped cases (mean cosine to the unclipped reference embedding):
+  `constant` 0.507, `reflect` 0.509, `replicate` 0.489 — copying the edge pixels inward is
+  measurably *worse* than black, so the default stayed black. The other idea worth closing:
+  a second embedding from a horizontally mirrored crop ("TTA") scored +0.006 mean cosine and
+  rescued 1 case in 312 — implemented, measured, removed. Mirroring moves the hole instead of
+  filling it; the model+aligner are already mirror-invariant at 0.97/0.98 cosine.
 
 Both decoders check their layout contract instead of trusting it: when the tensors do not match
 the grid implied by `detector.input_w/h` they stop and name the sizes, which turns a wrong
@@ -297,7 +303,10 @@ ones worth knowing:
 | `recognize.thresh` | `0.2` | cosine threshold above which a match is reported. After the alignment fix, same-identity scores sit near 1.0 and cross-identity near 0, so there is wide headroom. |
 | `display.rfactor` | `6` | display frame = `detector input × rfactor` = 960×720; the letterbox canvas and the coord scale for `draw()`/`putText()`. |
 | `detector.conf_thresh` / `detector.nms_thresh` / `detector.keep_top_k` | `0.6` / `0.3` / `750` | detection sensitivity and box suppression. |
-| `tracker.iou` / `tracker.detect_every` / `tracker.max_lost` / `tracker.min_hits` | `0.45` / `1` / `15` / `1` | see below. |
+| `tracker.iou` / `tracker.dist_ratio` | `0.30` / `0.60` | association gates: a detection is the same track if box IoU ≥ `iou` **or** its centre moved less than `dist_ratio` × box size. Two gates, not one: a face at the frame edge alternates between the whole-face box and the visible-part-only box (measured adjacent-frame IoU **0.37**), so IoU alone splits one face into two tracks that are both drawn forever. |
+| `tracker.detect_every` / `tracker.max_lost` / `tracker.min_hits` | `1` / `5` / `2` | `detect_every` below; a confirmed track is carried — box *and* its last real label — for at most `max_lost` frames of pure prediction; a track needs `min_hits` detections before it is shown, so a detection that exists for one frame never reaches the screen. |
+| `align.border` | `constant` | how to fill the part of the alignment window that falls outside the frame for edge-clipped faces: `constant` (black) / `reflect` / `replicate`. Does not move the warp; see the measurement above. |
+
 
 `detect_every` is the main performance/accuracy dial. Measured here (CPU, 960×720,
 one face):
@@ -314,6 +323,25 @@ Detection is cheap relative to embedding, so raising it buys almost nothing:
 YuNet detect         0.93 ms/frame
 MobileFaceNet embed  4.47 ms/face     ← this dominates
 ```
+
+Frames carried by prediction are **not** embedded: `FaceTracker` reports each track as
+`measured` or not, the app recognizes only measured ones, and the label persists on the
+track's id. Predicted landmarks are last-known values offset by velocity — fine for drawing,
+garbage for embedding, and the resulting embedding looks perfectly normal, which is how a
+phantom box ends up wearing somebody's name. At `detect_every: 3` this cuts embeddings from
+1.06 to 0.39 per frame at the same box accuracy.
+
+Measured before/after the tracker rewrite (both trackers compiled against one synthetic
+harness; one face unless stated):
+
+| sequence | old (single IoU gate, `max_lost` 15, `min_hits` 1) | new |
+|---|---|---|
+| face at frame edge, box geometry alternating, 40 frames | 1.98 boxes/frame, doubled in 39/40 frames | 1.00 boxes/frame, 0 doubled |
+| two faces 1.5 face-widths apart | 2.63 boxes/frame, peak 3 | 2.00, peak 2 |
+| target vanishes (26 frames) | ghost box drawn 14 frames, embedded 14 times | carried 5 frames, embedded 0 |
+| false positive present for one frame | drawn 11 more frames | never drawn |
+| motion + 3-frame detection miss | 5 boxes far from the truth (the clamp pinned them at the frame edge) | 0 |
+| box-centre error, 7 px/frame motion | 1.70 px mean / 2.92 peak | 1.70 / 2.92 (unchanged) |
 
 ---
 
@@ -340,7 +368,7 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 | `main.cpp` | CLI parsing, config application, capture loop |
 | `config.hpp` / `config.cpp` | `PipelineConfig` + the `knobs()` table — every tunable described once, driving file parsing, `--set`, validation and `--dump-config` |
 | `FaceRecognition.h` / `.cpp` | `DNNConfig`, `Detector`, `FeatureExtractor`, `Similarity`, header-only `FeatureDatabase<T>`; alignment (`align_face`, `align_detection`), `extract_face_feature(s)`, `list_person_dirs` |
-| `face_tracker.hpp` / `.cpp` | `FaceTracker` — IoU greedy matching + constant-velocity prediction |
+| `face_tracker.hpp` / `.cpp` | `FaceTracker` — constant-velocity prediction + two-gate association (IoU / normalized centre distance, candidate pairs taken in global score order) + dedup + track lifecycle; emits `{face, id, measured}` |
 | `priorbox.hpp` / `.cpp` | YuNet prior-box generation and raw-output decoding |
 | `detector_head.hpp` / `.cpp` | head strategy: fused (via `PriorBox`) vs per-level YuNet-G, inferred from the model's layer names |
 | `utils.hpp` / `.cpp` | `nms()`, `draw()`, `letterbox()` |
@@ -352,11 +380,30 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 - **Detection coordinates are always in detector-input space (160×120)**, never in the
   image you passed to `detect()`. `align_detection(img, det, detection_shape)` maps them
   for you; pass the *same image* you detected on.
+- **Any hand-written coord transform on a `Face` has to stay in that Face's own space.**
+  `x' = img.cols − x` on a detection in 160×120 space (with the display frame 960×720) puts
+  every landmark outside the image, and the failure is silent: the alignment returns an
+  empty Mat and the face simply stays Unknown. Scale/mirror and the `detection_shape` you
+  pass alongside have to be converted together — which is why callers normally just hand
+  the raw detection to `align_detection()`.
+- **`cv::copyMakeBorder` on a submatrix reads the parent image.** Without
+  `cv::BORDER_ISOLATED`, OpenCV "fills" the border with real pixels from the parent Mat if
+  they are available — the requested border type is ignored (verified on 4.13, even with
+  `BORDER_CONSTANT`). `align_detection` passes the flag; any code cropping a `Mat` before
+  aligning needs it too.
 - **Every input frame is letterboxed onto `display_shape`** (`letterbox()` in `utils.cpp`)
   before tracking and drawing, and registration goes through the same helper — the two
   paths must preprocess identically or the features are not comparable. The padding is
   centred and the canvas is exactly `input_shape × rfactor`, so `draw()`/`putText()`
   scaling detection coords by `rfactor` stays exact with no extra offset.
+- **One association gate is not enough, and predicted geometry must not be recognized.**
+  A face at the frame edge alternates between the whole-face box and the visible-part box;
+  measured adjacent-frame IoU is 0.37, so a 0.45 IoU gate split one face into two tracks
+  that were both drawn every frame. Association therefore takes two gates (IoU *or*
+  normalized centre displacement) over candidate pairs sorted by score, plus a dedup pass.
+  `TrackView::measured` is the contract that keeps velocity-offset landmarks out of the
+  embedder; `advance()` must stay a rigid translation — clamping box corners squeezed boxes
+  at the edge and made the next association harder, which spawned more duplicate tracks.
 - **`CosSimilarity::similarity` returns `‖ref‖ · cos(query, ref)`**, not a cosine — it
   divides only by `norm(feature)` and assumes the *stored* side is unit-length (the
   fusion normalizes it). Comparing two raw embeddings returns ≈15, not a value in [0,1].
@@ -388,8 +435,8 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
   means adding a struct field *and* a table entry — never a bespoke parse branch.
   `config.hpp` is app-level: it must not be pulled into `FaceRecognition.h`, because
   `FeatureDatabase<T>` is a header-only template and every consumer would recompile.
-- **Relative `paths.*` values are resolved against `paths.root`** (default: the config
-  file's directory, else the working directory), in one place, after defaults, file and
+- **Relative `paths.*` values are resolved against `paths.root`** (default: the working
+  directory; anchoring to the config file is opt-in via `paths.root: .` inside it), in one place, after defaults, file and
   `--set` have all been applied. Resolving earlier — or per source — produces the
   half-resolved mix that made this project unrunnable outside `build/`.
 
@@ -403,6 +450,17 @@ re-recognizes each registration photo (expect that photo's own person as top mat
 alignment/embedding change, embed ~12 warped variants of each identity (±25° rotation,
 0.85–1.15 scale, small translations, brightness ±40) and compare mean **within-identity**
 vs **between-identity** true cosine (`a.dot(b)/(‖a‖‖b‖)`, *not* `CosSimilarity`).
+For tracking changes, compile `face_tracker.cpp` and the previous version (from git) against
+one synthetic harness: paste a real face onto a blurred frame at controlled positions,
+then compare *boxes drawn* (`tracker.tracks()`) against *detections returned*
+(`detector.faces()`) over scripted sequences — geometry alternating at the frame edge, two
+faces at 0.7/1.0/1.5 face-widths apart, a target that vanishes, single- and two-frame false
+positives, motion with a 3-frame detection miss, motion at 7 px/frame for box error.
+Baseline (defaults `iou 0.30` / `dist_ratio 0.60` / `max_lost 5` / `min_hits 2`): edge case
+1.00 boxes/frame with 0 doubled frames, 0 ghost boxes after a miss burst, single-frame false
+positives never drawn, mean box-centre error 1.70 px (peak 2.92) at 7 px/frame. The old
+tracker scored 1.98 / 5 / drawn-11-frames / 1.70 on the same sequences.
+
 Current baseline (letterbox pipeline, warp seed `12345`, 13 samples per identity):
 **within 0.845 / between −0.029 / margin 0.874**; the same harness run against the old
 stretch preprocessing scored 0.805 / −0.019 / 0.824. These numbers are harness-specific —

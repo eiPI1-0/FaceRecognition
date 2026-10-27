@@ -15,8 +15,11 @@ void nms(std::vector<Face>& dets,
 // 补边后的图正好是 input_shape * rfactor。返回新 Mat，不与输入共享数据。
 cv::Mat letterbox(const cv::Mat& img, const cv::Size& size,
                   const cv::Scalar& border = cv::Scalar(0, 0, 0));
+// measured 可选，按 faces 顺序标记该框本帧是否有检测支撑（0 = 纯预测/外推）。
+// 预测框用另一种颜色、更细的线画：一眼能分清哪些是检测出来的、哪些是补出来的。
 void draw(cv::Mat& img,
           const std::vector<Face>& faces,
-	  const int rfactor = 5);
+	  const int rfactor = 5,
+          const std::vector<char>* measured = nullptr);
 
 #endif

@@ -191,8 +191,9 @@ cv::Mat align_face(const cv::Mat& face_roi,
 // det 的 bbox/landmarks 坐标系与 detection_shape 一致（默认 160x120）。
 cv::Mat align_detection(const cv::Mat& img, const Face& det,
                         const cv::Size& detection_shape,
-                        const cv::Size& output_size) {
-    if (img.empty()) {
+                        const cv::Size& output_size,
+                        int border_mode) {
+    if (img.empty() || detection_shape.width <= 0 || detection_shape.height <= 0) {
         return {};
     }
 
@@ -208,34 +209,71 @@ cv::Mat align_detection(const cv::Mat& img, const Face& det,
     lm.mouth_right  = cv::Point2f(det.landmarks.mouth_right.x * sx,  det.landmarks.mouth_right.y * sy);
 
     const float eye_dist = cv::norm(lm.left_eye - lm.right_eye);
-    if (eye_dist < 1e-3f) {
+    if (!(eye_dist > 1e-3f)) {          // 顺带挡住 NaN
         return {};
     }
 
     // 取方形 ROI：112x112 模板窗口对应约 3.2 倍眼距（模板眼距 35.24px），
     // 紧致 bbox 会裁掉旋转/缩放后需要的像素。
     const float side = 3.2f * eye_dist;
+    if (!(side < 1e6f)) {               // 垃圾关键点会让 side² 变成上百 MB 的临时分配
+        return {};
+    }
     cv::Point2f center = (lm.right_eye + lm.left_eye + lm.mouth_left +
                           lm.nose_tip + lm.mouth_right) * 0.2f;
 
-    cv::Rect face_area(cvRound(center.x - side * 0.5f), cvRound(center.y - side * 0.5f),
-                       cvRound(side), cvRound(side));
-    // 越界时收缩到图内（相似变换由关键点决定，收缩只影响可见像素，不改变对齐结果）
-    face_area &= cv::Rect(0, 0, img.cols, img.rows);
-    if (face_area.area() <= 0) {
+    // 理想窗口（贴边人脸时会超出图像边界）。相似变换只由关键点决定，所以裁到哪
+    // 都不改变对齐几何，真正影响特征的只有"窗口里落在图像外的那块填什么"：
+    // 旧实现等价于填黑（ROI 交集 + warpAffine 默认的 BORDER_CONSTANT），
+    // 现在可以按需填（border_mode）。实测 replicate 反而比黑边差，故默认仍是黑边。
+    const int x = cvRound(center.x - side * 0.5f);
+    const int y = cvRound(center.y - side * 0.5f);
+    const int w = cvRound(side);
+    const int h = cvRound(side);
+
+    const cv::Rect ideal(x, y, w, h);
+    const cv::Rect image_rect(0, 0, img.cols, img.rows);
+    const cv::Rect valid = ideal & image_rect;
+    if (valid.area() <= 0) {
         return {};
     }
 
-    cv::Mat face_roi = img(face_area);
+    // face_roi 的左上角在原图坐标系里的位置（关键点要按它换算）
+    cv::Mat face_roi;
+    cv::Point2f win_tl;
+    if (valid == ideal) {
+        // 常见情形：窗口整块在图内。零拷贝，和旧实现完全一致（不多花一次 ROI 拷贝）。
+        face_roi = img(valid);
+        win_tl = cv::Point2f(static_cast<float>(x), static_cast<float>(y));
+    } else if (static_cast<long long>(w) * h <= 4LL * static_cast<long long>(img.total())) {
+        const int top    = valid.y - y;
+        const int bottom = (y + h) - (valid.y + valid.height);
+        const int left   = valid.x - x;
+        const int right  = (x + w) - (valid.x + valid.width);
+        // BORDER_ISOLATED 是必须的：img(valid) 是子矩阵，OpenCV 对子矩阵做边框时会
+        // 优先去**父图**取邻域像素当"填充"，把请求的 border_mode 静默换掉（4.13 实测：
+        // 传 BORDER_CONSTANT 也能拿到父图像素）。调用方传进来的 img 本身是 ROI 时，
+        // 这就变成"读了调用方给的图之外的像素"。
+        cv::copyMakeBorder(img(valid), face_roi, top, bottom, left, right,
+                           border_mode | cv::BORDER_ISOLATED);
+        win_tl = cv::Point2f(static_cast<float>(x), static_cast<float>(y));
+    } else {
+        // 窗口大得离谱（眼距远超图像尺寸的检测）：退化成裁到图内，
+        // 只为把临时分配限制在 4× 图像面积以内。这种检测的几何本身已经没有意义。
+        face_roi = img(valid);
+        win_tl = cv::Point2f(static_cast<float>(valid.x), static_cast<float>(valid.y));
+    }
 
-    // 关键点转成 ROI 内坐标
-    const cv::Point2f roi_tl(static_cast<float>(face_area.x), static_cast<float>(face_area.y));
-    lm.right_eye   -= roi_tl;
-    lm.left_eye    -= roi_tl;
-    lm.mouth_left  -= roi_tl;
-    lm.nose_tip    -= roi_tl;
-    lm.mouth_right -= roi_tl;
+    // 关键点转成窗口内坐标（落在图像外的点对应到填充区，对拟合相似变换无害）
+    lm.right_eye   -= win_tl;
+    lm.left_eye    -= win_tl;
+    lm.mouth_left  -= win_tl;
+    lm.nose_tip    -= win_tl;
+    lm.mouth_right -= win_tl;
 
+    // 不做"bbox 方形裁剪"兜底：align_face 只在五点退化（A<1e-9，已被 eye_dist 挡掉）
+    // 时失败，而未经相似变换的 crop 喂给 ArcFace 约定的 embedder 只会静默给出坏分数，
+    // 比返回空特征（判 unknown）更难查。
     return align_face(face_roi, lm, output_size);
 }
 
@@ -243,7 +281,8 @@ cv::Mat align_detection(const cv::Mat& img, const Face& det,
 cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
                              FeatureExtractor& extractor,
                              const cv::Size& detection_shape) {
-    cv::Mat aligned = align_detection(img, det, detection_shape, extractor.inputSize());
+    cv::Mat aligned = align_detection(img, det, detection_shape, extractor.inputSize(),
+                                      extractor.align_border());
     if (aligned.empty()) {
         return {};
     }
@@ -266,7 +305,8 @@ std::vector<cv::Mat> extract_face_features(const cv::Mat& img,
     aligned.reserve(dets.size());
     index_map.reserve(dets.size());
     for (int d = 0; d < static_cast<int>(dets.size()); ++d) {
-        cv::Mat a = align_detection(img, dets[d], detection_shape, out_size);
+        cv::Mat a = align_detection(img, dets[d], detection_shape, out_size,
+                                    extractor.align_border());
         if (!a.empty()) {
             aligned.push_back(std::move(a));
             index_map.push_back(d);

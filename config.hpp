@@ -35,11 +35,27 @@ struct PipelineConfig {
     float recogn_thresh = 0.2f;
     int   rfactor       = 6;      // display_shape = detector_input * rfactor（派生，不可单独设）
 
-    // 跟踪
-    float tracker_iou  = 0.45f;
+    // 跟踪（关联与生命周期，见 face_tracker.hpp 的设计说明）
+    // 关联走两条门取分：框 IoU，或"中心位移 < dist_ratio×框平均尺寸"。
+    // 只靠 IoU 会在贴边时把一个脸拆成多条并行轨迹：同一个脸的框几何会在"整脸框"和
+    // "只剩可见部分的框"之间跳，实测相邻帧 IoU 只有 0.37，低于旧的 0.45 单一阈值
+    // → 一个脸两条轨迹同时画（画面表现就是"突然冒出好几个框"）。
+    float tracker_iou  = 0.30f;
+    float tracker_dist = 0.60f;   // 距离门系数：0.6×框尺寸 ≈ 同目标一步的合理位移
     int   detect_every = 1;       // 实测：检测 0.93ms vs 提特征 4.47ms/脸，调大省不了多少
-    int   max_lost     = 15;
-    int   min_hits     = 1;
+    int   max_lost     = 5;       // 旧默认 15：一次误检/一次拆分能挂 16 帧残影，太长
+    int   min_hits     = 2;       // 命中 2 次检测才上屏：单帧误检从此不上屏也不被识别
+
+    // 人脸贴边时，对齐用的 side×side 窗口会超出图像边界，超出的部分怎么填：
+    // constant（黑边，默认）| reflect（镜像）| replicate（边缘复制）。
+    // 实测（2 身份 × 13 增强图 × 4 条边 × 裁掉窗口 25/50/75% = 312 例，指标 = 与未裁剪
+    // 参考特征的 cosine）：constant 0.507 / reflect 0.509 / replicate 0.489 —— replicate
+    // 明显更差、reflect 在噪声范围内，所以默认保持旧的黑边行为。
+    std::string align_border = "constant";
+    // 试过"贴边人脸再做一次水平镜像的 TTA 取高分"：实测 312 例贴边裁剪里平均 cosine 只
+    // +0.006、312 例只多救回 1 例，代价是每张受影响的脸多一次 forward。已删除，别按直觉
+    // 加回来 —— 镜像不找回丢掉的像素，只把缺口挪到窗口另一侧（模型对镜像本就近乎不变，
+    // self vs self-flip cosine 0.97/0.98）。贴边人脸的旋钮只有 align.border。
 
     // 后端
     std::string backend = "cpu";  // cpu | cuda | openvino

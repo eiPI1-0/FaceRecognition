@@ -139,15 +139,35 @@ const std::vector<Knob>& knobs() {
                     "scale draw()/putText() map detection coords by"},
 
         {"tracker.iou", &PipelineConfig::tracker_iou, 0.0, 1.0,
-         "tracking", "IoU above which a detection is the same track"},
+         "tracking", "one of two association gates: IoU above which a detection is the same "
+                     "track. The other gate is tracker.dist_ratio - a face at the frame edge "
+                     "alternates between whole-face and visible-part boxes, measured adjacent-"
+                     "frame IoU 0.37, so IoU alone splits one face into parallel tracks"},
+        {"tracker.dist_ratio", &PipelineConfig::tracker_dist, 0.0, 3.0,
+         "tracking", "second association gate: a detection whose center moved less than this "
+                     "times the mean box size is the same track (the budget also widens with "
+                     "0.5 x speed x frames-since-last-detection, since prediction error grows). "
+                     "Measured: 0.6 keeps adjacent faces 1 face-width apart separate"},
         {"tracker.detect_every", &PipelineConfig::detect_every, 1, 30,
          "tracking", "measured: detection 0.93 ms vs embedding 4.47 ms/face, so raising this "
                      "saves little (max box error 5.9px at 1, ~18px at 5)"},
         {"tracker.max_lost", &PipelineConfig::max_lost, 0, 1000,
-         "tracking", "frames a track survives without a matching detection"},
+         "tracking", "frames a confirmed track is carried (predicted geometry, cached label) "
+                     "without a matching detection; tracks outside the frame are dropped at "
+                     "once. 15 used to mean a stale box plus a random name for half a second"},
         {"tracker.min_hits", &PipelineConfig::min_hits, 1, 100,
-         "tracking", ""},
+         "tracking", "detections a track must accumulate before it is shown or recognized: 2 "
+                     "makes single-frame false positives structurally invisible (costs one "
+                     "frame of latency for a new face)"},
 
+        {"align.border", &PipelineConfig::align_border,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "alignment", "a face at the frame edge makes the square alignment window stick out of "
+                      "the image; how to fill the part outside: constant (black, default) | "
+                      "reflect | replicate. The warp comes from the landmarks, so the fill does "
+                      "not change geometry, only what the missing pixels are. Measured over 312 "
+                      "edge-clipped cases (mean cosine to the unclipped reference embedding): "
+                      "constant 0.507, reflect 0.509, replicate 0.489 - default stays black"},
         {"dnn.backend", &PipelineConfig::backend,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
          "backend", "cpu | cuda | openvino (cuda/openvino need an OpenCV build with them)"},
@@ -325,6 +345,13 @@ bool validate_config(const PipelineConfig& cfg, std::string& err,
                   format_range(k);
             return false;
         }
+    }
+
+    if (cfg.align_border != "replicate" && cfg.align_border != "reflect" &&
+        cfg.align_border != "constant") {
+        err = "align.border: '" + cfg.align_border +
+              "' must be one of replicate, reflect, constant";
+        return false;
     }
 
     if (cfg.backend != "cpu" && cfg.backend != "cuda" && cfg.backend != "openvino") {

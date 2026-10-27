@@ -42,13 +42,20 @@ recognize.thresh: 0.20
 display.rfactor: 6
 
 # --- tracking ---
-# IoU above which a detection is the same track
-tracker.iou: 0.45
+# one of two association gates: IoU above which a detection is the same track. The other gate is tracker.dist_ratio - a face at the frame edge alternates between whole-face and visible-part boxes, measured adjacent-frame IoU 0.37, so IoU alone splits one face into parallel tracks
+tracker.iou: 0.30
+# second association gate: a detection whose center moved less than this times the mean box size is the same track (the budget also widens with 0.5 x speed x frames-since-last-detection, since prediction error grows). Measured: 0.6 keeps adjacent faces 1 face-width apart separate
+tracker.dist_ratio: 0.60
 # measured: detection 0.93 ms vs embedding 4.47 ms/face, so raising this saves little (max box error 5.9px at 1, ~18px at 5)
 tracker.detect_every: 1
-# frames a track survives without a matching detection
-tracker.max_lost: 15
-tracker.min_hits: 1
+# frames a confirmed track is carried (predicted geometry, cached label) without a matching detection; tracks outside the frame are dropped at once. 15 used to mean a stale box plus a random name for half a second
+tracker.max_lost: 5
+# detections a track must accumulate before it is shown or recognized: 2 makes single-frame false positives structurally invisible (costs one frame of latency for a new face)
+tracker.min_hits: 2
+
+# --- alignment ---
+# a face at the frame edge makes the square alignment window stick out of the image; how to fill the part outside: constant (black, default) | reflect | replicate. The warp comes from the landmarks, so the fill does not change geometry, only what the missing pixels are. Measured over 312 edge-clipped cases (mean cosine to the unclipped reference embedding): constant 0.507, reflect 0.509, replicate 0.489 - default stays black
+align.border: constant
 
 # --- backend ---
 # cpu | cuda | openvino (cuda/openvino need an OpenCV build with them)

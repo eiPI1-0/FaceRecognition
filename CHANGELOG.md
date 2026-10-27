@@ -69,7 +69,98 @@ than a strict versioning scheme.
   signature (it sniffs content and ignores the `.yml` extension) and throws when it
   disagrees — and this way file and `--set` share one parse-and-validate path.
 
+- **`tracker.dist_ratio`, the second association gate.** A detection whose centre moved less
+  than this times the mean box size counts as the same track; the budget also widens with
+  `0.5 × speed × frames-since-last-detection`, because the error of a predicted position grows
+  with how long it has been since a real measurement.
+- **Tracks carry their own lifecycle: `TrackView {face, id, measured}`.** `measured` says
+  whether this frame's geometry came from a detection or is pure extrapolation, so the app can
+  recognize one and not the other (see Fixed). `draw()` paints predicted boxes in a different
+  colour and thinner, so a carried box is visible as such.
+
+- **Edge-clipped faces have a fill policy: `align.border`.** When a face sits against the
+  frame edge, the square alignment window (`3.2 × eye distance`) sticks out of the image. The
+  similarity transform comes from the landmarks, so clipping never changed the geometry — all
+  it decided was what the missing pixels were: black. That choice is now a key
+  (`constant` | `reflect` | `replicate`), and it is measured rather than assumed: over 312
+  edge-clipped cases (2 identities × 13 augmented frames × 4 edges × 25/50/75 % of the window
+  cut away; metric = mean cosine to the unclipped reference embedding) `constant` 0.507,
+  `reflect` 0.509, `replicate` 0.489. So the default **stays** `constant`, and the default
+  default path is identical to the previous implementation: registration plus query through
+  the whole app path on three images (one of them edge-clipped) matched to the bit, and
+  aligned crops of heavily clipped faces differ by at most ±1 LSB (6 crops checked).
+  The competing idea was implemented, measured and deleted rather than kept as a knob: a
+  second embedding from a horizontally mirrored crop, gated on edge-clipped faces, beat the
+  direct embedding by **+0.006** mean cosine and rescued **1 case in 312** — mirroring moves
+  the hole instead of filling it, and the model+aligner are already mirror-invariant
+  (self vs self-flip cosine 0.97/0.98).
+
+### Fixed
+
+- **One face could become two boxes that never went away.** A face near the frame edge
+  alternates between the whole-face box and the visible-part-only box; the measured IoU between
+  those two on adjacent frames is **0.37**, below the tracker's single 0.45 association gate.
+  So the next detection was declared a *new* track while the old one kept being predicted —
+  both drawn every frame, each with its own label, and the pair was permanent. The real defect
+  was the single gate: box IoU conflates "same object" with "same box geometry", and those
+  separate exactly at the frame edge, which is where this was observed. Association now scores
+  two gates (IoU **or** normalized centre displacement, `tracker.dist_ratio`) over all candidate
+  pairs taken in descending score order — detections no longer claim tracks in arrival order,
+  which used to make the result depend on the detector's output permutation — and a dedup pass
+  (same two quantities) makes "at most one track per face" a hard property rather than luck.
+- **Prediction distorted boxes.** `advance()` clamped `x` into `[0, frame_width − box_width]`;
+  once a box is wider than the space left, that bound goes negative and the box gets pinned to
+  x = 0 *and squeezed*, which made the next association harder and spawned yet another duplicate
+  track. Prediction is now a rigid translation of box and landmarks together, and a track that
+  leaves the frame entirely is dropped instead of being pinned to the border.
+- **Extrapolated geometry was fed to the embedder.** A carried track holds the last *measured*
+  landmarks offset by velocity: good enough to draw, meaningless to embed — and the embedding
+  comes back looking perfectly normal, which is how a phantom box gets somebody's name on it.
+  The app now embeds only `measured` faces and carries the last real label on the track's `id`
+  for at most `tracker.max_lost` frames; a measured frame's verdict always replaces the cache,
+  *including* "nobody matches", so names no longer linger after the person walks off.
+- **One false positive stayed on screen for 16 frames** (`max_lost 15`, `min_hits 1`) — and was
+  embedded 16 times. Defaults are `max_lost 5` and `min_hits 2`: a detection that exists for a
+  single frame is never shown at all. `min_hits` cannot corroborate the first `min_hits` frames
+  of a stream, so those are emitted as measured regardless — otherwise a single still-image
+  source would print nothing.
+
+  Measured on one synthetic harness with both versions linked against it (one face unless
+  noted): face at the edge with alternating box geometry, 40 frames — **1.98 → 1.00**
+  boxes/frame, doubled frames **39/40 → 0**; two faces 1.5 face-widths apart — **2.63 → 2.00**
+  boxes/frame, peak **3 → 2**; target vanishes — ghost drawn **14 → 5** frames, embeddings
+  **14 → 0**; false positive present for one frame — drawn **11 more frames → never**; motion
+  through a 3-frame detection miss — boxes far from the truth **5 → 0**; box-centre error at
+  7 px/frame motion **1.70 px mean / 2.92 peak, unchanged**; `detect_every 3` embeddings
+  **1.06 → 0.39** per frame. On a 12-frame clip built from a real photo plus a one-frame false
+  detection in the background, the old code drew 2 boxes and embedded 2 faces from frame 4 to
+  the end; the new one draws 1, keeps the right label through the prediction-only tail, and
+  embeds nothing there.
+
 ### Changed
+
+- **The alignment fill lives on `FeatureExtractor`, not a library-wide global.** A global
+  setter was called *after* the `FeatureDatabase` constructor, i.e. after registration —
+  gallery features were built with one fill and queries with another, which is exactly the
+  "registration and inference must preprocess identically" rule this project already had.
+  Both paths take the same extractor, so they cannot disagree now: `align_detection` takes
+  the fill as a parameter, `extract_face_feature(s)` read it from the extractor.
+- **`align_detection` dropped its bbox fallback.** It was unreachable (`align_face` only fails
+  on degenerate landmarks, which the eye-distance check rejects first) and, if it had run, it
+  would have handed the embedder a crop outside the ArcFace convention — a silent score
+  degradation with a different distribution than the gallery's. Degenerate landmarks mean an
+  empty feature and an `Unknown` label again.
+- **`copyMakeBorder` is now called with `cv::BORDER_ISOLATED`.** Without it, OpenCV fills the
+  border from the *parent* `Mat` when the source is a submatrix and silently ignores the
+  requested border type (verified on 4.13 with `BORDER_CONSTANT` returning parent pixels).
+  `align_detection`'s ROI is such a submatrix, so a caller passing an ROI used to get pixels
+  from outside the image it handed over.
+- **The recognition-label loop is per face**: a local `label` replaces the `max_name`/
+  `max_similar` pair that used to leak across iterations, and the dead `i < dets.size()`
+  guard is gone (`extract_face_features` returns exactly one entry per detection, empty
+  where alignment failed). Behaviour unchanged.
+- Docs: `config.example.yml` regenerated with the new keys; the README no longer advertises
+  the unused `openface.nn4.small2.v1.t7` leftover.
 
 - `embedder.input_w/h` is now a *geometry* knob, not just a blob resize: the aligned crop is
   warped to exactly the size the extractor declares, instead of always 112×112 and being

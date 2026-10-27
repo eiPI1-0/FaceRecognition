@@ -46,10 +46,12 @@ void nms(std::vector<Face>& dets,
 
 void draw(cv::Mat& img,
           const std::vector<Face>& faces,
-	  const int rfactor) {
+	  const int rfactor,
+          const std::vector<char>* measured) {
 
     const int thickness = 2;
-    const cv::Scalar bbox_color = {  0, 255,   0};
+    const cv::Scalar bbox_color = {  0, 255,   0};   // 有检测支撑
+    const cv::Scalar pred_color = {  0, 165, 255};   // 纯预测（外推）
     const cv::Scalar text_color = {255, 255, 255};
     const std::vector<cv::Scalar> landmarks_color = {
         {255,   0,   0}, // left eye
@@ -63,12 +65,13 @@ void draw(cv::Mat& img,
         return shift ? cv::Point(int(p.x*rfactor), int(p.y*rfactor)+12) : cv::Point(int(p.x*rfactor), int(p.y*rfactor));
     };
     for (auto i = 0; i < faces.size(); ++i) {
+        const bool predicted = measured && i < measured->size() && !(*measured)[i];
         // draw bbox
         cv::rectangle(img,
                       point2f2point(faces[i].bbox.top_left, rfactor),
                       point2f2point(faces[i].bbox.bottom_right, rfactor),
-                      bbox_color,
-                      thickness);
+                      predicted ? pred_color : bbox_color,
+                      predicted ? thickness - 1 : thickness);
         // put score by the corner of bbox
         std::string str_score = std::to_string(faces[i].score);
         if (str_score.size() > 6) {

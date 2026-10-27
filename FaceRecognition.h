@@ -60,13 +60,22 @@ cv::Mat align_face(const cv::Mat& face_roi,
 // 纯函数：根据原图 + 检测框，对齐单人脸到固定尺寸（默认 112x112），不提取特征。
 // det 的 bbox/landmarks 坐标系与 detection_shape 一致（默认 160x120），
 // 内部自动映射到原图坐标系后再做裁剪与对齐。
+// border_mode：人脸贴边时，理想的 side×side 窗口会超出图像边界，超出的部分按
+// cv::BORDER_* 填充（默认 BORDER_CONSTANT，即黑边）。相似变换只由关键点决定，
+// 所以填充不改几何，只改"窗口里缺的那块像素填什么"。实测三种填充里 replicate 最差
+// （312 例贴边裁剪，与未裁剪参考特征的平均 cosine：constant 0.507 / reflect 0.509 /
+// replicate 0.489），故默认保持黑边。管线里这个值取自 FeatureExtractor::align_border()
+// —— 注册与推理共用同一个 extractor，所以两边不会用不同的填充。
 cv::Mat align_detection(const cv::Mat& img, const Face& det,
                         const cv::Size& detection_shape,
-                        const cv::Size& output_size = cv::Size(112, 112));
+                        const cv::Size& output_size = cv::Size(112, 112),
+                        int border_mode = cv::BORDER_CONSTANT);
 
 // 纯函数：根据原图 + 检测框，提取单人脸对齐后的特征，不修改输入图。
 // 对齐尺寸取自 extractor.inputSize()（单一真源）：嵌入模型的输入形状改了，对齐几何
 // 就跟着改，warpAffine 直接产出模型要的尺寸，blobFromImage 不再二次插值。
+// 贴边填充取自 extractor.align_border()，注册与推理共用同一个 extractor，
+// 所以两边不可能用不同的预处理。
 cv::Mat extract_face_feature(const cv::Mat& img, const Face& det,
                              FeatureExtractor& extractor,
                              const cv::Size& detection_shape);
@@ -93,10 +102,17 @@ public:
     bool batch_mode() const { return batch_mode_; }
     cv::Size inputSize() const { return input_shape; }
 
+    // 贴边人脸对齐时的边界填充（cv::BORDER_CONSTANT | _REFLECT | _REPLICATE）。
+    // 挂在 extractor 上而不是全局变量上：注册和推理用的是同一个 extractor，
+    // 预处理就没有分叉的机会（"注册/推理必须同一预处理"是本项目踩过的坑）。
+    void set_align_border(int border_mode) { align_border_ = border_mode; }
+    int align_border() const { return align_border_; }
+
 private:
     cv::dnn::Net model;
     cv::Size input_shape;
     bool batch_mode_ = false;
+    int align_border_ = cv::BORDER_CONSTANT;
 };
 
 // 检测 + 逐人脸对齐 + 特征提取。内部会 clone 输入图，不修改调用方传入的 img。
