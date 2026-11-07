@@ -107,8 +107,13 @@ std::vector<Face> PriorBox::decode(const cv::Mat& loc,
         }
         float score = std::sqrt(cls_score * iou_score);
 
-        // ignore low scores
-        if (score < ignore_score) { continue; }
+        // ignore low scores —— 注意这里必须是 `>=` 而不是 `<`：
+        // NaN 与两个比较都是 false，`score < ignore_score` 会把 NaN 分数放行，
+        // 于是模型输出里的未初始化尾部（见下）变成"分数=nan 的幽灵脸"。
+        if (!(score >= ignore_score)) { continue; }
+        // 分数有限还不够：尾部 anchor 的 loc/iou 同样是垃圾，几何必须是有限值。
+        if (!std::isfinite(loc_v[i*14+0]) || !std::isfinite(loc_v[i*14+1]) ||
+            !std::isfinite(loc_v[i*14+2]) || !std::isfinite(loc_v[i*14+3])) { continue; }
 
         Face face;
         face.score = score;
@@ -122,6 +127,23 @@ std::vector<Face> PriorBox::decode(const cv::Mat& loc,
         float x2 = (cx + w / 2) * out_w;
         float y2 = (cy + h / 2) * out_h;
         face.bbox = { {x1, y1}, {x2, y2} };
+
+        // 几何门：一个"检测"首先必须是**这张图里的一个框**。
+        // fused 导出（yunet_120x160）最后一级 anchor 的值依赖 Net 实例的缓冲状态
+        // （实测同一张图：不同实例给出 NaN / (1,0) / 看似正常的分数），分数本身
+        // 被 clamp 到 [0,1] 所以无法凭分数判别 —— 但垃圾 loc 一定产生病态框。
+        // 边缘被裁掉的脸仍然保留（只要求与画面有实质交集）。
+        {
+            const float bx1 = std::min(x1, x2), bx2 = std::max(x1, x2);
+            const float by1 = std::min(y1, y2), by2 = std::max(y1, y2);
+            const float bw = bx2 - bx1, bh = by2 - by1;
+            if (!(bw >= 2.f && bh >= 2.f && bw <= 8.f * out_w && bh <= 8.f * out_h)) { continue; }
+            const float ix = std::max(0.f, std::min(bx2, static_cast<float>(out_w)) -
+                                          std::max(bx1, 0.f));
+            const float iy = std::max(0.f, std::min(by2, static_cast<float>(out_h)) -
+                                          std::max(by1, 0.f));
+            if (ix * iy < 0.01f * bw * bh) { continue; }
+        }
 
         // YuNet 关键点顺序: loc->[right_eye, left_eye, nose, mouth_left, mouth_right]
         // 注意 8,9 是鼻子而非嘴（历史版本在此处把 nose 与 mouth_left 接反了）
