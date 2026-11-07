@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <unistd.h>
 #include <fstream>
 
 namespace {
@@ -97,6 +98,12 @@ const std::vector<Knob>& knobs() {
         {"paths.embedder_model", &PipelineConfig::embedder_model,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
          "paths", ""},
+        {"paths.gallery_index", &PipelineConfig::gallery_index,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "paths", "on-disk enrollment index. Built once (detect+embed per photo), then read "
+                  "by every worker instead of recomputing; also feeds the result-cache "
+                  "fingerprint. Empty string disables persistence.",
+         true},
         {"paths.data_dir", &PipelineConfig::data_dir,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
          "paths", "one subfolder per enrolled person"},
@@ -201,7 +208,7 @@ bool find_knob(const std::string& key, const Knob** knob, std::vector<std::strin
 
 bool set_knob(const Knob& knob, const std::string& value, PipelineConfig& cfg, std::string& err) {
     if (auto* p = std::get_if<StrMember>(&knob.member)) {
-        if (value.empty()) {
+        if (value.empty() && !knob.allow_empty) {
             err = std::string(knob.key) + ": empty value";
             return false;
         }
@@ -321,9 +328,10 @@ void resolve_asset_paths(PipelineConfig& cfg, const std::string& default_root) {
 
     // 成员指针常量不能靠 auto 推导，显式写类型
     const StrMember paths[] = {&PipelineConfig::detector_model, &PipelineConfig::embedder_model,
-                               &PipelineConfig::data_dir};
+                               &PipelineConfig::data_dir, &PipelineConfig::gallery_index};
     for (StrMember member : paths) {
         std::string& value = cfg.*member;
+        if (value.empty()) continue;   // 空串是"关闭"的显式取值，不能解析成 root
         const fs::path p(value);
         if (!p.is_absolute()) {
             value = (root / p).lexically_normal().string();
@@ -432,7 +440,32 @@ bool sniff_model_file(const std::string& path, std::string& problem) {
 
 }  // namespace
 
-bool check_model_files(const PipelineConfig& cfg, std::string& err) {
+namespace {
+// paths.* 相对 paths.root 解析，而 root 默认就是 cwd —— 所以从仓库根跑 ./build/main
+// 必然找不到权重。这里只做诊断，不改解析规则（自动锚定会让"只调阈值"的配置文件
+// 悄悄把资产挪走，那种意外比"必须从 build/ 运行"难查得多），但把可用的命令写出来。
+std::string asset_hint(const std::string& knob, const std::string& missing) {
+    char buf[4096];
+    const std::string cwd = ::getcwd(buf, sizeof buf) ? buf : "(unknown)";
+    std::string out = "\n  cwd: " + cwd +
+                      "  (paths.* resolve against paths.root, default = cwd)";
+    for (const std::string& root : {std::string("build"), std::string("../build"),
+                                    std::string(".")}) {
+        const std::string cand = (root == ".") ? missing : root + "/" + missing;
+        std::error_code ec;
+        if (std::filesystem::exists(cand, ec) && !std::filesystem::is_directory(cand, ec)) {
+            out += "\n  found " + cand + "  ->  run from " +
+                   (root == "." ? cwd : cwd + "/" + root) +
+                   ", or add:  --set paths.root=" + root;
+            return out;
+        }
+    }
+    out += "\n  or point the knob straight at a file:  --set " + knob + "=/abs/path/to/model.onnx";
+    return out;
+}
+}  // namespace
+
+bool check_model_files(const PipelineConfig& cfg, std::string& err, std::string* hint) {
     const struct { const char* key; const std::string* path; } models[] = {
         {"paths.detector_model", &cfg.detector_model},
         {"paths.embedder_model", &cfg.embedder_model},
@@ -441,6 +474,7 @@ bool check_model_files(const PipelineConfig& cfg, std::string& err) {
         std::string problem;
         if (!sniff_model_file(*m.path, problem)) {
             err = std::string(m.key) + ": model file " + *m.path + " " + problem;
+            if (hint) *hint = asset_hint(m.key, *m.path);
             return false;
         }
     }

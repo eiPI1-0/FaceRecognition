@@ -10,8 +10,7 @@
 #include <opencv2/core.hpp>
 
 // 流水线的全部可调项，main.cpp 的唯一来源。
-// 库层（FaceRecognition.h）绝不包含本头：FeatureDatabase<T> 是 header-only 模板，
-// 把 app 层概念漏进库头 = 每次调参全量重编。
+// 库层（engine.hpp / gallery.hpp）绝不包含本头：把 app 层概念漏进库头 = 每次调参全量重编。
 struct PipelineConfig {
     // 资产路径。三条相对路径都相对 asset_root 解析（见 resolve_asset_paths）；
     // asset_root 为空表示"未指定"，由调用方给默认值（无配置文件时就是 "."）。
@@ -19,6 +18,10 @@ struct PipelineConfig {
     std::string detector_model = "./models/yunet_120x160.onnx";
     std::string embedder_model = "./models/mobilefacenet.onnx";
     std::string data_dir       = "./data/";
+    // 注册索引的落盘位置。空串 = 不持久化（每次启动重新注册）。
+    // 之所以要它：注册要跑 detect+embed，每个 worker 各算一遍会拖慢启动；有了索引，
+    // 所有 worker 读同一个文件，并把它作为结果缓存指纹的一部分。
+    std::string gallery_index  = "./gallery.idx";
 
     // 模型契约：改错不会崩，只会输出垃圾。只应在换模型文件时一同修改。
     int detector_input_w = 160, detector_input_h = 120;   // YuNet + PriorBox::decode 的先验框布局
@@ -81,6 +84,9 @@ struct Knob {
     double hi =  std::numeric_limits<double>::infinity();
     const char* group = "";      // dump 时的分组标题
     const char* comment = "";    // dump 时写在条目上方的说明（生成的配置自解释）
+    // 少数 string knob 用空串表达"关闭"（paths.gallery_index）。默认拒绝空值：
+    // 空路径通常是打错，而不是意图。
+    bool allow_empty = false;
 };
 
 const std::vector<Knob>& knobs();
@@ -106,7 +112,9 @@ bool validate_config(const PipelineConfig& cfg, std::string& err, std::vector<st
 // 模型文件能不能真被加载：不存在 / 0 字节 / 其实是个 Git LFS 指针。
 // 与 validate_config 分开，因为 --dump-config 不需要模型在场；而这些检查只在真要跑
 // 流水线时才该拦。报的错带 knob 名，用户才知道改哪一行。
-bool check_model_files(const PipelineConfig& cfg, std::string& err);
+// hint（可选）：权重找不到时，返回一段可直接粘贴的修复建议。
+bool check_model_files(const PipelineConfig& cfg, std::string& err,
+                     std::string* hint = nullptr);
 
 // 把当前配置写成 flat 点分 key 的 YAML 风格文本（可读、可 grep、与 --set 同构）。
 void dump_config(std::ostream& os, const PipelineConfig& cfg);

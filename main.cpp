@@ -4,9 +4,12 @@
 #include <utility>
 #include <vector>
 #include <charconv>
+#include <filesystem>
 #include "FaceRecognition.h"
 #include "face_tracker.hpp"
 #include "config.hpp"
+#include "gallery.hpp"
+#include "src/cli.hpp"
 
 using namespace cv;
 
@@ -37,7 +40,8 @@ FrameOut recognize_frame(Recognizer& rec,
                          const std::vector<TrackView>& tracks,
                          long frame_no,
                          int max_lost,
-                         FeatureDatabase<CosSimilarity>& database,
+                         const facerec::Gallery& gallery,
+                         float recogn_thresh,
                          const cv::Mat& im,
                          FeatureExtractor& extractor,
                          const cv::Size& det_shape) {
@@ -64,7 +68,7 @@ FrameOut recognize_frame(Recognizer& rec,
         if (!rec.features[k].empty()) {
             float sim = -1.0f;
             std::string hit;
-            if (database.select_max_similarity(rec.features[k], sim, hit)) {
+            if (gallery.best_match(rec.features[k], recogn_thresh, sim, hit)) {
                 name = hit;
             }
         }
@@ -96,17 +100,17 @@ DNNConfig make_dnn_config(const std::string& backend) {
 }
 
 void print_usage(const char* argv0) {
-    std::cout << "Usage: " << argv0
-              << " <source> [cpu|cuda|openvino] [batch|nobatch] [--config <path>]\n"
-              << "                   [--set key=value] [--dump-config]\n"
-              << "  <source>           camera index (e.g. 0) or an image/video path or a URL\n"
-              << "  cpu|cuda|openvino  DNN backend (default: cpu)\n"
-              << "  batch|nobatch      force batch embedding (default: auto by backend)\n"
-              << "  --config <path>    load a config file (flat `key: value` lines)\n"
-              << "  --set key=value    override one knob; repeatable\n"
-              << "  --dump-config      print the effective config and exit\n"
-              << "Precedence: built-in defaults < --config < CLI options.\n"
-              << "Run `--dump-config` for the full list of keys and what they do.\n";
+    std::cout << "facerec - face detection + recognition pipeline\n"
+              << "Usage: " << argv0 << " <command> [options]\n"
+              << "\nCommands:\n"
+              << "  identify  --image <path> [options]   单帧无状态人脸识别，JSON 输出到 stdout\n"
+              << "  enroll    --name <person> [--dry-run|--yes] <photo> ...  离线建库验证\n"
+              << "  serve     [--host H] [--port P] [--workers N]   HTTP 服务端\n"
+              << "  demo      <source> [cpu|cuda|openvino] ...       实时窗口演示（旧行为）\n"
+              << "  mcp       [--transport stdio|http] [--port P]    MCP 工具（给 LLM 调用）\n"
+              << "\nLegacy: '" << argv0 << " 0' is treated as '" << argv0 << " demo 0'.\n"
+              << "Run '" << argv0 << " <command> --help' for command usage.\n"
+              << "Run '" << argv0 << " identify --image <path> --dump-config' to dump effective config.\n";
 }
 
 // 建流水线 + 跑循环。异常（模型读盘失败、后端不可用）由 main 的 catch 统一兜住。
@@ -125,16 +129,20 @@ int run_pipeline(const PipelineConfig& cfg, const std::string& source) {
     }
 
     // align.border -> OpenCV 边界填充类型。挂在 extractor 上（不是全局变量），并且
-    // 必须在构造 FeatureDatabase 之前设：注册就发生在那个构造函数里，注册与推理
+    // 必须在建 Gallery 之前设：注册就发生在 load_or_build 里，注册与推理
     // 用了不同的填充，gallery 与查询特征就不可比（同一预处理是硬约束）。
     int border_mode = cv::BORDER_CONSTANT;
     if (cfg.align_border == "reflect") border_mode = cv::BORDER_REFLECT;
     else if (cfg.align_border == "replicate") border_mode = cv::BORDER_REPLICATE;
     extractor.set_align_border(border_mode);
 
-    FeatureDatabase<CosSimilarity> database(cfg.data_dir, detector, extractor,
-                                            display_shape, rfactor, cfg.recogn_thresh);
-    std::cout << "Loaded " << database.size() << " person(s) from " << cfg.data_dir << std::endl;
+    bool gallery_rebuilt = false;
+    std::string gallery_err;
+    facerec::Gallery gallery = facerec::Gallery::load_or_build(
+        cfg, detector, extractor, display_shape, rfactor, &gallery_rebuilt, &gallery_err);
+    if (!gallery_err.empty()) std::cerr << "gallery: " << gallery_err << std::endl;
+    std::cout << "Loaded " << gallery.size() << " person(s) from " << cfg.data_dir
+              << (gallery_rebuilt ? " (rebuilt)" : " (index)") << std::endl;
 
     // 跟踪器默认值来自实测（本机 CPU，960x720，1 张人脸）：YuNet 检测 0.93 ms/帧，
     // MobileFaceNet 提特征 4.47 ms/脸 —— 提取才是瓶颈，跳过检测每帧只省 ~0.75 ms，
@@ -198,7 +206,8 @@ int run_pipeline(const PipelineConfig& cfg, const std::string& source) {
         const std::vector<TrackView>& tracks = tracker.tracks();
 
         const FrameOut fr = recognize_frame(recognizer, tracker.tracks(), frame_no,
-                                            tracker.params().max_lost, database,
+                                            tracker.params().max_lost, gallery,
+                                            cfg.recogn_thresh,
                                             im, extractor, detector.shape());
         for (size_t i = 0; i < fr.faces.size(); ++i) {
             cv::putText(im, fr.labels[i], fr.faces[i].bbox.top_left * rfactor,
@@ -225,7 +234,9 @@ int run_pipeline(const PipelineConfig& cfg, const std::string& source) {
 
 }  // namespace
 
-int main(int argc, char *argv[])
+// 演示用实时循环（摄像头/图片/视频 + 窗口 + 画框）。保留原样，供 `facerec demo`
+// 与旧命令行形式 `./main 0` 使用；生产路径是 identify/enroll/serve/mcp。
+int run_demo(int argc, char *argv[])
 {
     // 全部可调项的唯一来源是 PipelineConfig；key 名单见 config.cpp 的 knob 表。
     // 优先级：内置默认 < 配置文件 < 命令行。故命令行覆盖项先记下来，加载文件之后再应用。
@@ -337,9 +348,9 @@ int main(int argc, char *argv[])
 
     // 模型文件在场且真是权重，才值得去建流水线：否则报错来自 OpenCV 的 importer，
     // 用户看不出是哪个 knob 指错了。
-    std::string asset_err;
-    if (!check_model_files(cfg, asset_err)) {
-        std::cerr << "Invalid config: " << asset_err << std::endl;
+    std::string asset_err, asset_hint_text;
+    if (!check_model_files(cfg, asset_err, &asset_hint_text)) {
+        std::cerr << "Invalid config: " << asset_err << asset_hint_text << std::endl;
         return -1;
     }
 
@@ -353,3 +364,63 @@ int main(int argc, char *argv[])
     }
 }
 
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    const std::string cmd = argv[1];
+    if (cmd == "-h" || cmd == "--help") {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    // 显式子命令入口。子命令拿到的是 `argv+1`，故参数个数为 argc-1。
+    if (cmd == "identify") {
+        return cmd_identify(argc - 1, argv + 1);
+    } else if (cmd == "enroll") {
+        return cmd_enroll(argc - 1, argv + 1);
+    } else if (cmd == "serve") {
+        return cmd_serve(argc - 1, argv + 1);
+    } else if (cmd == "mcp") {
+        return cmd_mcp(argc - 1, argv + 1);
+    } else if (cmd == "demo") {
+        return run_demo(argc - 1, argv + 1);
+    }
+
+    // 兼容旧形式：`./main 0`、`./main photo.jpg`，以及 `./main --dump-config` 这类
+    // 纯选项调用。历史上它们都是"直接跑演示循环"，文档与 AGENTS.md 的验证配方仍在用，
+    // 所以不当作错误。选项本身是明确的意图，只在把参数当 source 时才提示一次。
+    if (cmd.rfind("-", 0) == 0) {
+        return run_demo(argc, argv);
+    }
+    // 裸词（无 '/'、无 "://"、非序号、当前目录下也不存在）几乎一定是拼错的子命令，
+    // 比如 ./main compaer：当 source 用会得到 "Cannot open source: compaer"，
+    // 用户看不出是命令名写错了。旧形式 ./main 0 / ./main photo.jpg / ./main data/*.jpeg
+    // 都仍然走演示路径。
+    const bool looks_like_source =
+        !cmd.empty() &&
+        (cmd[0] == '/' || cmd.find('/') != std::string::npos ||
+         cmd.find("://") != std::string::npos ||
+         cmd.find_first_not_of("0123456789") == std::string::npos ||
+         std::filesystem::exists(cmd));
+    if (!looks_like_source) {
+        std::cerr << "Unknown subcommand: " << cmd << std::endl
+                  << "  subcommands: identify | enroll | serve | mcp | demo" << std::endl
+                  << "  (a bare word is not a source: paths need '/', a URL needs '://', "
+                  << "a camera index is all digits)" << std::endl;
+        return -1;
+    }
+    if (cmd[0] != '-') {
+        std::cerr << "note: treating '" << cmd << "' as a demo source; "
+                  << "the subcommands are identify|enroll|serve|mcp|demo" << std::endl;
+        return run_demo(argc, argv);
+    }
+
+    std::cerr << "Unknown command: " << cmd << std::endl;
+    print_usage(argv[0]);
+    return -1;
+}
