@@ -578,6 +578,8 @@ int cmd_serve(int argc, char* argv[]) {
                 std::cerr << "--cache-entries expects an integer" << std::endl;
                 return -1;
             }
+        } else if (arg == "--reuseport") {
+            opt.reuseport = true;
         } else if (arg == "--quiet") {
             opt.quiet = true;
         } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
@@ -595,10 +597,11 @@ int cmd_serve(int argc, char* argv[]) {
     if (show_help) {
         std::cout << "Usage: facerec serve [--host 127.0.0.1] [--port 8080] [--workers N]\n"
                   << "                     [--cv-threads 1] [--max-request-mb 32] [--cache-entries 256]\n"
-                  << "                     [--quiet]\n"
+                  << "                     [--reuseport] [--quiet]\n"
                   << "                     [--config <path>] [--set key=value]\n"
                   << "  --workers     pipeline instances / concurrent requests (default: CPU count)\n"
                   << "  --cv-threads  OpenCV internal thread pool per worker (default: 1)\n"
+                  << "  --reuseport   SO_REUSEPORT: run N processes on one port (kernel load-balances)\n"
                   << "Endpoints: POST /v1/identify /v1/embed /v1/compare, GET /v1/people,\n"
                   << "           GET /healthz, GET /readyz\n";
         return 0;

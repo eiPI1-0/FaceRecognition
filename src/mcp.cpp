@@ -19,6 +19,7 @@
 #include "json_util.hpp"
 #include "pipeline_pool.hpp"
 #include "result_cache.hpp"
+#include "server.hpp"
 #include "sha256.hpp"
 
 namespace facerec {
@@ -432,11 +433,6 @@ int serve_stdio(PipelinePool& pool, const McpOptions& opt, ResultCache& cache) {
     return 0;
 }
 
-httplib::Server* g_server = nullptr;
-void on_signal(int) {
-    if (g_server) g_server->stop();
-}
-
 struct Access {
     TokenTable tokens;
     AuditSink audit;
@@ -476,18 +472,14 @@ int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
             "application/json; charset=utf-8");
     });
 
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
-    g_server = &svr;
     std::cerr << "facerec mcp: HTTP transport on http://" << opt.host << ":" << opt.port
               << "/mcp, " << pool.size() << " worker(s), gallery " << pool.gallery_size()
               << " person(s)" << std::endl;
-    if (!svr.listen(opt.host, opt.port)) {
+    // 与 HTTP 外壳同一份停机/SIGPIPE 处理：两个入口的行为必须一致，否则修一个忘一个。
+    if (listen_with_signals(svr, opt.host, opt.port, false) != 0) {
         std::cerr << "Failed to listen on " << opt.host << ":" << opt.port << std::endl;
-        g_server = nullptr;
         return 1;
     }
-    g_server = nullptr;
     return 0;
 }
 

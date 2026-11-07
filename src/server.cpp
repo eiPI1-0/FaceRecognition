@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/socket.h>
+
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -133,6 +135,8 @@ IdentifyOptions options_from_json(const std::string& body) {
 }
 
 // SIGINT/SIGTERM -> 停止接受新连接并退出 listen 循环。
+// 信号handler 里只能做 async-signal-safe 的事（不能分配、不能加锁、不能写 iostream），
+// 所以只能提前把一个裸指针交出去，handler 只做 svr->stop() 这一件事。
 httplib::Server* g_server = nullptr;
 
 void on_signal(int) {
@@ -140,6 +144,45 @@ void on_signal(int) {
 }
 
 }  // namespace
+
+int listen_with_signals(::httplib::Server& svr, const std::string& host, int port,
+                        bool reuseport) {
+    // 端口冲突的策略必须显式，不能交给第三方库的默认值。实测（本机 Linux）：httplib 的
+    // default_socket_options（httplib.h:1867）在 Linux 上开的是 SO_REUSEPORT 而**不是**
+    // SO_REUSEADDR，于是第二个进程绑同一个端口不会失败，而是与老进程**静默地各接一半连接**。
+    // 对服务端这是最坏的一种"能用"：改代码重启后老进程还在，一半流量打到旧二进制，
+    // 现象是"时灵时不灵"，日志里什么都没有。
+    //   默认：SO_REUSEADDR 开（重启不受 TIME_WAIT 影响）+ SO_REUSEPORT 关
+    //         -> 端口被活着的监听者占用时立刻 EADDRINUSE，启动失败并说明原因。
+    //   --reuseport：显式打开，用于多进程同端口横向扩展（见 deploy/facerec@.service）。
+    svr.set_socket_options([reuseport](socket_t sock) {
+        const int yes = 1, on = reuseport ? 1 : 0;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&yes), sizeof(yes));
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT,
+                   reinterpret_cast<const char*>(&on), sizeof(on));
+    });
+    // Nagle 必须关。httplib 的 CPPHTTPLIB_TCP_NODELAY 默认是 **false**（httplib.h:90），
+    // 于是 accept 出来的每个连接都开着 Nagle；而响应是**两段**写出的（header 一次 send、
+    // body 一次 send），第二段是个小包，撞上客户端的延迟 ACK 就要等 ~40ms 才发出去。
+    // 实测（本机，裸 socket vs http.client 打 /healthz，服务端不做任何推理）：
+    //   裸 socket 单连接   p50 = 0.10 ms
+    //   http.client keep-alive  p50 = 41.0 ms，strace 里第二段 body 被扣住 41.5 ms
+    // 这 41ms 是**每个响应**都付的固定成本，跟模型、并发、缓存都无关；之前记录的所有
+    // 延迟数字里都含着它。关掉后同一条链路与裸 socket 持平。
+    svr.set_tcp_nodelay(true);
+
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+    // httplib 的写路径没有用 MSG_NOSIGNAL，向已关闭的连接写数据会送 SIGPIPE，
+    // 而它的默认动作是终止进程。这里不是“防御性编程”：不屏蔽的话，一个客户端
+    // 提前断开就能带走整个服务。
+    std::signal(SIGPIPE, SIG_IGN);
+    g_server = &svr;
+    const bool ok = svr.listen(host, port);
+    g_server = nullptr;
+    return ok ? 0 : 1;
+}
 
 int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     // ---- 鉴权与审计 ----
@@ -392,12 +435,9 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     });
 
     // ---- 启动 ----
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
-    g_server = &svr;
-
     std::cout << "Listening on http://" << opt.host << ":" << opt.port
-              << "  (workers=" << workers << ")" << std::endl;
+              << "  (workers=" << workers << (opt.reuseport ? ", SO_REUSEPORT" : "") << ")"
+              << std::endl;
     {
         std::ostringstream os;
         os << "\"host\":\"" << json_escape(opt.host) << "\",\"port\":"
@@ -410,12 +450,11 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         audit_event(audit, "startup", os.str());
     }
 
-    if (!svr.listen(opt.host, opt.port)) {
-        std::cerr << "Failed to listen on " << opt.host << ":" << opt.port << std::endl;
-        g_server = nullptr;
+    if (listen_with_signals(svr, opt.host, opt.port, opt.reuseport) != 0) {
+        std::cerr << "Failed to listen on " << opt.host << ":" << opt.port
+                  << (opt.reuseport ? " (SO_REUSEPORT)" : "") << std::endl;
         return 1;
     }
-    g_server = nullptr;
     std::cout << "Stopped." << std::endl;
     return 0;
 }
