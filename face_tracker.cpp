@@ -1,5 +1,4 @@
 #include "face_tracker.hpp"
-#include "engine.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -217,21 +216,25 @@ void FaceTracker::build_views() {
     }
 }
 
-void FaceTracker::update(cv::Mat& img, Detector& detector) {
-    ++frame_count_;
-    const cv::Size bounds = detector.shape();
-    const bool detect_now = tracks_.empty() || (frame_count_ % p_.detect_every == 0);
+// frame_count_ 是"已经推进过的帧数"，所以对**下一帧**的判断要 +1。
+// needs_detection() 是纯查询（不改状态）：调用方先问、再决定要不要跑检测、最后 update()。
+bool FaceTracker::needs_detection() const {
+    if (p_.detect_every <= 1) return true;
+    return tracks_.empty() || ((frame_count_ + 1) % p_.detect_every == 0);
+}
 
+// 纯跟踪入口：一帧的画面尺寸 + 本帧的检测结果，不知道检测器、不知道图像。
+// 这样"跟踪"是一个可以直接喂脚本化序列的函数（tests/tracker_scenarios.cpp）。
+void FaceTracker::update(const cv::Size& frame, const std::vector<Face>& dets) {
+    ++frame_count_;
     // 每一帧（含检测帧）都先外推一帧，让轨迹与检测处于同一时刻
     for (auto& t : tracks_) {
         advance(t);
     }
 
-    if (detect_now) {
-        associate(detector.detect(img));
-    }
+    associate(dets);
 
     dedup();
-    prune(bounds);
+    prune(frame);
     build_views();
 }

@@ -203,7 +203,9 @@ int run_pipeline(const PipelineConfig& cfg, const std::string& source) {
 
         // 跟踪器决定本帧是否跑全图 DNN 检测；输出是带稳定 ID 的轨迹视图
         ++frame_no;
-        tracker.update(im, detector);
+        const bool detect_now = tracker.needs_detection();
+        tracker.update(detector.shape(),
+                       detect_now ? detector.detect(im) : std::vector<Face>{});
         const std::vector<TrackView>& tracks = tracker.tracks();
 
         const FrameOut fr = recognize_frame(recognizer, tracker.tracks(), frame_no,

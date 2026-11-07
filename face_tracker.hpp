@@ -5,8 +5,6 @@
 #include "face_def.hpp"
 #include "opencv2/opencv.hpp"
 
-class Detector; // 前置声明，避免循环依赖
-
 // 跟踪器交给应用的一帧视图：几何 + 跨帧稳定 ID + 本帧是否有检测支撑。
 //
 // measured=false 表示这一帧没有匹配到任何检测，框和关键点都是按速度外推的。
@@ -48,8 +46,13 @@ public:
 
     explicit FaceTracker(const TrackerParams& params = TrackerParams{});
 
-    // 每帧调用。内部按 detect_every 决定是否调用 detector.detect()。
-    void update(cv::Mat& img, Detector& detector);
+    // 下一帧要不要跑检测（detect_every 与"还没有轨迹"决定）。调用方据此决定给 detect()
+    // 还是直接传空列表 —— 跟踪器因此不需要认识 Detector，也就不需要模型在场才能测。
+    bool needs_detection() const;
+
+    // 每帧调用一次：给定画面尺寸与本帧检测结果，推进一帧。
+    // 跳过检测的帧传空列表（语义等于"这一帧没有检测到任何东西"）。
+    void update(const cv::Size& frame, const std::vector<Face>& dets);
 
     const std::vector<TrackView>& tracks() const { return views_; }
     size_t size() const { return views_.size(); }

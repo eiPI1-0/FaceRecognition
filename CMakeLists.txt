@@ -66,4 +66,10 @@ if(FACEREC_BUILD_TESTS)
     target_include_directories(decode_gates PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(decode_gates ${OpenCV_LIBS})
     add_test(NAME decode_gates COMMAND decode_gates)
+
+    # tracker 的六条脚本化序列：纯跟踪入口驱动，不加载模型（见 face_tracker.hpp）。
+    add_executable(tracker_scenarios tests/tracker_scenarios.cpp face_tracker.cpp)
+    target_include_directories(tracker_scenarios PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(tracker_scenarios ${OpenCV_LIBS})
+    add_test(NAME tracker_scenarios COMMAND tracker_scenarios)
 endif()
