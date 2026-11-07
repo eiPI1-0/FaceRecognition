@@ -12,6 +12,7 @@
 #include <sstream>
 
 #include "api.hpp"      // json_escape（api 层已经是所有外壳的共同依赖）
+#include "metrics.hpp"    // 请求计数：唯一计数点在本文件的访问日志钩子
 #include "sha256.hpp"
 
 namespace facerec {
@@ -77,6 +78,27 @@ std::string bearer(const httplib::Request& req) {
 }
 
 bool is_probe_path(const std::string& path) { return path == "/healthz" || path == "/readyz"; }
+
+// 把一次请求折成稳定基数的标签对。**不能**把 req.path 原样当标签：任何客户端循环打
+// /random-N 都能给 map 加一条永久记录，把 /metrics 变成内存与磁盘的双重炸弹。
+// 白名单是 serve 与 mcp 全部公开路由的并集；其余（含扫描器探路、404）一律归 other。
+std::string metric_labels(const std::string& path, int status) {
+    static const char* kKnown[] = {"/v1/identify", "/v1/embed", "/v1/compare", "/v1/people",
+                                   "/mcp",         "/healthz", "/readyz",    "/metrics"};
+    const char* slot = "other";
+    for (const char* p : kKnown) {
+        if (path == p) {
+            slot = p;
+            break;
+        }
+    }
+    std::string out = "path=\"";
+    out += slot;
+    out += "\",status=\"";
+    out += std::to_string(status);
+    out += '"';
+    return out;
+}
 
 }  // namespace
 
@@ -192,7 +214,7 @@ void audit_event(const AuditSink& sink, const char* kind, const std::string& fie
 }
 
 void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool quiet,
-                            const AuditSink& audit, bool is_mcp) {
+                            const AuditSink& audit, bool is_mcp, Metrics* metrics) {
     const char* svc = is_mcp ? "mcp" : "http";
 
     svr.set_pre_routing_handler([&tokens, &audit, svc](const httplib::Request& req,
@@ -215,8 +237,13 @@ void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    svr.set_logger([quiet, &audit, svc](const httplib::Request& req,
-                                        const httplib::Response& res) {
+    svr.set_logger([quiet, &audit, svc, metrics](const httplib::Request& req,
+                                                const httplib::Response& res) {
+        // 计数在**所有提前返回之前**：quiet 与"探针成功不记日志"只影响日志量，
+        // 不该让流量从指标里消失（否则 quiet 生产部署的 requests 恒为 0）。
+        if (metrics) {
+            metrics->http_requests.inc(metric_labels(req.path, res.status));
+        }
         // 探针成功不记（k8s 每 10s 打一次会把日志淹没），探针失败要记。
         if (is_probe_path(req.path) && res.status < 400) return;
         if (quiet && res.status < 400) return;

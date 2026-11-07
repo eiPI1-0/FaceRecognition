@@ -444,7 +444,9 @@ int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
 
     // 与 serve 同一套：/healthz 免鉴权，其余要 bearer；审计行不含 person_id（PLAN.md D1/D3）。
-    install_access_control(svr, access.tokens, opt.quiet, access.audit, /*is_mcp=*/true);
+    // MCP 传输层不暴露 /metrics，也就没有 Metrics 实例（见 auth.hpp 的参数说明）。
+    install_access_control(svr, access.tokens, opt.quiet, access.audit, /*is_mcp=*/true,
+                           /*metrics=*/nullptr);
 
     svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json; charset=utf-8");

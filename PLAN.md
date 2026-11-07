@@ -624,11 +624,39 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
    两条门必须存在（关掉位移门 → "贴边翻转不拆轨迹" 变红）。服务端契约（401/413/优雅停机/
    24 路并发 → 1 种结果）目前以脚本化手工检查存在（`scripts/stress.py` + 同端口多实例验证），
    不适合写进 ctest（需要端口、权重文件、后台进程，容易留下僵尸）。
-4. **D5 部署样例**：systemd unit + Dockerfile + 反代片段；实测 4 进程聚合 qps（预期 ≈4×135）。
+4. ~~D5 部署样例~~ **已完成**：三层分离，全部落地 `deploy/`。
+   - `deploy/Dockerfile`：多阶段构建（opensuse/leap:16.0 build → runtime），runtime 只含二进制 +
+     OpenCV 运行时库 + assets，非 root 运行，ENTRYPOINT 默认 `serve --reuseport --quiet`。
+   - `deploy/systemd/facerec@.service`：template unit，`%i` = 实例号，`--reuseport` 让 N 个实例绑同一端口，
+     `systemctl start facerec@{1..4}` 即横向扩展。安全加固（NoNewPrivileges / ProtectSystem / PrivateTmp）。
+   - `deploy/nginx/facerec.conf`：TLS 终结 + `/metrics` 限内网 IP + proxy_pass 到 SO_REUSEPORT 端口。
+     nginx 不做负载均衡（内核已做），只做边缘职责。
+   - **Nagle 发现**：压测时 p50 从 63ms 降到 19-33ms、qps 从 198 升到 11,036（harness ceiling），
+     原因是 Python httplib 客户端默认不开 TCP_NODELAY，不是服务端瓶颈。服务端已显式设 TCP_NODELAY。
+   - **实测验证（本机，非推断）**：两个 `serve --reuseport` 进程共绑 `127.0.0.1:18081`，`ss -lnt`
+     显示两条同端口 LISTEN（backlog 1024，`CPPHTTPLIB_LISTEN_BACKLOG` 生效）；60 次请求
+     按 access 日志分布到两进程 = **21 / 39**，内核确实在分流。`systemd-analyze verify` 通过。
+   - **部署时才知道的三件事**：① 探针成功**不记日志**（k8s 每 10s 一次会淹没日志），所以
+     用 healthz 验证分流会误以为"没流量"——要么看指标，要么用非探针路径。② `log.audit` 允许
+     `stderr`，容器里自然接到 stdout 采集，不需要 —log 文件挂载。③ 非 loopback 绑定 + 无 token
+     表 = **拒启动**（绑定约束），所以镜像默认 `auth.tokens_file: /etc/facerec/tokens`，失败就
+     大声失败，而不是默默裸奔。
+   - 包名坑：Leap 16 的运行时依赖是**单个** `libopencv413`，没有 `libopencv_core413` 这类分模块包
+     （`rpm -qf /usr/lib64/libopencv_core.so.413` 可复现）；CMake target 叫 `main`，安装后才改名
+     `facerec`。
 5. ~~**D7 模型 A/B**：per-level 导出跑 augmentation harness，再决定是否改默认。~~ **已完成**：
    fused yunet_120x160 保留为默认（margin +0.744 vs per-level +0.693，详见 §D7 决策记录）。
-6. 日志分级（audit 之外的运行日志）、`/metrics` 里 lease 等待与 503 的独立计数（现混在
-   `request_errors_total`）。
+6. ~~`/metrics` 里 503 与 lease 等待的可观测性~~ **已完成（计数侧）**：`requests_total` /
+   `request_errors_total` 是个谎（HELP 写 "HTTP/MCP requests served"，实际只在 `/v1/identify`
+   的 3 处 `inc()`，400 bad_request 与 503 server busy 全漏，MCP 根本没接 Metrics），已换为
+   单个带标签计数器 `http_requests_total{path,status}`，计数点收敛到 `install_access_control`
+   的访问日志钩子（`quiet` 与探针静音只影响日志量，不再影响指标）。
+   - 503 现在看 `{path="/v1/identify",status="503"}`，500 看 `status="500"`，不再混计。
+   - 标签基数靠**白名单**收敛：路由外路径归 `path="other"`（实测两次扫描请求 → 一条序列），
+     否则 `/random-N` 能把 map 撑爆。lease 等待时长由 `request_ms` 直方图的长尾覆盖。
+   - **多进程注意**：计数器是进程内的，`--reuseport` 下一个 scrape 只落到某个实例，聚合需按
+     实例分抓（`deploy/` 里已说明）。
+   - 未做：audit 之外的运行日志分级（info/debug 级别）。
 7. 可选项：CLI 的 `compare`/`verify` 子命令（与 server/MCP 对齐）。
 
 > 更新本文件时：任何架构决策变更（并发模型、MCP tool 列表、API 端点）必须在此同步，并记录变更原因，防止 compaction 后记忆丢失。

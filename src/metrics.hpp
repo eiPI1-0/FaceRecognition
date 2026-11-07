@@ -4,6 +4,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -49,6 +51,34 @@ private:
     std::atomic<uint64_t> total_{0};
 };
 
+// 标签值在运行期才知道（path/status），所以不能像 Counter 那样一个成员一个计数器。
+// 一条标签组合一个计数，首次出现时插入。写路径只做一次 map 查找；一次请求里已经有
+// imdecode 与 DNN，这点开销是噪声。
+//
+// 标签基数**必须**由调用方收敛：拿请求路径原样当标签，`/aaaaaaaa…` 就能把 map 撑爆。
+// install_access_control 因此只认白名单路由，其余一律归 "other"。
+class LabeledCounter {
+public:
+    LabeledCounter(const char* name, const char* help) : name_(name), help_(help) {}
+
+    void inc(const std::string& labels) {
+        std::lock_guard<std::mutex> lk(m_);
+        ++values_[labels];
+    }
+
+    // Prometheus 文本格式；输出按标签排序，同样的输入永远逐字节相同（便于 diff/测试）。
+    void write_prometheus(std::string& out) const;
+
+    const char* name() const { return name_; }
+    const char* help() const { return help_; }
+
+private:
+    const char* name_;
+    const char* help_;
+    mutable std::mutex m_;
+    std::map<std::string, uint64_t> values_;
+};
+
 class Counter {
 public:
     explicit Counter(const char* name, const char* help) : name_(name), help_(help) {}
@@ -80,10 +110,13 @@ class Metrics {
 public:
     Metrics();
 
-    // 请求级
-    Counter requests_total{"requests_total", "HTTP/MCP requests served"};
-    Counter request_errors_total{"request_errors_total",
-                                 "Requests answered with an error"};
+    // 请求级：唯一的数据来源是访问日志钩子（auth.cpp 的 install_access_control），
+    // 按 {path,status} 打标签。收敛到钩子里是因为散在各 handler 的手工 inc() 必然漏：
+    // 之前缺了 400 bad_request 与 503 server busy，而 HELP 却写着 "HTTP/MCP requests
+    // served"。现在任何路由、任何状态码（含 401/413/503）自动计入，加路由不可能忘。
+    // 503 与 500 靠 status 标签区分，不再混在同一个错误计数里。
+    LabeledCounter http_requests{"http_requests_total",
+                                 "HTTP requests served, by path and status"};
     Counter faces_total{"faces_detected_total", "Faces detected across requests"};
     Counter matches_known_total{"matches_known_total",
                                 "Faces matched to an enrolled person"};

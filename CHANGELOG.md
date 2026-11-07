@@ -4,6 +4,45 @@ Notable changes to this repository. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses release tags rather
 than a strict versioning scheme.
 
+## Unreleased
+
+### Added
+
+- **`deploy/` — three deployment artifacts, each with one job.**
+  - `deploy/Dockerfile`: multi-stage build (openSUSE Leap 16). The build stage carries
+    `opencv-devel`; the runtime stage carries only `libopencv413` plus the binary, runs as a
+    non-root user, and keeps `models/`, `data/` and the enrollment index on volumes. Because a
+    non-loopback bind without a token table refuses to start, the image ships
+    `auth.tokens_file: /etc/facerec/tokens` and fails loudly when it is not mounted.
+  - `deploy/systemd/facerec@.service`: a template unit, so `systemctl start facerec@{1..4}` is
+    horizontal scaling. `--reuseport` lets all instances bind one port and the kernel distributes
+    connections — verified here with two processes, two `ss -lnt` lines, and 60 requests split
+    21 / 39 across them.
+  - `deploy/nginx/facerec.conf`: TLS termination, `/metrics` restricted to private ranges, and a
+    proxy to a loopback-bound instance. nginx does no load balancing, because the kernel already
+    does; it only does edge work.
+
+### Changed
+
+- **`facerec_requests_total` / `facerec_request_errors_total` are gone**; both were wrong in a way
+  that mattered. Their HELP text claimed "HTTP/MCP requests served", but they were incremented at
+  three points inside `/v1/identify` only: `400 bad_request` and `503 server busy` were invisible,
+  and the MCP transport never incremented them at all. They are replaced by one labeled counter,
+  `facerec_http_requests_total{path,status}`, incremented in the single access-log hook in
+  `src/auth.cpp` — so every route and every status code (401 / 400 / 413 / 503 / 500) is counted,
+  and adding a route cannot under-count it. `quiet` and probe log suppression still silence logs,
+  never metrics. `path` is a fixed whitelist; unknown paths collapse into `path="other"`, so a
+  client looping over `/random-N` cannot inflate label cardinality.
+  Per-process counters are unchanged, and now documented: with `--reuseport` one scrape reaches
+  one arbitrary instance, so aggregate per instance.
+
+### Fixed
+
+- README claimed "There is **no authentication** and no TLS", contradicting the implemented
+  binding constraint (bearer tokens via `auth.tokens_file`, refusal to start on a non-loopback
+  host without a token table, audit line on every 401). Corrected, and TLS is documented as the
+  reverse proxy's job.
+
 ## v1.2.0 — 2026-11-07 — production shells (CLI / HTTP / MCP)
 
 ### Added

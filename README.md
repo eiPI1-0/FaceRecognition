@@ -241,17 +241,30 @@ wrote), because writing a template is the irreversible act.
 
 **Operational notes**
 
-- `GET /metrics` — Prometheus text: `facerec_requests_total`, `facerec_request_errors_total`,
+- `GET /metrics` — Prometheus text: `facerec_http_requests_total{path,status}` (every route,
+  every status: 401/400/413/503/500 all visible; `path` is a **fixed** whitelist, anything
+  unrecognised collapses into `path="other"` so a scanner cannot inflate label cardinality),
   `facerec_faces_detected_total`, `facerec_matches_known_total` / `..._unknown_total`,
   `facerec_cache_hits_total` / `..._misses_total` / `..._evictions_total`, and histograms
   `facerec_decode_ms`, `facerec_detect_ms`, `facerec_embed_ms`, `facerec_request_ms`,
   `facerec_match_score`.
+  Request counting happens in **one** place — the access-log hook in `src/auth.cpp` — so a new
+  route can never be under-counted and an early-return branch can never be missed.
+  Note: counters are **per process**; with `--reuseport` a scrape lands on one arbitrary
+  instance, so aggregate across instances (see `deploy/`) instead of trusting a single scrape.
 - SIGINT/SIGTERM stops accepting new connections and lets in-flight handlers finish.
 - The listen backlog is set to 1024 (`CPPHTTPLIB_LISTEN_BACKLOG`, see `CMakeLists.txt`);
   cpp-httplib's default of 5 makes the kernel drop SYNs past 5 simultaneous connects, which
   shows up as a mysterious ~1 s latency tail that server-side timings do not explain.
-- There is **no authentication** and no TLS: bind to localhost or terminate both in a reverse
-  proxy. `--max-request-mb` and the pixel cap reject oversized/decompressed-bomb bodies.
+- **Auth is a binding constraint, not a switch.** Tokens live in `auth.tokens_file`
+  (`name:sha256:<64 hex>` per line, created `0600` by `./main token --name <caller>`; the token
+  itself is printed once and never stored). Every route except `/healthz` and `/readyz` requires
+  `Authorization: Bearer <token>`. Binding a **non-loopback** `--host` with no token table
+  **refuses to start** — so `--host 0.0.0.0` can never be a silent open door. A 401 always writes
+  an audit line (with peer address and whether a token was presented), even under `--quiet`.
+- TLS is still the reverse proxy's job (`deploy/nginx/facerec.conf` terminates it and proxies to
+  a loopback-bound instance). `--max-request-mb` and the pixel cap reject oversized /
+  decompression-bomb bodies before decoding.
 - `paths.gallery_index` holds **plaintext 512-d templates plus names**, so it is created `0600`
   and a wider mode triggers a one-line warning with the fix (`chmod 600`). Treat backups and
   copies of it as biometric data; `paths.gallery_index: ""` keeps templates in memory only.
@@ -262,6 +275,36 @@ wrote), because writing a template is the irreversible act.
   `image/jpeg`/`octet-stream` anyway: it is what the API documents.
 - The gallery is rebuilt from `data/` at startup and cached to `paths.gallery_index`
   (invalidated by a model/gallery fingerprint change).
+
+### Deployment
+
+Three files in `deploy/`, each doing one job:
+
+| File | Job |
+|---|---|
+| `deploy/Dockerfile` | multi-stage image: build stage carries `opencv-devel`, runtime carries only `libopencv413` + the binary. Non-root, `serve` as ENTRYPOINT, assets and index on volumes. |
+| `deploy/systemd/facerec@.service` | template unit. `systemctl start facerec@{1..4}` starts four processes on one port; `--reuseport` lets the kernel distribute connections. |
+| `deploy/nginx/facerec.conf` | TLS termination, `/metrics` restricted to private ranges, everything else proxied to a loopback-bound instance. |
+
+**Scale out, not up.** One process already uses every core (one pipeline per worker), so the
+axis that matters is *processes*, and `--reuseport` is what makes that a one-flag change: each
+instance keeps its own pipeline pool and its own result cache, no coordinator, no shared memory.
+Verified here: two processes on one port, `ss -lnt` shows two LISTEN lines, and 60 requests split
+21 / 39 in the access log.
+
+**What to expect when you deploy:**
+
+- Probes are **not** logged when they succeed (k8s hits `/healthz` every 10 s). Verifying traffic
+  distribution with `/healthz` therefore shows nothing — use a non-probe route or the counters.
+- `/metrics` is **per process**. With `--reuseport` a scrape reaches one arbitrary instance, so
+  configure one scrape target per instance (or a sidecar) and sum in PromQL; a single scrape is a
+  sample, not the total.
+- `log.audit: stderr` is the default and is the right choice in a container (the orchestrator
+  collects stdout); no log-volume mount needed.
+- The runtime dependency on openSUSE Leap 16 is the **single** `libopencv413` package — there is no
+  per-module `libopencv_core413` (§ note: `rpm -qf /usr/lib64/libopencv_core.so.413`).
+
+The CMake target is named `main`; the Dockerfile and the systemd unit install it as `facerec`.
 
 ### mcp — Model Context Protocol tools
 

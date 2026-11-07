@@ -1,0 +1,75 @@
+# facerec@.service — systemd template unit for horizontal scaling.
+#
+# Usage:
+#   sudo cp deploy/systemd/facerec@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+#   # Start 4 instances (kernel load-balances via SO_REUSEPORT):
+#   sudo systemctl start facerec@{1..4}
+#   sudo systemctl enable facerec@{1..4}
+#
+#   # Scale down to 2:
+#   sudo systemctl stop facerec@{3,4}
+#
+# Each instance is an independent process with its own pipeline pool.
+# --reuseport lets them all bind port 8080; the kernel distributes
+# incoming connections across them (SO_REUSEPORT, not round-robin).
+#
+# Install:
+#   sudo install -Dm755 build/main /opt/facerec/facerec     # target is named `main`
+#   sudo install -Dm644 config.example.yml /etc/facerec.yml
+#   sudo /opt/facerec/facerec token --name svc \
+#        --tokens-file /etc/facerec/tokens                  # prints the token once
+#   sudo cp -r build/models build/data /opt/facerec/
+#   sudo useradd -r -U -s /sbin/nologin -d /opt/facerec facerec
+#   sudo chown -R facerec:facerec /opt/facerec
+#
+# Adjust paths if you install elsewhere.
+
+[Unit]
+Description=FaceRecognition server (instance %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=facerec
+Group=facerec
+
+# The binary must run from a directory containing models/ and data/.
+WorkingDirectory=/opt/facerec
+
+# Binds loopback only: nginx (deploy/nginx/facerec.conf) terminates TLS and
+# proxies to this port, so the app never sees the public network.
+# --reuseport is REQUIRED when running multiple instances on the same port.
+# --quiet suppresses per-request access logs (audit still goes to journal via stderr).
+# --workers defaults to CPU count per instance; tune down if running many instances
+# to avoid over-subscription (e.g., 4 instances × 4 workers = 16 threads).
+ExecStart=/opt/facerec/facerec serve \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --reuseport \
+    --quiet \
+    --config /etc/facerec.yml
+
+# Graceful shutdown: SIGTERM → finish in-flight requests → exit.
+# cpp-httplib + our signal handler drain cleanly within 10s.
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3
+
+# Security hardening (systemd ≥ 231)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/facerec/data /var/lib/facerec
+PrivateTmp=true
+
+# Logging: structured audit JSON goes to stderr → journalctl.
+# View: journalctl -u facerec@1 -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=facerec-%i
+
+[Install]
+WantedBy=multi-user.target

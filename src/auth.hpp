@@ -19,6 +19,8 @@
 
 namespace facerec {
 
+class Metrics;
+
 class TokenTable {
 public:
     // 行式文件：`name:sha256:<64 hex>`，`#` 注释与空行忽略。任何坏行都失败并给出 file:line
@@ -66,8 +68,11 @@ struct AuditSink {
 //   - 401 带 WWW-Authenticate，且**永远**记审计，不受 quiet 影响（安全事件不能被静音）；
 //   - 成功行的 body 细节由 handler 自己补（它知道 faces/matched/cache），这里只记
 //     method/path/status/ms/caller/bytes。
+// metrics 可为空（mcp server 不持有 Metrics）：非空时每个请求计一次
+// `http_requests_total{path,status}`。计数点放在这里而不是各 handler，是为了让
+// "加路由忘了计数" 与 "某个分支漏了错误码" 结构上不可能发生。
 void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool quiet,
-                            const AuditSink& audit, bool is_mcp);
+                            const AuditSink& audit, bool is_mcp, Metrics* metrics);
 
 // 非请求事件（startup / enroll / gallery 重建）：fields 是已序列化好的 JSON 片段。
 void audit_event(const AuditSink& sink, const char* kind, const std::string& fields);

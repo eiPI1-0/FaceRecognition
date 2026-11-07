@@ -251,7 +251,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
 
     // 鉴权 + 结构化审计（PLAN.md D1/D3）：探针免鉴权，其余全要 bearer；
     // 401 永远记审计，成功行受 --quiet 影响。
-    install_access_control(svr, auth, opt.quiet, audit, /*is_mcp=*/false);
+    install_access_control(svr, auth, opt.quiet, audit, /*is_mcp=*/false, &metrics);
 
     // ---- 指标 ----
     svr.Get("/metrics", [&metrics, &cache](const httplib::Request&, httplib::Response& res) {
@@ -297,7 +297,8 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     svr.Post("/v1/identify", [&pool, &opt, &cache, &metrics](const httplib::Request& req,
                                                              httplib::Response& res) {
         const auto t_request = std::chrono::steady_clock::now();
-        metrics.requests_total.inc();
+        // 请求数与错误数不在这里计：auth.cpp 的访问日志钩子按 {path,status} 统一计，
+        // 否则 400 bad_request / 503 server busy 这类早退分支必然漏计。
         std::string bytes, err;
         if (!image_bytes_from_request(req, bytes, err)) {
             set_json(res, 400, error_to_json(err, "bad_request"));
@@ -328,7 +329,6 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         double ms_decode = 0;
         cv::Mat img = decode_image(bytes, opt.max_image_pixels, err, ms_decode);
         if (img.empty()) {
-            metrics.request_errors_total.inc();
             set_json(res, 400, error_to_json(err, "bad_image"));
             return;
         }
@@ -348,7 +348,6 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
             res.set_header("X-Cache", "MISS");
             set_json(res, 200, identify_to_json(result, iopt));
         } catch (const cv::Exception& e) {
-            metrics.request_errors_total.inc();
             set_json(res, 500, error_to_json(e.what(), "pipeline_error"));
         }
     });

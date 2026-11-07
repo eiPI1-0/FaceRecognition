@@ -70,14 +70,33 @@ void Counter::write_prometheus(std::string& out, const std::string& labels) cons
     out += '\n';
 }
 
+void LabeledCounter::write_prometheus(std::string& out) const {
+    out += "# HELP facerec_";
+    out += name_;
+    out += ' ';
+    out += help_;
+    out += "\n# TYPE facerec_";
+    out += name_;
+    out += " counter\n";
+    std::lock_guard<std::mutex> lk(m_);
+    for (const auto& kv : values_) {  // std::map：已按标签字典序
+        out += "facerec_";
+        out += name_;
+        out += '{';
+        out += kv.first;
+        out += "} ";
+        out += std::to_string(kv.second);
+        out += '\n';
+    }
+}
+
 Metrics::Metrics() = default;
 
 std::string Metrics::to_prometheus() const {
     std::string out;
     out.reserve(8192);
     const std::string none;
-    requests_total.write_prometheus(out, none);
-    request_errors_total.write_prometheus(out, none);
+    http_requests.write_prometheus(out);
     faces_total.write_prometheus(out, none);
     matches_known_total.write_prometheus(out, none);
     matches_unknown_total.write_prometheus(out, none);
