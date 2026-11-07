@@ -4,6 +4,150 @@ Notable changes to this repository. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses release tags rather
 than a strict versioning scheme.
 
+## Unreleased — production shells (CLI / HTTP / MCP)
+
+### Added
+
+- **`./main mcp`** — Model Context Protocol server (JSON-RPC 2.0) over stdio or `POST /mcp`,
+  linking the library directly so a tool call costs one forward pass instead of a cold
+  `readNet`. Four read-only tools with JSON Schemas: `identify_faces`, `compare_faces`,
+  `list_people`, `get_face_crop`. **Enrollment is deliberately not exposed**: writing a
+  biometric template is non-retractable and must not be reachable from a prompt-injectable
+  caller — `tools/call` to `enroll_person` answers `-32602 unknown tool`. Tool results carry
+  a human-readable summary *and* machine-parseable JSON, and `identify_faces` states in the
+  description the model actually reads that `"matched": null` means unknown, so candidate
+  scores are never turned into an invented identity.
+- **`./main identify --image <path>`** — one image in, JSON out, no window, no state.
+  `bbox`/`landmarks` are in original-image pixels (the letterbox mapping is inverted), so a
+  caller never has to know about `rfactor`. "No face" and "below threshold" are answers, not
+  errors: `"faces": []` / `"matched": null` with exit status 0. Request-level `--top-k`,
+  `--min-score`, `--include landmarks|crops|embedding` and `--detector-input WxH`, so tuning
+  needs no restart and no recompile.
+- **`./main enroll --name <person> --dry-run <photos...>`** — validates a registration set
+  (readable? face found? aligned?) without writing anything. `--yes` prints the plan; the
+  persistent index is still a later phase.
+- **`./main serve`** — HTTP service on vendored cpp-httplib: `POST /v1/identify` (raw image
+  body *or* JSON with `image_b64`), `/v1/embed`, `/v1/compare`, `GET /v1/people`,
+  `/healthz`, `/readyz`. Backpressure is the worker pool itself (one `Pipeline` per worker,
+  `503` when none is free), body and pixel limits are enforced before decoding, and
+  SIGINT/SIGTERM finishes in-flight requests then exits 0.
+- **A layered source tree.** The inference library moved to `src/engine.{hpp,cpp}`
+  (`FaceRecognition.h` is now a forwarding header, so old includes still build), and the
+  request-level API — `Pipeline`, `IdentifyResult`, JSON — lives in `src/api.{hpp,cpp}`.
+  CLI, HTTP and MCP share that one implementation, so their output cannot drift apart.
+  `src/json_util`, `src/encoding` and `src/pipeline_pool` hold what the shells used to
+  duplicate.
+- `./main demo <source>` — the original interactive loop, unchanged; `./main 0` still works
+  and is reported as a legacy form on stderr.
+- **`GET /metrics`** — Prometheus text exposition: request / error / faces-detected /
+  known-vs-unknown-match / cache hit-miss-eviction counters, plus histograms for `decode_ms`,
+  `detect_ms`, `embed_ms`, `request_ms` and `match_score`. The score histogram is what makes a
+  `recognize.thresh` change reviewable: you see the distribution move instead of guessing.
+- **Persistent gallery index** (`paths.gallery_index`, default `./gallery.idx`, empty disables):
+  fused enrollment features are stored next to the run and reloaded at startup — no photo is
+  decoded or embedded when the index is valid. It carries a fingerprint of the model files and
+  of every registration photo (path, size, mtime); any change rebuilds it, and a corrupt index
+  rebuilds with the reason printed rather than failing.
+- **`--cv-threads N`** (default 1): the server parallelizes across pipeline instances, so
+  OpenCV's intra-request thread pool is off unless asked for. `--workers` defaults to the CPU count.
+- **A missing weight now names its own fix**: `check_model_files()` adds a copy-pasteable hint
+  (current working directory plus `--set paths.root=build`) to the existing "which path, what to
+  do" message. Path *resolution* semantics are unchanged — relative `paths.*` still resolve
+  against `paths.root` (default cwd), anchoring stays opt-in.
+
+### Fixed
+
+- **stdio MCP framing**: JSON Schemas were written as readable multi-line raw strings, and
+  a raw newline inside one message breaks the newline-delimited transport — the server sent
+  33 lines for 6 requests and clients failed mid-object. Schemas are now emitted on one
+  line. (The HTTP transport hides this bug, so stdio is what has to be tested.)
+- `httplib` caps `application/x-www-form-urlencoded` bodies at **8192 bytes** independently
+  of `set_payload_max_length`, and `curl --data-binary` defaults to exactly that content
+  type — so posting a 900 KB image returned 413 regardless of `--max-request-mb`. The cap
+  is raised to 64 MB at compile time; the real limit stays the runtime
+  `--max-request-mb` (verified: 2 MB body with a 1 MB limit still returns 413).
+
+- **Request-level detector size** (`/v1/identify` `detector_input`, CLI `--detector-input`):
+  detect a group photo or distant face with 640×480 instead of 160×120 to trade CPU for
+  recall. The letterbox canvas stays fixed, so the alignment crop always comes from the
+  resolution the gallery was built at — the knob changes how many pixels reach the
+  detector, not the embedding's domain. Cost is roughly quadratic (1.6 / 11.4 / 35 / 87 ms
+  at 160×120 / 320×240 / 640×480 / 960×720 on one image). Sizes must be multiples of 8
+  within [32,1024], else 400. Up to 8 distinct sizes are kept per worker (LRU), because an
+  unbounded set of request-chosen sizes would be an unbounded memory path.
+- **Result cache** (`src/result_cache`, `--cache-entries`, default 256): keyed by
+  `sha256(image bytes) + request params + model/gallery fingerprint`, computed *before*
+  decoding so a hit skips `imdecode`, detection and embedding. Measured 205 → 1347 req/s
+  and p50 72.8 → 4.4 ms when 16 clients repeat one image. `X-Cache: HIT|MISS` is returned
+  and `/readyz` reports hit/miss counters. `src/sha256` is self-contained (no OpenSSL).
+  The key covers every option that changes the output rather than caching a canonical
+  result and re-deriving crops/embeddings — half the code and no recompute edge cases, at
+  the cost of a miss when the same image is asked for a different `top_k`.
+
+### Changed
+
+- **`Detector::detect(const cv::Mat&) const -> std::vector<Face>`** returns by value instead
+  of handing back an internal reference, and no longer keeps `dets`/`output_blobs` as
+  cross-call state. `FeatureExtractor::extract*` and
+  `FeatureDatabase::select_max_similarity` are `const`. This is what makes "one pipeline
+  instance per worker thread" safe; the old interface could not be used concurrently.
+- `FeatureDatabase` gained `select_top_k(feature, k)`, so a caller can report ranked
+  candidates instead of only the single best match.
+- Server default `cv::setNumThreads(1)`: measured p50 latency is unchanged (10.6 ms) while
+  throughput rises 26–32% at 4–8 workers — letting each worker's OpenCV also spawn 16
+  threads only makes them compete for cores.
+- `features_from_img` takes `const cv::Mat&`; it always cloned internally anyway.
+
+### Fixed
+
+- `./main --dump-config`, `./main <source>` and every other pre-existing invocation keep
+  working after the subcommand split (non-command first argument falls through to `demo`).
+- **`nan` scores and phantom faces under serving** — the same image sometimes returned an extra
+  candidate, sometimes two, with `det_score: nan` or a forged 0.999 score. Two independent causes,
+  both fixed:
+  1. *Detection*: the pinned fused export computes its **last level** (6 of 1076 anchors, stride 64)
+     unreliably under OpenCV 4.13 — buffer-state dependent per `Net` instance, stable within one, and
+     *not* a race: a process-wide forward mutex, `cv::setNumThreads(1)` and `net.enableFusion(false)`
+     all still reproduce it (12–24 of 48 forwards affected). `decode` then *accepted* those anchors,
+     because the score gate was written `score < ignore_score`, which is false for NaN.
+     `PriorBox::decode` now rejects non-finite scores (`!(score >= ignore_score)`) and any candidate
+     box that cannot be a face in this frame (finite, 2 px ≤ w,h ≤ 8× the frame, ≥1% of its area
+     inside). Required because `iou_score` is clamped to [0,1], so garbage conf can forge a high
+     score while garbage `loc` yields a degenerate box. Edge-clipped faces still pass: only real
+     overlap is required. Before: 4 phantom candidates per one-face photo, every run; after: 24
+     concurrent identical requests give exactly **1** distinct result, and real detections are
+     bit-equal to before. The tracker, `align_face`, OpenCV's thread pool and buffer reuse were each
+     ruled out with measurements (PLAN.md §P5) — the earlier "the tracker is thread-unsafe" and
+     "buffer reuse explains it" diagnoses in this session's notes were wrong.
+  2. *Transport*: a stable ~1.04 s tail on some requests was cpp-httplib's **listen backlog of 5**
+     (`httplib.h:117`; `Server::listen()` takes no backlog argument, so the macro is the only lever).
+     Above 5 simultaneous connects the kernel drops SYNs and the client retransmits after 1 s —
+     invisible in server-side timings (handler 16 ms, `curl`'s own `connect` 1015 ms). CMake now
+     defines `CPPHTTPLIB_LISTEN_BACKLOG=1024`. Measured (Debug, cache off): workers=4 max
+     1078 → 67 ms, workers=8 1081 → 126 ms, and 5/64 slow requests → 0.
+- **`enroll --yes` reported `"status":"ok"` while writing nothing** — the write path was a stub,
+  which on a *biometric enrollment* API is the worst possible failure mode (the caller believes a
+  person exists; every later query answers `matched: null`). It now copies the photos that contain
+  a usable face into `<data_dir>/<person>/`: `--name` must be one safe path component (`../evil`,
+  `a/b`, leading `-` rejected; whitespace normalized exactly like the gallery index does), an
+  existing filename is never clobbered (`_1` suffix), unreadable/faceless photos are listed in
+  `"skipped"`, and a run that writes nothing fails instead of reporting success. `--dry-run` now
+  prints `would_write_to`, and both modes emit valid JSON (a misplaced bracket made the dry-run
+  output unparseable — caught by feeding it through `json.load`).
+- **MCP `list_people` reported directories, not enrolled people**: an empty `data/test/` was
+  announced as `"3 person(s) enrolled: … test"` while the JSON beside it listed 2 — and a person
+  with no usable photos can never match, so a caller would have inferred an identity that does not
+  exist. The summary now comes from the gallery itself and appends
+  `[enrolled but no usable photos: <dir>]` when a directory contributed nothing.
+- **A person directory whose name contained whitespace had two different ids**: `data/John Doe/`
+  was `John Doe` after a cold start and `John_Doe` after the index was reloaded (the line-based
+  index normalized on write only). The id and provenance are normalized at build time now, through
+  the one shared rule (`normalize_entry_id`, declared in `gallery.hpp`).
+- A bare first argument that is not a path, URL, camera index or existing file (`./main compaer`)
+  is reported as an unknown subcommand instead of being opened as a video source.
+- `CMakeLists.txt` sets a default `CMAKE_BUILD_TYPE=Release` when none is given: an unconfigured
+  build silently produced `-O0` binaries, and every perf number taken from them was off by ~3×.
+
 ## v1.1.0 — 2026-10-27
 
 ### Added

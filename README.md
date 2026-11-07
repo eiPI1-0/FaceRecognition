@@ -112,8 +112,160 @@ so a differently-aligned model will silently degrade.
 
 ## Run
 
+The binary is a multi-command tool. `demo` is the original interactive window; the other
+commands are for scripting, services and LLM tool use.
+
 ```sh
-./main <source> [cpu|cuda|openvino] [batch|nobatch]
+./main identify --image <path> [options]     # one image, JSON on stdout
+./main enroll   --name <person> [--dry-run|--yes] <photo> ...
+./main serve    [--host H] [--port P] [--workers N]    # HTTP service
+./main demo     <source> [cpu|cuda|openvino] [batch|nobatch]
+./main mcp    [--transport stdio|http] [--port P]    # MCP tools for LLM clients
+```
+
+`./main <source>` without a command is still treated as `./main demo <source>`, so older
+invocations keep working.
+
+### identify — stateless, script- and LLM-friendly
+
+```sh
+./main identify --image photo.jpg
+./main identify --image photo.jpg --top-k 3 --include landmarks,crops
+./main identify --image photo.jpg --detector-input 640x480 --set recognize.thresh=0.35
+```
+
+stdout is **only** JSON; logs go to stderr. Exit status is 0 whenever the request was
+served — including "no face found" (`"faces": []`) and "face found but unknown"
+(`"matched": null`) — because those are answers, not failures. Non-zero means the request
+itself was wrong (bad path, unreadable image, invalid config).
+
+```json
+{"status":"ok","source":"photo.jpg","image_size":[640,607],"detector_input":[160,120],
+ "timing_ms":{"detect":1.03,"embed":5.22,"total":6.25},
+ "model":{"detector_model":"models/yunet_120x160.onnx","embedder_model":"models/mobilefacenet.onnx","gallery_size":2},
+ "faces":[{"index":0,"bbox":[299.1453,71.7509,111.3053,126.4719],"det_score":1.0,"aligned":true,
+           "matched":{"person_id":"BruceLi","score":1.0},
+           "top_k":[{"person_id":"BruceLi","score":1.0},{"person_id":"IvanYang","score":0.0226}]}]}
+```
+
+`bbox` and `landmarks` are in **original-image pixels**, not in the detector's 160×120
+space — the letterbox mapping is inverted for you.
+
+### serve — HTTP service
+
+```sh
+./main serve --port 8080 --workers 8          # workers = concurrent requests
+curl -X POST --data-binary @photo.jpg -H 'Content-Type: image/jpeg' \
+     localhost:8080/v1/identify
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"image_b64":"...","top_k":3,"include":["landmarks"]}' \
+     localhost:8080/v1/identify
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/identify` | raw image body **or** JSON `{"image_b64", "top_k", "min_score", "include"}` |
+| `POST /v1/embed` | 512-d embedding of one face (`face_index`, default 0) |
+| `POST /v1/compare` | `{"a":[...],"b":[...]}` → cosine |
+| `GET /v1/people` | enrolled person ids (never embeddings or photos) |
+| `GET /healthz` / `GET /readyz` | liveness / readiness (`/readyz` also reports cache hits/misses) |
+
+`/v1/identify` accepts a request-level detector size — more pixels through the detector for
+group photos and distant faces:
+
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"image_b64":"...","detector_input":{"w":640,"h":480}}' \
+     localhost:8080/v1/identify
+```
+
+It costs roughly quadratically (measured on one image: 160×120 = 1.6 ms, 320×240 = 11.4 ms,
+640×480 = 35 ms, 960×720 = 87 ms). The letterbox canvas stays fixed, so the alignment crop
+still comes from the same resolution the gallery was built at. If you routinely use a large
+detector size, raise `detector.input_w/h` in the config as well so gallery and queries are
+built at the same geometry — the request-level knob buys *recall*, not accuracy.
+
+Identical requests are cached by `sha256(image bytes) + params + model/gallery
+fingerprint`, and the key is computed **before** decoding, so a hit skips `imdecode`,
+detection and embedding. Measured with one image repeated by 16 clients: 205 → 1347 req/s,
+p50 72.8 ms → 4.4 ms. Disable with `--cache-entries 0`; `X-Cache: HIT|MISS` is returned.
+Changing the gallery requires a restart for the cache to be invalidated (its fingerprint is
+taken at startup).
+
+Concurrency model: one `Pipeline` (its own DNN nets) per worker, requests beyond that
+queue and eventually return `503` (the lease times out at 5 s). `--workers` defaults to the
+CPU count; each pipeline costs ~7 MB RSS and one core, so 16 workers ≈ 220 MB. `--cv-threads 1`
+is the default — the model is "many pipelines in parallel", not "one Net spread over threads";
+raising it re-introduces thread-pool contention inside every convolution.
+
+Serving throughput (this machine, 16 cores, **Release**, `--cache-entries 0`, one face per image,
+4×W simultaneous clients, fresh connection per request):
+
+| `--workers` | p50 | p90 | max | req/s | RSS |
+|---|---|---|---|---|---|
+| 4 | 74 ms | 108 ms | 117 ms | ≈135 | 112 MB |
+| 8 | 100 ms | 136 ms | 150 ms | ≈193 | 147 MB |
+| 16 (64 clients, oversubscribed) | 185 ms | 271 ms | 307 ms | ≈187 | 217 MB |
+
+Beyond ~8 workers the CPU is saturated; scale out with several processes behind a
+reverse proxy rather than by adding workers.
+
+**Operational notes**
+
+- `GET /metrics` — Prometheus text: `facerec_requests_total`, `facerec_request_errors_total`,
+  `facerec_faces_detected_total`, `facerec_matches_known_total` / `..._unknown_total`,
+  `facerec_cache_hits_total` / `..._misses_total` / `..._evictions_total`, and histograms
+  `facerec_decode_ms`, `facerec_detect_ms`, `facerec_embed_ms`, `facerec_request_ms`,
+  `facerec_match_score`.
+- SIGINT/SIGTERM stops accepting new connections and lets in-flight handlers finish.
+- The listen backlog is set to 1024 (`CPPHTTPLIB_LISTEN_BACKLOG`, see `CMakeLists.txt`);
+  cpp-httplib's default of 5 makes the kernel drop SYNs past 5 simultaneous connects, which
+  shows up as a mysterious ~1 s latency tail that server-side timings do not explain.
+- There is **no authentication** and no TLS: bind to localhost or terminate both in a reverse
+  proxy. `--max-request-mb` and the pixel cap reject oversized/decompressed-bomb bodies.
+- The gallery is rebuilt from `data/` at startup and cached to `paths.gallery_index`
+  (invalidated by a model/gallery fingerprint change).
+
+### mcp — Model Context Protocol tools
+
+```sh
+./main mcp                        # stdio (Claude Desktop / IDE)
+./main mcp --transport http --port 8081 --workers 8    # POST /mcp
+```
+
+Four read-only tools, each with a JSON Schema:
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `identify_faces` | `image_b64`, `top_k`, `min_score`, `include_landmarks` | per-face bbox (original pixels), `matched` or `null`, ranked candidates |
+| `compare_faces` | `image_a_b64`, `image_b_b64` | cosine of the largest face in each |
+| `list_people` | — | enrolled person ids (never embeddings or photos) |
+| `get_face_crop` | `image_b64`, `face_index` | aligned 112×112 PNG as `image` content |
+
+**Enrollment is deliberately not a tool.** Writing biometric templates is a
+non-retractable action and must not be reachable from a prompt-injectable caller; use
+`facerec enroll` or an admin API instead. Calling `enroll_person` returns
+`-32602 unknown tool`.
+
+The `identify_faces` description (which the model actually reads) states that
+`"matched": null` means *unknown*, and that candidates must not be turned into an
+identity — a low score is not a weak guess, it is "not this person".
+
+Claude Desktop / MCP client config:
+
+```json
+{"mcpServers":{"facerec":{"command":"/abs/path/build/main",
+                          "args":["mcp"],
+                          "cwd":"/abs/path/build"}}}
+```
+
+`mcp` links the library directly rather than shelling out, so a tool call costs one
+forward pass instead of a cold `readNet` of both ONNX files.
+
+### demo — the interactive window
+
+```sh
+./main demo <source> [cpu|cuda|openvino] [batch|nobatch]
              [--config <path>] [--set key=value] [--dump-config]
 ```
 
@@ -123,10 +275,10 @@ is processed as its single frame; for non-camera sources the window stays open o
 frame until you press `Esc`, instead of exiting immediately.
 
 ```sh
-./main 0                          # camera 0, CPU backend
-./main 1 cuda                     # CUDA backend (needs OpenCV built with CUDA)
-./main 0 openvino                 # Inference Engine backend
-./main 0 nobatch                  # force per-face forward passes
+./main 0                          # camera 0, CPU backend (legacy form of `demo`)
+./main demo 1 cuda                # CUDA backend (needs OpenCV built with CUDA)
+./main demo 0 openvino            # Inference Engine backend
+./main demo 0 nobatch             # force per-face forward passes
 ./main photo.jpg                  # single image
 ./main clip.mp4                   # video file
 ./main "rtsp://host/stream"       # stream
@@ -286,10 +438,24 @@ model/shape pair into a message rather than an out-of-bounds read.
 detected, aligned and embedded; the per-person feature is the mean of the
 **L2-normalized** embeddings, re-normalized. Photos with no detectable face are skipped.
 
+Add people from the command line — validation happens before anything is written:
+
+```sh
+./main enroll --name BruceLi --dry-run a.jpg b.jpg   # validate, write nothing (default)
+./main enroll --name BruceLi --yes a.jpg b.jpg       # copy into data/BruceLi/
+```
+
+`--yes` copies only the photos that contain a usable face, never clobbers an existing file
+(`_1` suffix) and restricts `--name` to one safe path component (`../evil`, `a/b` are
+rejected). A **running** server keeps its in-memory gallery: restart it to pick up new photos.
+
 More photos per person ⇒ more stable fused feature. Accuracy is dominated by how close
 the recognition environment (distance, lighting, camera) is to the registration photos.
-The gallery is rebuilt from the photos on every startup — there is no cached feature file,
-so changes to the preprocessing convention need no migration step.
+
+The built features are cached in `paths.gallery_index` (default `./gallery.idx`; an empty
+value disables the cache). The index carries a fingerprint of the model files and of every
+registration photo (path, size, mtime) — any change rebuilds it from the photos, so a change
+in the preprocessing convention needs no migration step, and a corrupt index just rebuilds.
 
 ---
 
@@ -365,9 +531,20 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 
 | File | Role |
 |---|---|
-| `main.cpp` | CLI parsing, config application, capture loop |
+| `main.cpp` | subcommand dispatch; `run_demo()` is the original capture loop |
+| `src/engine.hpp` / `.cpp` | library layer: `DNNConfig`, `Detector`, `FeatureExtractor`, `Similarity`, header-only `FeatureDatabase<T>`; alignment (`align_face`, `align_detection`), `extract_face_feature(s)`, `list_person_dirs`. No GUI, no `config.hpp` |
+| `src/api.hpp` / `.cpp` | application layer: `Pipeline` (detector + extractor + gallery), `IdentifyResult`, JSON serialization — shared by CLI, HTTP and (future) MCP so the three shells cannot disagree |
+| `src/cli.hpp` / `.cpp` | `identify` / `enroll` / `serve` / `mcp` subcommands |
+| `src/server.hpp` / `.cpp` | cpp-httplib HTTP service: `/v1/*` endpoints, backpressure, graceful shutdown |
+| `src/mcp.hpp` / `.cpp` | MCP server: JSON-RPC 2.0, stdio + HTTP transports, four read-only tools |
+| `src/pipeline_pool.hpp` / `.cpp` | `PipelinePool` + `Lease` — one pipeline per worker, the unit of concurrency and backpressure for both server and MCP |
+| `src/json_util.hpp` / `.cpp` | tolerant JSON field readers (HTTP bodies and MCP arguments share one implementation) |
+| `src/encoding.hpp` / `.cpp` | base64 encode/decode (HTTP `image_b64`, MCP `image` content) |
+| `src/result_cache.hpp` / `.cpp` | LRU result cache keyed by image sha256 + params + model/gallery fingerprint |
+| `src/sha256.hpp` / `.cpp` | self-contained FIPS 180-4 digest (no OpenSSL dependency) |
+| `third_party/httplib.h` | vendored cpp-httplib v0.15.3 (header-only, pthread only) |
+| `FaceRecognition.h` | forwarding header → `src/engine.hpp` (kept so older includes still build) |
 | `config.hpp` / `config.cpp` | `PipelineConfig` + the `knobs()` table — every tunable described once, driving file parsing, `--set`, validation and `--dump-config` |
-| `FaceRecognition.h` / `.cpp` | `DNNConfig`, `Detector`, `FeatureExtractor`, `Similarity`, header-only `FeatureDatabase<T>`; alignment (`align_face`, `align_detection`), `extract_face_feature(s)`, `list_person_dirs` |
 | `face_tracker.hpp` / `.cpp` | `FaceTracker` — constant-velocity prediction + two-gate association (IoU / normalized centre distance, candidate pairs taken in global score order) + dedup + track lifecycle; emits `{face, id, measured}` |
 | `priorbox.hpp` / `.cpp` | YuNet prior-box generation and raw-output decoding |
 | `detector_head.hpp` / `.cpp` | head strategy: fused (via `PriorBox`) vs per-level YuNet-G, inferred from the model's layer names |
@@ -476,8 +653,8 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
   the detector still runs on the whole padded frame at 160×120, so on an extreme aspect
   (portrait phone frame) the face occupies fewer detector pixels than a crop-aware
   pipeline would give it.
-- Requires a display: the only output is an `imshow` window (no headless/batch mode that
-  writes annotated files).
+- `identify` / `serve` / `mcp` are headless, but there is no batch mode that writes
+  annotated images: the only visual output is the `demo` window, which needs a display.
 - YuNet's landmarks are coarse: fit residuals are 3–5 px and detection boxes jitter by
   ~5 px frame to frame. Identity assignment is robust to this; box edges are not perfectly
   still.
@@ -487,6 +664,13 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
   for tens of people; hundreds would need an index.
 - The shipped sample data contains 2 identities with 1 photo each — useful as a regression
   signal, **not** an accuracy benchmark.
+- The pinned **fused** YuNet export computes its last level unreliably under OpenCV 4.13:
+  6 of its 1076 anchors (stride 64) come out buffer-state dependent — per Net instance, and
+  stable for that instance — which is how `nan` scores and ghost boxes once reached clients.
+  `PriorBox::decode` filters those candidates out (finite score + a box that could be a face
+  in this frame), so they never surface in an API. The per-level export
+  (`face_detection_yunet_2023mar.onnx`) showed 0/44 forwards affected, but has never been run
+  through the augmentation harness, so it is not the default.
 - No tests, CI, or lint config.
 
 ---

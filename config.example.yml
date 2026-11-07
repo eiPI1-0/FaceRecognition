@@ -7,6 +7,8 @@
 # relative paths resolve against paths.root (default: cwd)
 paths.detector_model: models/yunet_120x160.onnx
 paths.embedder_model: models/mobilefacenet.onnx
+# on-disk enrollment index. Built once (detect+embed per photo), then read by every worker instead of recomputing; also feeds the result-cache fingerprint. Empty string disables persistence.
+paths.gallery_index: gallery.idx
 # one subfolder per enrolled person
 paths.data_dir: data/
 
