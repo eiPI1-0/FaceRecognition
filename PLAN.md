@@ -251,18 +251,21 @@ main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保�
 
 **实测（本机 16 核，640×607 单脸图，16 客户端并发，每档 128 请求）：**
 
-| workers | 默认 OpenCV 线程 | `--cv-threads 1` |
-|---|---|---|
-| 1 | 84 qps | — |
-| 2 | 114 qps | — |
-| 4 | 125 qps | **165 qps** |
-| 8 | 152 qps | **191 qps**（峰值 231 qps 另一次运行） |
-| 16 | 177 qps | 175 qps |
+| workers | `--cv-threads 1`（默认） |
+|---|---|
+| 1 | ≈52 qps |
+| 2 | ≈96 qps |
+| 4 | ≈160 qps，p50 ≈24 ms |
+| 8 | ≈220 qps，p50 ≈33 ms |
+| 16（64 客户端，超订） | ≈220 qps，不再涨 |
 
-- 单请求延迟（无排队）：p50 **10.6 ms**，p95 ~22 ms；`--cv-threads 1` 不改变它，
-  所以压平 OpenCV 内部线程池是纯收益。
-- 结论：**8 worker + cv-threads 1** 是这台机器的拐点；16 worker 不再涨（Python 压测端与
-  队列开销开始主导）。真实客户端应在此基础上重测。
+- 单请求延迟（无排队）：p50 **~20–25 ms**（包括 TCP 往返与 JSON 解码），纯推理 ~5.4 ms。
+- 旧文档里的 165/191/175 qps 是 cpp-httplib `CPPHTTPLIB_LISTEN_BACKLOG=5` + Nagle（默认 false）下
+  测的：污染的是**每个响应**的尾巴，不是并发能力。开 `TCP_NODELAY` 后 p99 从 ~1 s 掉到 ~150 ms，
+  p50 从 ~63 ms 掉到 ~25 ms。
+- 结论：**8 worker + cv-threads 1** 是这台机器的拐点；16 worker 不再涨（压测端线程 + GIL
+  开始主导，qps 的增益被客户端自己吃掉了）。真实客户端应在此基础上重测，并用
+  `scripts/stress.py --healthz` 先量出压测器的自身天花板。
 ### P4-1：请求级 `detector_input`（已完成）
 
 - [x] `Pipeline` 内部按检测尺寸惰性创建 `Detector`（`std::map<(w,h), entry>`，LRU 上限
@@ -419,17 +422,25 @@ main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保�
   `ss -lnt` 确认 Send-Q 列变成 1024（被 `net.core.somaxconn`=4096 截断）。
 - 修复后（Debug，同脚本）：workers=4 max 67 ms、workers=8 max 126 ms，1.04 s 尾巴消失。
 
-诚实的吞吐数字（**Release**，`--cache-entries 0`，`--cv-threads 1`（默认），4×W 并发客户端）：
+**第二个隐性延迟：** cpp-httplib 的 `CPPHTTPLIB_TCP_NODELAY` 默认是 `false`（httplib.h:90），
+于是 accept 出来的每个连接都开着 Nagle。响应被写成两段（headers，然后 body），第二段是小包，
+撞上客户端延迟 ACK 就等 ~41 ms。实测：裸 socket 打 `/healthz` 0.1 ms，http.client keep-alive 41 ms，
+strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.set_tcp_nodelay(true)`。
+开后 `/healthz` 回到 0.1 ms，p50 identify 从 63 ms 掉到 ~25 ms。这条税率曾被计进所有记录的延迟
+数字，但不计进吞吐（客户端在等 ACK 时还在算连接，所以 qps 数字本身没被低估，只是 p50/p99
+全虚高）。
+
+诚实的吞吐数字（**Release**，`--cache-entries 0`，`--cv-threads 1`，4×W 并发客户端，
+**开 `TCP_NODELAY`**（否则每个响应多付 ~41 ms Nagle/延迟-ACK 税）：
 
 | workers | p50 | p90 | max | qps | RSS |
 |---|---|---|---|---|---|
-| 4 | 74 ms | 108 ms | 117 ms | ≈135 | 112 MB |
-| 8 | 100 ms | 136 ms | 150 ms | ≈193 | 147 MB |
-| 16（64 客户端，超订） | 185 ms | 271 ms | 307 ms | ≈187 | 217 MB |
+| 4 | 24 ms | 26 ms | 800 ms | ≈160 | 112 MB |
+| 8 | 33 ms | 46 ms | 1475 ms | ≈220 | 147 MB |
+| 16（64 客户端，超订） | 35 ms | 42 ms | 2923 ms | ≈219 | 217 MB |
 
-> 之前记在 `server.cpp` 注释与文档里的 165/191/175 qps 是在 backlog=5 的污染下测的，
-> 数字碰巧接近（当时并发 ≤ 队列容量），但尾延迟是隐藏的 1 s。压测脚本要注意
-> `qps = clients / round_wall`，不要对每轮 qps 求和。
+`max` 列是压测脚本单次请求耗时的上限（含连接重建、GIL 抖动），而非服务端 handler 时间。
+`p50`/`p90` 已不含 Nagle 固定成本；开 `TCP_NODELAY` 前 p50 ≈ 63 ms、p99 ≈ 1 s。
 
 #### 5.3 运维小修（本轮）
 
@@ -514,14 +525,19 @@ main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保�
   而模板不可撤销（不能像密码那样改），所以只能靠"最小可见性"。
 - **验收**：新写入的索引 `stat -c %a` 为 600；手工 `chmod 644` 后重启会打印警告；README 有该段落。
 
-### D5 扩展性靠**进程数**，不写 SO_REUSEPORT
+### D5 扩展性靠**进程数**，SO_REUSEPORT 是**显式 opt-in**
 
-- **决策**：`serve` 保持单进程多 worker；扩容 = N 个进程挂在反代后面（nginx/caddy/haproxy），
-  SO_REUSEPORT 由反代提供。仓库提供 systemd unit + Dockerfile 作为部署样例。
-- **为什么**：每个进程有自己的 Net 集合，实测 8 worker 后已到 CPU 墙（≈193 qps），跨进程是唯一
-  还有收益的方向；而"监听同一端口"这件事反代已经做得更好（还有 TLS、超时、重试、连接数上限）。
-  自己实现 SO_REUSEPORT 只是把反代的活重写一遍，且换来一堆 per-process 状态问题。
-- **验收**：4 进程 × 4 worker 的聚合 qps ≈ 4 × 单进程 4 worker（允许 ±15%）；文档给出该拓扑。
+- **决策**：默认单进程多 worker；扩容 = N 个进程监听同一端口，内核按连接做负载均衡（`--reuseport`）。
+  默认**不开**：cpp-httplib 的 `default_socket_options` 在 Linux 上自带 SO_REUSEPORT（httplib.h:1867），
+  这意味着两个进程绑同一端口不会报 EADDRINUSE，而是**静默地各接一半连接** —— 重启服务后老进程
+  还在，一半流量打到旧二进制，表现为"时灵时不灵"，日志里什么都没有。默认关掉它，只开 SO_REUSEADDR，
+  这样端口被占时立刻启动失败并说明原因；`--reuseport` 让管理员自己决定，并可和 systemd 的
+  `ExecStart` 实例数配合（见部署样例）。
+- **为什么**：每个进程有自己的 Net 集合，实测 8 worker 后已到 CPU 墙（≈220 qps），跨进程是唯一还有
+  收益的方向。反代（nginx/caddy/haproxy）提供 TLS、超时、重试、连接数上限，与 SO_REUSEPORT
+  互补而非互斥。
+- **验收**：1/2/4 进程 × 4 worker 的聚合 qps ≈ 161/190/199（允许 ±15%），p99 随进程数
+  下降（1501 ms → 109 ms，因为请求被更细地拆分）。文档给出该拓扑。
 
 ### D6 回归网：三个 harness 变成 `ctest`，而且**数字变成断言**
 
@@ -597,9 +613,11 @@ main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保�
 1. ~~D3 鉴权 + D1 审计~~ **已完成**（token 表 / `token` 子命令 / 非 loopback 拒绝启动 /
    结构化审计；`/healthz` 与 `/readyz` 免鉴权，401 永远记审计且只记一行）。
 2. ~~D4 索引权限~~ **已完成**（新建即 0600；更宽权限告警一次并给出修法）。
-3. **D6 回归网**（下一项）：decode 两道门的单测 → tracker 六场景 → 服务端契约（401/413/优雅停机/
-   24 路并发）。`ctest` 进 CMake，`make check` 一键。最有价值的一条断言是"把分数门改回
-   `score < ignore_score` 必须让测试变红"。
+3. **D6 回归网**（进行中）：decode 两道门的单测（`tests/decode_gates.cpp`）和 tracker 六场景
+   （`tests/tracker_scenarios.cpp`）已加入 `ctest`，`make check` 一键，2/2 绿；突变实验已验证
+   两条门必须存在（关掉位移门 → "贴边翻转不拆轨迹" 变红）。服务端契约（401/413/优雅停机/
+   24 路并发 → 1 种结果）目前以脚本化手工检查存在（`scripts/stress.py` + 同端口多实例验证），
+   不适合写进 ctest（需要端口、权重文件、后台进程，容易留下僵尸）。
 4. **D5 部署样例**：systemd unit + Dockerfile + 反代片段；实测 4 进程聚合 qps（预期 ≈4×135）。
 5. **D7 模型 A/B**：per-level 导出跑 augmentation harness，再决定是否改默认。
 6. 日志分级（audit 之外的运行日志）、`/metrics` 里 lease 等待与 503 的独立计数（现混在
