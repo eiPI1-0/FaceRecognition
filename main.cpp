@@ -108,6 +108,7 @@ void print_usage(const char* argv0) {
               << "  serve     [--host H] [--port P] [--workers N]   HTTP 服务端\n"
               << "  demo      <source> [cpu|cuda|openvino] ...       实时窗口演示（旧行为）\n"
               << "  mcp       [--transport stdio|http] [--port P]    MCP 工具（给 LLM 调用）\n"
+              << "  token     --name <id> [--tokens-file <path>]     生成 bearer 凭据（只显示一次）\n"
               << "\nLegacy: '" << argv0 << " 0' is treated as '" << argv0 << " demo 0'.\n"
               << "Run '" << argv0 << " <command> --help' for command usage.\n"
               << "Run '" << argv0 << " identify --image <path> --dump-config' to dump effective config.\n";
@@ -387,6 +388,8 @@ int main(int argc, char *argv[])
         return cmd_serve(argc - 1, argv + 1);
     } else if (cmd == "mcp") {
         return cmd_mcp(argc - 1, argv + 1);
+    } else if (cmd == "token") {
+        return cmd_token(argc - 1, argv + 1);
     } else if (cmd == "demo") {
         return run_demo(argc - 1, argv + 1);
     }
@@ -409,14 +412,14 @@ int main(int argc, char *argv[])
          std::filesystem::exists(cmd));
     if (!looks_like_source) {
         std::cerr << "Unknown subcommand: " << cmd << std::endl
-                  << "  subcommands: identify | enroll | serve | mcp | demo" << std::endl
+                  << "  subcommands: identify | enroll | serve | mcp | token | demo" << std::endl
                   << "  (a bare word is not a source: paths need '/', a URL needs '://', "
                   << "a camera index is all digits)" << std::endl;
         return -1;
     }
     if (cmd[0] != '-') {
         std::cerr << "note: treating '" << cmd << "' as a demo source; "
-                  << "the subcommands are identify|enroll|serve|mcp|demo" << std::endl;
+                  << "the subcommands are identify|enroll|serve|mcp|token|demo" << std::endl;
         return run_demo(argc, argv);
     }
 

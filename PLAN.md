@@ -109,6 +109,10 @@ GET  /readyz     → model_hash / gallery_version / n_people / ready
 
 ### 4.3 流式会话（平面 B，tracker 住在这里）
 
+> **已作废（见 D2）**：会话语义不进 `serve`。若需要服务端拉流，做独立进程 `facerec ingest`，
+> 内部调平面 A，并复用 `FaceTracker` 作为库；`serve` 永远保持无状态。以下为原始设计，仅存档。
+
+
 ```
 POST   /v1/sessions        {source: rtsp://... 或 push} → {session_id}
 GET    /v1/sessions/{id}/events   (SSE / WebSocket)
@@ -222,7 +226,7 @@ main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保�
 - [x] `CMakeLists.txt`：把 `FaceRecognition.cpp` 换成 `src/engine.cpp`，加 `src` + 根目录 include 路径。
 - [x] `face_tracker.cpp`：`#include "FaceRecognition.h"` → `#include "engine.hpp"`。
 - [x] `main.cpp` / `run_pipeline` 逻辑不动，`./main 0`/`./main 1` 行为与当前一致（已验证：Loaded 2 person(s)、Cannot open source: 1、退出码非零）。
-- [ ] `gallery.{hpp,cpp}`：只读索引读写，离线 build，不在构造里跑 DNN（P0 先保留 `FeatureDatabase` 在头文件，P1+ 再拆出持久化索引）。
+- [x] `gallery.{hpp,cpp}`：只读索引读写，离线 build，不在构造里跑 DNN（P0 先保留 `FeatureDatabase` 在头文件，P1+ 再拆出持久化索引）。
 
 ### P1：CLI（可被脚本/LLM 调用）— 已完成
 
@@ -446,6 +450,105 @@ main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保�
   建库时就归一：否则 `data/John Doe/` 冷启动叫 `John Doe`、索引重载后叫 `John_Doe`，
   同一个人两个名字。
 
+## 13. 决策记录（ADR，2026-11-07，v1.2.0 之后）
+
+每条决策写清"选了什么 / 为什么 / 否决了什么 / 怎么验收"。改动这些决策要在本文件里改并写原因，
+**不要**在代码注释里悄悄漂移。
+
+### D1 审计日志：查询不留身份，写入必留身份 —— **已实现**
+
+- **决策**：审计是**一行一个 JSON 对象**的请求日志（默认 stderr，`log.audit` 可改路径或 `off`）。
+  查询类（identify/embed/compare/people/crop）记录 `req/caller/op/status/ms/faces/matched/cache/bytes`，
+  **不记录** person_id、匹配到的名字、embedding、图像字节、bbox、内容哈希。
+  写入类（enroll、gallery 重建、模型加载、鉴权拒绝）**必须**记录 person_id 与文件清单。
+- **为什么**：审计的用途是"事后能回答谁在什么时候用了服务、用了多少"，而不是"再建一个可检索的
+  人脸-身份数据库"。把一个请求和一个人的名字持久地连在一起，就是把 gallery 之外的追责面扩大到
+  了每一个被拍到的路人。反过来，enroll 是不可逆写入，它必须可审计——那里 person_id 是必需品。
+- **否决**：① 记录 person_id 到查询日志（等于给每次查询建索引，泄漏面大于收益）；② 记录
+  `sha256(image)`（看着无害，实则是一个可用作 join key 的内容指纹：拿到图的人能反查"这图被查过几次"）；
+  ③ 完全不记录（滥用无法发现，卷量、调用方、人脸数已经是足够的滥用信号）。
+- **验收**：`grep -c person_id` 在对查询日志里为 0；鉴权失败即使 `--quiet` 也必出现。
+
+### D2 平面 B（流式会话）**不进 `serve`**；要流式就是客户端或 sidecar
+
+- **决策**：`serve` 只有平面 A（无状态、可水平扩展、可缓存）。会话语义（tracker、label 缓存、
+  max_lost、MJPEG/SSE 出流）放在**客户端**或一个可选的独立进程 `facerec ingest`（内部调平面 A，
+  复用 `FaceTracker` 作为库）。PLAN 早期 §4.3 的 `POST /v1/sessions` 设计作废。
+- **为什么**：服务端持有每路流的状态，等于把"一个可水平扩展的无状态服务"变成"一个有粘性的媒体
+  服务器"：要管解码、重连、背压、TTL/LRU、每进程会话归属，而 tracker 的收益（平滑、稳定 id、
+  省掉重复 embed）本质上是**时间维度**的问题，谁拥有帧谁就该拥有它。手机/浏览器/NVR 都有帧；
+  没有帧的客户端也不需要 id。
+- **否决**：① 在 `serve` 里实现 sessions（把最重的状态塞进最需要无状态的地方）；② 直接删掉计划
+  （流式是真需求，只是位置错了）。
+- **验收（现在）**：README 明确"单帧 + 批量，流式由客户端或 sidecar 承担"；`demo` 子命令仍是
+  唯一的 tracker 消费者，且它与 API 共享同一套 `Pipeline`/`FaceTracker`。
+
+### D3 鉴权：进程内 bearer 表（哈希存盘）+ "非 loopback 无 token 就拒绝启动" —— **已实现**
+
+- **决策**：`auth.tokens_file`（默认空）指向一个 `name:sha256:<64hex>` 的行式文件（`#` 注释）。
+  请求带 `Authorization: Bearer <token>`，常量时间比对；命中则把 `name` 作为审计里的 `caller`。
+  **`--host` 不是 loopback 且没有 tokens 文件 → 拒绝启动**（`/healthz`、`/readyz` 免鉴权，其余全要）。
+  `./main token --name <id>` 生成随机 token 并打印可直接粘贴的那一行。
+- **为什么**：TLS 与边缘身份交给反向代理（本仓库不引入 OpenSSL 依赖），但"进程自己不知道谁在调"
+  会让审计无从归因、也让误配（`--host 0.0.0.0` 直接裸奔）成为默认路径。把安全做成**绑定约束**
+  而不是一个容易忘的开关，是这里唯一优雅的做法。
+- **否决**：① OAuth/JWT（要引 crypto 依赖，且没有 IdP 时只是自造协议）；② 明文 token 存配置
+  （配置文件会被复制、被 dotfile 同步、被贴进 issue）；③ 只靠反向代理（MCP-over-HTTP 的客户端
+  常常直连，且审计没有 caller 就只剩时间戳）。
+- **验收**：无 token → 401 + `WWW-Authenticate`；错 token → 401；对 token → 200；`--host 0.0.0.0`
+  无 tokens → 启动失败并指出修法；token 文件里 `strings` 不到任何可用凭据。
+
+> 实现时额外发现：cpp-httplib 对 `Content-Type: application/x-www-form-urlencoded` 的请求体有
+> 8KB 内建上限，而 `curl --data-binary @photo.jpg` 默认发的就是这个类型 —— 48KB 的照片直接 413。
+> 更麻烦的是这个上限**是否生效取决于包含 `httplib.h` 的 TU 数量**（同一请求、同一 header：
+> 2 个 TU 放行、3 个 TU 413，实测，可复现）。结论：不要把语义建在库的内部启发式上，
+> CMake 里显式钉住 `CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH`，让 `--max-request-mb`
+> 成为唯一体积闸门。
+
+### D4 `gallery.idx` 是**生物特征库**，按这个身份对待 —— **已实现**
+
+- **决策**：写入时显式 `0600`；载入时若权限比 `0640` 更宽则**警告并给出修法**（不硬失败，避免把
+  已有部署打挂）；README/CHANGELOG 明写"索引 = 明文 512-d 模板 + 人名，备份/加密/销毁按生物特征
+  数据对待"；`paths.gallery_index: ""` 是"只在内存里注册"的选项。
+- **为什么**：一个 0644 的文件里存着每个人的 512-d 模板，等于把整个身份库暴露给同机任何用户；
+  而模板不可撤销（不能像密码那样改），所以只能靠"最小可见性"。
+- **验收**：新写入的索引 `stat -c %a` 为 600；手工 `chmod 644` 后重启会打印警告；README 有该段落。
+
+### D5 扩展性靠**进程数**，不写 SO_REUSEPORT
+
+- **决策**：`serve` 保持单进程多 worker；扩容 = N 个进程挂在反代后面（nginx/caddy/haproxy），
+  SO_REUSEPORT 由反代提供。仓库提供 systemd unit + Dockerfile 作为部署样例。
+- **为什么**：每个进程有自己的 Net 集合，实测 8 worker 后已到 CPU 墙（≈193 qps），跨进程是唯一
+  还有收益的方向；而"监听同一端口"这件事反代已经做得更好（还有 TLS、超时、重试、连接数上限）。
+  自己实现 SO_REUSEPORT 只是把反代的活重写一遍，且换来一堆 per-process 状态问题。
+- **验收**：4 进程 × 4 worker 的聚合 qps ≈ 4 × 单进程 4 worker（允许 ±15%）；文档给出该拓扑。
+
+### D6 回归网：三个 harness 变成 `ctest`，而且**数字变成断言**
+
+- **决策**：`make check`（CTest）固定三件事：① `PriorBox::decode` 的两道门（NaN 分数、
+  退化几何 → 0 候选；正常张量 → 期望候选）；② tracker 的 6 个脚本化场景（AGENTS.md 里的配方）；
+  ③ 服务端契约（鉴权 401/200、413、优雅停机、24 路并发 → 1 种结果）。
+- **为什么**：v1.2.0 的所有保证目前都活在一次性 harness 里；最容易被后人"简化"掉的正是
+  decode 的两道门和 tracker 的两道门。数字进断言，回归就从"读 commit message"变成"测试红了"。
+- **验收**：`ctest` 全绿；把 `priorbox.cpp` 的分数门改回 `score < ignore_score` 必须让 ① 变红
+  （测试必须真的能失败 —— 这是最有价值的一条）。
+
+### D7 模型：把 per-level 导出扶正，fused 降级为 legacy（待 A/B）
+
+- **决策**：per-level（2023mar, 320×320）跑完 augmentation harness 后，若 margin 不低于当前
+  0.874 的同等条件，则改为默认；fused 导出保留但降级。**decode 的两道门不管换不换都留着**。
+- **为什么**：一个"最后一级 6 个 anchor 会写出 NaN"的模型是永久性地雷，靠解码侧兜住是伤疤不是
+  免疫。但换默认值必须有同样的测量（同 seed、同 warp、同身份集合）。
+- **否决**：① 现在就换（没有 A/B 就是猜）；② 保留 fused 并删掉兜底（不可能）。
+- **验收**：harness 报告 within/between/margin 三组数字；换默认后 24 路并发仍只有 1 种结果。
+
+### D8 API 契约只增不减；破坏性变更走 `/v2`
+
+- **决策**：`/v1/*` 响应字段只增不改语义；新增字段永远可选；MCP tool 的 JSON Schema 同样只增。
+  破坏性变更 = 新前缀 + 旧前缀保留一个 release cycle。
+- **为什么**：调用方是脚本和 LLM，两边都会缓存 schema 与字段名；静默改语义在 LLM 侧表现为
+  "模型说了奇怪的话"，比 500 更难查。
+
 ## 9. 不变量与禁区（重写绝不能碰）
 
 这些是 AGENTS.md 已实测确认的正确性，重构时必须原样保留，不能“简化”：
@@ -489,16 +592,18 @@ main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保�
 
 ---
 
-## 12. 下一步行动（剩余项，按价值排序）
+## 12. 下一步行动（按 D1–D8 排序的落地顺序）
 
-1. **鉴权 + 审计日志**：`serve`/`mcp --transport http` 目前只绑 127.0.0.1，没有 bearer；
-   上生产前必须有（审计日志不记图像字节/embedding/人名映射）。
-2. **多进程 + SO_REUSEPORT**：单进程 16 worker 已到 OpenCV CPU 的墙（≈190 qps）；
-   跨进程要靠 SO_REUSEPORT，或直接把 N 个进程挂在反代后面。
-3. **模型侧**：per-level 导出（2023mar, 320×320）没有 fused 导出最后一级的缺陷，
-   但从未跑过 augmentation A/B（within/between/margin）——要换默认模型，先跑那个 harness。
-   不换就把 AGENTS.md 里"最后一级 6 anchor 不可信 + 两道门是承重的"记住。
-4. **队列深度埋点**：`Lease` 等待时长与 503 计数（现在只有 requests/errors）。
-5. 可选项：CLI 的 `compare`/`verify` 子命令（server 与 MCP 已有，CLI 缺，属一致性缺口）。
+1. ~~D3 鉴权 + D1 审计~~ **已完成**（token 表 / `token` 子命令 / 非 loopback 拒绝启动 /
+   结构化审计；`/healthz` 与 `/readyz` 免鉴权，401 永远记审计且只记一行）。
+2. ~~D4 索引权限~~ **已完成**（新建即 0600；更宽权限告警一次并给出修法）。
+3. **D6 回归网**（下一项）：decode 两道门的单测 → tracker 六场景 → 服务端契约（401/413/优雅停机/
+   24 路并发）。`ctest` 进 CMake，`make check` 一键。最有价值的一条断言是"把分数门改回
+   `score < ignore_score` 必须让测试变红"。
+4. **D5 部署样例**：systemd unit + Dockerfile + 反代片段；实测 4 进程聚合 qps（预期 ≈4×135）。
+5. **D7 模型 A/B**：per-level 导出跑 augmentation harness，再决定是否改默认。
+6. 日志分级（audit 之外的运行日志）、`/metrics` 里 lease 等待与 503 的独立计数（现混在
+   `request_errors_total`）。
+7. 可选项：CLI 的 `compare`/`verify` 子命令（与 server/MCP 对齐）。
 
 > 更新本文件时：任何架构决策变更（并发模型、MCP tool 列表、API 端点）必须在此同步，并记录变更原因，防止 compaction 后记忆丢失。

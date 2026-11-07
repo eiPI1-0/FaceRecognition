@@ -1,5 +1,7 @@
 #include "server.hpp"
 
+#include "auth.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -140,6 +142,34 @@ void on_signal(int) {
 }  // namespace
 
 int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
+    // ---- 鉴权与审计 ----
+    // 安全是绑定约束而不是开关：没有 token 表就只允许绑 loopback。这样"忘了配鉴权又对外监听"
+    // 这个最坏组合在启动阶段就不可能成立（PLAN.md D3）。
+    TokenTable auth;
+    if (!cfg.auth_tokens_file.empty()) {
+        std::string err;
+        if (!auth.load(cfg.auth_tokens_file, err)) {
+            std::cerr << "Fatal: " << err << std::endl;
+            return -1;
+        }
+    }
+    if (auth.empty() && !is_loopback_host(opt.host)) {
+        std::cerr << "Refusing to listen on " << opt.host << " without authentication.\n"
+                  << "  Either bind loopback (--host 127.0.0.1) and put a reverse proxy in "
+                     "front, or set auth.tokens_file.\n"
+                  << "  Create a token table:  ./main token --name admin --tokens-file "
+                     "./tokens.txt" << std::endl;
+        return -1;
+    }
+    AuditSink audit;
+    {
+        std::string err;
+        if (!audit.configure(cfg.log_audit, err)) {
+            std::cerr << "Fatal: log.audit: " << err << std::endl;
+            return -1;
+        }
+    }
+
     // 并发度 = 核数（默认）。CPU 上超过核数只会增加排队与上下文切换；
     // OpenCV 内部线程池在 P4 会单独压成 1，这里先只控制 worker 数。
     int workers = opt.workers > 0 ? opt.workers
@@ -176,11 +206,9 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     svr.set_write_timeout(30, 0);
     svr.set_keep_alive_max_count(100);
 
-    if (!opt.quiet) {
-        svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
-            std::cerr << req.method << " " << req.path << " -> " << res.status << std::endl;
-        });
-    }
+    // 鉴权 + 结构化审计（PLAN.md D1/D3）：探针免鉴权，其余全要 bearer；
+    // 401 永远记审计，成功行受 --quiet 影响。
+    install_access_control(svr, auth, opt.quiet, audit, /*is_mcp=*/false);
 
     // ---- 指标 ----
     svr.Get("/metrics", [&metrics, &cache](const httplib::Request&, httplib::Response& res) {
@@ -370,6 +398,17 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
 
     std::cout << "Listening on http://" << opt.host << ":" << opt.port
               << "  (workers=" << workers << ")" << std::endl;
+    {
+        std::ostringstream os;
+        os << "\"host\":\"" << json_escape(opt.host) << "\",\"port\":"
+           << opt.port << ",\"workers\":" << workers << ",\"persons\":" << pool.gallery_size()
+           << ",\"gallery_fingerprint\":\"" << json_escape(pool.fingerprint())
+           << "\",\"detector\":\"" << json_escape(cfg.detector_model)
+           << "\",\"embedder\":\"" << json_escape(cfg.embedder_model)
+           << "\",\"auth\":\"" << (auth.empty() ? "off" : std::to_string(auth.size()) + " token(s)")
+           << "\"";
+        audit_event(audit, "startup", os.str());
+    }
 
     if (!svr.listen(opt.host, opt.port)) {
         std::cerr << "Failed to listen on " << opt.host << ":" << opt.port << std::endl;

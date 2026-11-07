@@ -210,6 +210,35 @@ Serving throughput (this machine, 16 cores, **Release**, `--cache-entries 0`, on
 Beyond ~8 workers the CPU is saturated; scale out with several processes behind a
 reverse proxy rather than by adding workers.
 
+**Authentication and audit.** The server binds `127.0.0.1` by default and does **not** ship a
+TLS terminator: put a reverse proxy in front for both. Inside the process there is one rule
+that cannot be forgotten, because it is a bind constraint rather than a flag — **a
+non-loopback `--host` without a token table refuses to start**:
+
+```sh
+./main token --name ci --tokens-file ./tokens.txt    # prints the token once; stores only its sha256
+./main serve --host 0.0.0.0 --port 8080 --set auth.tokens_file=./tokens.txt
+curl -H "Authorization: Bearer <token>" -X POST --data-binary @photo.jpg \
+     -H 'Content-Type: image/jpeg' localhost:8080/v1/identify
+```
+
+`tokens.txt` is line-based (`name:sha256:<64 hex>`, `#` comments), compared in constant time, and
+written `0600` — the file holds no usable credential, so a leaked copy is not a leaked key.
+`/healthz` and `/readyz` stay open (probes); everything else, `/metrics` included, needs the
+token. Every request is one JSON line on `log.audit` (`stderr` by default, or a file path, or
+`off`), and `--quiet` silences only successes — a refused request is always logged, because a
+silent brute-force attempt is exactly what you cannot afford:
+
+```json
+{"audit":"request","ts":"2026-11-07T03:39:09.024Z","svc":"http","method":"POST","path":"/v1/identify",
+ "status":401,"ms":0,"caller":"","bytes":0,"auth":"denied","peer":"127.0.0.1","presented":false}
+```
+
+Query lines deliberately carry **no person id, no matched name, no embedding, no image bytes**:
+an audit log that maps requests to identities is a second biometric database with none of the
+protections. Enrollment *is* attributable (`./main enroll` logs the person and the files it
+wrote), because writing a template is the irreversible act.
+
 **Operational notes**
 
 - `GET /metrics` — Prometheus text: `facerec_requests_total`, `facerec_request_errors_total`,
@@ -223,6 +252,14 @@ reverse proxy rather than by adding workers.
   shows up as a mysterious ~1 s latency tail that server-side timings do not explain.
 - There is **no authentication** and no TLS: bind to localhost or terminate both in a reverse
   proxy. `--max-request-mb` and the pixel cap reject oversized/decompressed-bomb bodies.
+- `paths.gallery_index` holds **plaintext 512-d templates plus names**, so it is created `0600`
+  and a wider mode triggers a one-line warning with the fix (`chmod 600`). Treat backups and
+  copies of it as biometric data; `paths.gallery_index: ""` keeps templates in memory only.
+- `curl --data-binary @photo.jpg` sends `Content-Type: application/x-www-form-urlencoded`, and
+  cpp-httplib caps form bodies at 8 KB (413) unless told otherwise — the build pins
+  `CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH`, so the payload limit is the only size gate
+  and the endpoint's meaning does not depend on the client's `Content-Type`. Send
+  `image/jpeg`/`octet-stream` anyway: it is what the API documents.
 - The gallery is rebuilt from `data/` at startup and cached to `paths.gallery_index`
   (invalidated by a model/gallery fingerprint change).
 

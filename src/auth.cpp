@@ -1,0 +1,264 @@
+#include "auth.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <ctime>
+#include <random>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+#include "api.hpp"      // json_escape（api 层已经是所有外壳的共同依赖）
+#include "sha256.hpp"
+
+namespace facerec {
+
+thread_local std::string tl_caller;
+thread_local std::chrono::steady_clock::time_point tl_request_start;
+
+const std::string& current_caller() { return tl_caller; }
+
+namespace {
+
+std::string trim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return {};
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+bool is_hex64(const std::string& s) {
+    if (s.size() != 64) return false;
+    for (char c : s) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// 常量时间比较：不因为第一个不同字节就提前返回，避免用比对耗时逐字节猜 token。
+// volatile 防止编译器把它优化成 memcmp。
+bool ct_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    volatile unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff = static_cast<unsigned char>(diff | (static_cast<unsigned char>(a[i] ^ b[i])));
+    }
+    return diff == 0;
+}
+
+std::string iso8601_now() {
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const auto secs = time_point_cast<seconds>(now);
+    const auto ms = duration_cast<milliseconds>(now - secs).count();
+    const std::time_t t = system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tm.tm_year + 1900,
+                  tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+                  static_cast<int>(ms));
+    return buf;
+}
+
+// `Authorization: Bearer <token>`，大小写不敏感地匹配 scheme。
+std::string bearer(const httplib::Request& req) {
+    const std::string auth = req.get_header_value("Authorization");
+    if (auth.size() < 7) return {};
+    std::string scheme = auth.substr(0, 7);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                   [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+    if (scheme != "bearer ") return {};
+    return trim(auth.substr(7));
+}
+
+bool is_probe_path(const std::string& path) { return path == "/healthz" || path == "/readyz"; }
+
+}  // namespace
+
+bool is_loopback_host(const std::string& host) {
+    return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
+}
+
+bool TokenTable::load(const std::string& path, std::string& err) {
+    entries_.clear();
+    std::ifstream in(path);
+    if (!in) {
+        err = "cannot read token file: " + path;
+        return false;
+    }
+    std::string line;
+    int line_no = 0;
+    while (std::getline(in, line)) {
+        ++line_no;
+        const std::string t = trim(line);
+        if (t.empty() || t[0] == '#') continue;
+        const size_t a = t.find(':');
+        const size_t b = (a == std::string::npos) ? std::string::npos : t.find(':', a + 1);
+        const std::string where = path + ":" + std::to_string(line_no);
+        if (a == std::string::npos || b == std::string::npos) {
+            err = where + ": expected `name:sha256:<64 hex>`, got `" + t.substr(0, 60) + "`";
+            return false;
+        }
+        Entry e;
+        e.name = trim(t.substr(0, a));
+        const std::string algo = trim(t.substr(a + 1, b - a - 1));
+        e.digest_hex = trim(t.substr(b + 1));
+        if (e.name.empty() || e.name.find_first_of(" \t") != std::string::npos) {
+            err = where + ": token name must be non-empty and contain no whitespace";
+            return false;
+        }
+        if (algo != "sha256") {
+            err = where + ": unsupported algorithm `" + algo + "` (only sha256 is accepted)";
+            return false;
+        }
+        if (!is_hex64(e.digest_hex)) {
+            err = where + ": digest must be 64 lowercase hex characters";
+            return false;
+        }
+        for (const Entry& prev : entries_) {
+            if (prev.name == e.name) {
+                err = where + ": duplicate token name `" + e.name + "`";
+                return false;
+            }
+        }
+        entries_.push_back(std::move(e));
+    }
+    if (entries_.empty()) {
+        err = "token file is empty: " + path;
+        return false;
+    }
+    return true;
+}
+
+bool TokenTable::authenticate(const std::string& token, std::string& caller) const {
+    if (token.empty()) return false;
+    const std::string digest = sha256_hex(token);
+    // 扫完全表：命中位置不是秘密，但没有理由让它变成一条可观察的分支。
+    const Entry* hit = nullptr;
+    for (const Entry& e : entries_) {
+        if (ct_equal(digest, e.digest_hex)) hit = &e;
+    }
+    if (!hit) return false;
+    caller = hit->name;
+    return true;
+}
+
+bool AuditSink::configure(const std::string& spec, std::string& err) {
+    if (spec == "off") {
+        kind = Off;
+        path.clear();
+        return true;
+    }
+    if (spec.empty() || spec == "stderr") {
+        kind = Stderr;
+        path.clear();
+        return true;
+    }
+    // 打开一次确认可写：启动期失败好过运行时每行都静默丢掉。
+    {
+        std::ofstream probe(spec, std::ios::app);
+        if (!probe) {
+            err = "cannot open audit log for append: " + spec;
+            return false;
+        }
+    }
+    kind = File;
+    path = spec;
+    return true;
+}
+
+void AuditSink::emit(const std::string& json_object) const {
+    if (kind == Off) return;
+    if (kind == Stderr) {
+        std::cerr << json_object << '\n';
+        return;
+    }
+    // 每次 open/append/close：O_APPEND 下的单次写是原子的，多线程无需再加锁。
+    std::ofstream out(path, std::ios::app);
+    if (out) out << json_object << '\n';
+}
+
+void audit_event(const AuditSink& sink, const char* kind, const std::string& fields) {
+    std::ostringstream os;
+    os << "{\"audit\":\"" << kind << "\",\"ts\":\"" << iso8601_now() << "\"";
+    if (!fields.empty()) os << ',' << fields;
+    os << '}';
+    sink.emit(os.str());
+}
+
+void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool quiet,
+                            const AuditSink& audit, bool is_mcp) {
+    const char* svc = is_mcp ? "mcp" : "http";
+
+    svr.set_pre_routing_handler([&tokens, &audit, svc](const httplib::Request& req,
+                                                        httplib::Response& res) {
+        tl_caller.clear();
+        tl_request_start = std::chrono::steady_clock::now();
+        if (tokens.empty() || is_probe_path(req.path)) {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+        std::string caller;
+        if (!tokens.authenticate(bearer(req), caller)) {
+            // 安全事件不受 quiet 影响：拒绝行在下面的 logger 里必出（status >= 400）。
+            res.status = 401;
+            res.set_header("WWW-Authenticate", "Bearer realm=\"facerec\"");
+            res.set_content("{\"status\":\"error\",\"error\":\"unauthorized\"}",
+                            "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        tl_caller = caller;
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    svr.set_logger([quiet, &audit, svc](const httplib::Request& req,
+                                        const httplib::Response& res) {
+        // 探针成功不记（k8s 每 10s 打一次会把日志淹没），探针失败要记。
+        if (is_probe_path(req.path) && res.status < 400) return;
+        if (quiet && res.status < 400) return;
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                     tl_request_start)
+                .count();
+        std::ostringstream os;
+        os << "{\"audit\":\"request\",\"ts\":\"" << iso8601_now() << "\",\"svc\":\"" << svc
+           << "\",\"method\":\"" << json_escape(req.method) << "\",\"path\":\""
+           << json_escape(req.path) << "\",\"status\":" << res.status << ",\"ms\":"
+           << static_cast<long long>(ms) << ",\"caller\":\"" << json_escape(current_caller())
+           << "\",\"bytes\":" << req.body.size();
+        if (res.status == 401) {
+            // 拒绝永远是安全事件：即使 --quiet 也记，且带上对端与"是否出示了 token"。
+            os << ",\"auth\":\"denied\",\"peer\":\""
+               << json_escape(req.remote_addr.empty() ? std::string("?") : req.remote_addr)
+               << "\",\"presented\":"
+               << (req.get_header_value("Authorization").empty() ? "false" : "true");
+        }
+        os << '}';
+        audit.emit(os.str());
+    });
+}
+
+// 生成一个新 token：32 字节 CSPRNG → 64 hex（十六进制没有 URL/头部转义问题，
+// 长度固定也就没有"看起来像"的分支）。
+std::string generate_token() {
+    std::random_device rd;
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (int i = 0; i < 32; ++i) {
+        const unsigned int b = rd() & 0xffu;
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0x0f]);
+    }
+    return out;
+}
+
+std::string token_file_line(const std::string& name, const std::string& token) {
+    return name + ":sha256:" + sha256_hex(token);
+}
+
+}  // namespace facerec

@@ -104,6 +104,19 @@ const std::vector<Knob>& knobs() {
                   "by every worker instead of recomputing; also feeds the result-cache "
                   "fingerprint. Empty string disables persistence.",
          true},
+        {"auth.tokens_file", &PipelineConfig::auth_tokens_file,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "auth",
+         "bearer token table (line format `name:sha256:<64 hex>`). Empty = no auth, which is "
+         "only allowed while the server binds a loopback address; a non-loopback `--host` "
+         "without this file refuses to start",
+         true},
+        {"log.audit", &PipelineConfig::log_audit,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "logging",
+         "structured audit/access log: stderr | off | a file path (relative to cwd). One JSON "
+         "object per line; query lines carry no person id, name, embedding or image bytes"},
+
         {"paths.data_dir", &PipelineConfig::data_dir,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
          "paths", "one subfolder per enrolled person"},
@@ -328,7 +341,8 @@ void resolve_asset_paths(PipelineConfig& cfg, const std::string& default_root) {
 
     // 成员指针常量不能靠 auto 推导，显式写类型
     const StrMember paths[] = {&PipelineConfig::detector_model, &PipelineConfig::embedder_model,
-                               &PipelineConfig::data_dir, &PipelineConfig::gallery_index};
+                               &PipelineConfig::data_dir, &PipelineConfig::gallery_index,
+                               &PipelineConfig::auth_tokens_file};
     for (StrMember member : paths) {
         std::string& value = cfg.*member;
         if (value.empty()) continue;   // 空串是"关闭"的显式取值，不能解析成 root

@@ -22,6 +22,11 @@ struct PipelineConfig {
     // 之所以要它：注册要跑 detect+embed，每个 worker 各算一遍会拖慢启动；有了索引，
     // 所有 worker 读同一个文件，并把它作为结果缓存指纹的一部分。
     std::string gallery_index  = "./gallery.idx";
+    // 进程内 bearer 鉴权（PLAN.md D3）：空 = 关闭，此时只允许绑 loopback。
+    // 文件只存 sha256，磁盘上没有可用凭据；`./main token --name x` 生成一行。
+    std::string auth_tokens_file = "";
+    // 审计/访问日志：stderr（默认）| off | 文件路径。查询行不含 person_id（PLAN.md D1）。
+    std::string log_audit = "stderr";
 
     // 模型契约：改错不会崩，只会输出垃圾。只应在换模型文件时一同修改。
     int detector_input_w = 160, detector_input_h = 120;   // YuNet + PriorBox::decode 的先验框布局

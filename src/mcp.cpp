@@ -1,5 +1,7 @@
 #include "mcp.hpp"
 
+#include "auth.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -435,15 +437,18 @@ void on_signal(int) {
     if (g_server) g_server->stop();
 }
 
-int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache) {
+struct Access {
+    TokenTable tokens;
+    AuditSink audit;
+};
+
+int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
+               const Access& access) {
     httplib::Server svr;
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
 
-    if (!opt.quiet) {
-        svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
-            std::cerr << req.method << " " << req.path << " -> " << res.status << std::endl;
-        });
-    }
+    // 与 serve 同一套：/healthz 免鉴权，其余要 bearer；审计行不含 person_id（PLAN.md D1/D3）。
+    install_access_control(svr, access.tokens, opt.quiet, access.audit, /*is_mcp=*/true);
 
     svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json; charset=utf-8");
@@ -495,11 +500,47 @@ int run_mcp(const PipelineConfig& cfg, const McpOptions& opt) {
     }
     if (workers < 1) workers = 1;
 
+    // 鉴权与审计：规则与 serve 完全一致（同一个 install_access_control）。
+    Access access;
+    if (!cfg.auth_tokens_file.empty()) {
+        std::string err;
+        if (!access.tokens.load(cfg.auth_tokens_file, err)) {
+            std::cerr << "Fatal: " << err << std::endl;
+            return -1;
+        }
+    }
+    if (opt.transport == McpTransport::Http && access.tokens.empty() &&
+        !is_loopback_host(opt.host)) {
+        std::cerr << "Refusing to listen on " << opt.host << " without authentication.\n"
+                  << "  Either bind loopback (--host 127.0.0.1), or set auth.tokens_file.\n"
+                  << "  Create a token table:  ./main token --name admin --tokens-file "
+                     "./tokens.txt" << std::endl;
+        return -1;
+    }
+    {
+        std::string err;
+        if (!access.audit.configure(cfg.log_audit, err)) {
+            std::cerr << "Fatal: log.audit: " << err << std::endl;
+            return -1;
+        }
+    }
+
     // 与 serve 同一结论：并发靠多实例，不靠 Net 内部线程池。
     cv::setNumThreads(1);
     PipelinePool pool(cfg, workers);
     ResultCache cache(pool.fingerprint(), static_cast<size_t>(opt.cache_entries));
-    return opt.transport == McpTransport::Http ? serve_http(pool, opt, cache)
+    {
+        std::ostringstream os;
+        os << "\"op\":\"startup\",\"transport\":\""
+           << (opt.transport == McpTransport::Http ? "http" : "stdio") << "\",\"persons\":"
+           << pool.gallery_size() << ",\"gallery_fingerprint\":\""
+           << json_escape(pool.fingerprint()) << "\",\"auth\":\""
+           << (access.tokens.empty() ? "off"
+                                     : std::to_string(access.tokens.size()) + " token(s)")
+           << "\"";
+        audit_event(access.audit, "startup", os.str());
+    }
+    return opt.transport == McpTransport::Http ? serve_http(pool, opt, cache, access)
                                                : serve_stdio(pool, opt, cache);
 }
 

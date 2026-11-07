@@ -9,5 +9,7 @@ int cmd_identify(int argc, char* argv[]);
 int cmd_enroll(int argc, char* argv[]);
 int cmd_serve(int argc, char* argv[]);
 int cmd_mcp(int argc, char* argv[]);
+// 生成 bearer token 并（可选）追加到 token 表：`./main token --name ci`。
+int cmd_token(int argc, char* argv[]);
 
 #endif // FACERECOGNITION_CLI_HPP

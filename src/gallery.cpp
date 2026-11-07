@@ -2,10 +2,17 @@
 
 #include <sys/stat.h>
 
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <filesystem>
+#include <iostream>
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -91,6 +98,26 @@ bool b64_to_floats(const std::string& b64, size_t expected, std::vector<float>& 
 
 // 归一规则只有一处：建库时用它，写索引时再用一次（幂等），目录名比较也用它。
 // 声明在 gallery.hpp —— MCP/CLI 需要把目录名与 entry.person_id 对齐。
+// 索引里是**明文生物特征模板**（512-d + 人名），所以它必须只有属主可读：
+// 建文件时就带 0600（umask 拦不住 open 的 mode），比写完再 chmod 少一个暴露窗口。
+bool create_private_file(const std::string& path, std::string* err) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        if (err) *err = "cannot create gallery index: " + path;
+        return false;
+    }
+    ::close(fd);
+    return true;
+}
+
+// 权限比 0640 更宽 = 同机其他用户能读到所有人的模板。不硬失败（会把已有部署打挂），
+// 但必须说出来，并给出修法。
+bool is_world_or_group_readable(const std::string& path) {
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) return false;
+    return (st.st_mode & (S_IRGRP | S_IROTH)) != 0;
+}
+
 std::string normalize_entry_id(const std::string& s) {
     // person_id 里不许出现空白/换行：索引是行式格式，那是格式注入。
     std::string out = s;
@@ -244,6 +271,7 @@ Gallery Gallery::load_or_build(const PipelineConfig& cfg, Detector& detector,
 // ---------------------------------------------------------------------------
 
 bool Gallery::save(const std::string& path, std::string* err) const {
+    if (!create_private_file(path, err)) return false;
     std::ofstream out(path, std::ios::trunc);
     if (!out) {
         if (err) *err = "cannot write gallery index: " + path;
@@ -268,6 +296,13 @@ bool Gallery::save(const std::string& path, std::string* err) const {
 
 Gallery Gallery::load(const std::string& path, std::string* err) {
     Gallery g;
+    static std::atomic<bool> perms_warned{false};
+    if (is_world_or_group_readable(path) && !perms_warned.exchange(true)) {
+        // 只警告不回退：这是配置/部署问题，修法是 chmod 600，而不是拒绝服务。
+        std::cerr << "warning: " << path
+                  << " holds biometric templates but is readable beyond its owner; run `chmod 600 "
+                  << path << "`" << std::endl;
+    }
     std::ifstream in(path);
     if (!in) {
         if (err) *err = "gallery index not found: " + path;

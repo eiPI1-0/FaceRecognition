@@ -22,6 +22,7 @@ add_executable(main
     detector_head.cpp
     utils.cpp
     src/engine.cpp
+    src/auth.cpp
     src/api.cpp
     src/cli.cpp
     src/server.cpp
@@ -42,8 +43,27 @@ target_include_directories(main PRIVATE src ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_D
 # 客户端在 1 秒后重传 —— 压测里表现为"少数请求 connect 耗时 1014ms、总耗时 ~1.04s"，
 # 而服务端只花了 16ms。1024 被 net.core.somaxconn 截断（本机 4096），够用且不撒谎。
 target_compile_definitions(main PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=1024)
+# httplib 对 `Content-Type: application/x-www-form-urlencoded` 的请求体内建 8KB 上限
+# （httplib.h:6160，超了直接 413），而 `curl --data-binary @photo.jpg` 默认发的就是这个
+# Content-Type —— 一张 48KB 的照片就会莫名其妙 413。更糟的是这个上限在不同 TU 布局下行为
+# 不一致：同一个请求、同一个 httplib.h，2 个 TU 包含它时放行，加入第三个包含它的 TU 后 413
+# （实测，见 PLAN.md）。我们的 API 吃原始字节，语义不该随客户端填的 Content-Type 变化，
+# 所以把上限显式钉到"远高于 payload 上限"，让 payload 上限成为唯一的体积闸门。
+target_compile_definitions(main PRIVATE CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=268435456)
 # cpp-httplib 是单头 header-only 库（third_party/httplib.h，v0.15.3，sha256
 # a3347656c71c81c3fe510fdb1ff229d7db52eb7df04d3342d340eba0b6ad50ea）。
 # 需要 pthread；不引入 OpenSSL，HTTPS 由反向代理终结。
 find_package(Threads REQUIRED)
 target_link_libraries(main ${OpenCV_LIBS} Threads::Threads)
+
+# ---- 回归测试（PLAN.md D6）----
+# 只放"纯函数"层的东西：不需要模型、不需要摄像头、不需要网络，`ctest` 在任何机器上都能跑。
+# 服务端契约（鉴权/413/优雅停机）需要权重文件，等有了再单独加，并用 SKIP_RETURN_CODE 跳过缺模型。
+option(FACEREC_BUILD_TESTS "Build the regression tests (ctest)" ON)
+if(FACEREC_BUILD_TESTS)
+    enable_testing()
+    add_executable(decode_gates tests/decode_gates.cpp priorbox.cpp)
+    target_include_directories(decode_gates PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(decode_gates ${OpenCV_LIBS})
+    add_test(NAME decode_gates COMMAND decode_gates)
+endif()

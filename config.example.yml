@@ -9,6 +9,16 @@ paths.detector_model: models/yunet_120x160.onnx
 paths.embedder_model: models/mobilefacenet.onnx
 # on-disk enrollment index. Built once (detect+embed per photo), then read by every worker instead of recomputing; also feeds the result-cache fingerprint. Empty string disables persistence.
 paths.gallery_index: gallery.idx
+
+# --- auth ---
+# bearer token table (line format `name:sha256:<64 hex>`). Empty = no auth, which is only allowed while the server binds a loopback address; a non-loopback `--host` without this file refuses to start
+auth.tokens_file: 
+
+# --- logging ---
+# structured audit/access log: stderr | off | a file path (relative to cwd). One JSON object per line; query lines carry no person id, name, embedding or image bytes
+log.audit: stderr
+
+# --- paths ---
 # one subfolder per enrolled person
 paths.data_dir: data/
 

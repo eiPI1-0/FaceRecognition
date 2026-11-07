@@ -134,6 +134,22 @@ than a strict versioning scheme.
   `"skipped"`, and a run that writes nothing fails instead of reporting success. `--dry-run` now
   prints `would_write_to`, and both modes emit valid JSON (a misplaced bracket made the dry-run
   output unparseable — caught by feeding it through `json.load`).
+- **Bearer authentication with an impossible-to-forget failure mode.** `./main token --name <id>`
+  writes a random 64-hex token's `name:sha256:<hex>` line into a `0600` file (the file stores no
+  usable credential) and prints the token once; `auth.tokens_file` makes `serve` and
+  `mcp --transport http` require `Authorization: Bearer …` on everything except `/healthz` and
+  `/readyz`, compared in constant time. A **non-loopback `--host` without a token table refuses to
+  start** (with the fix in the message): the dangerous combination is unrepresentable rather than
+  merely undocumented, and it is checked before a single pipeline is built.
+- **Structured audit log** (`log.audit`: `stderr` by default, a file path, or `off`): one JSON
+  object per request with `svc/method/path/status/ms/caller/bytes`, `auth:"denied"` plus
+  `peer`/`presented` on 401, and a `startup` line carrying models, gallery fingerprint and auth
+  mode. Query lines carry **no person id, matched name, embedding or image bytes** (PLAN.md D1):
+  an audit trail that links requests to identities is a second biometric database. `--quiet`
+  silences successes only — a refusal is a security event and is always logged. `enroll` logs the
+  person it wrote, because a template write is the irreversible act.
+- **The gallery index is created `0600`** and a wider mode now warns once with the exact fix:
+  `build/gallery.idx` is plaintext 512-d templates plus names.
 - **MCP `list_people` reported directories, not enrolled people**: an empty `data/test/` was
   announced as `"3 person(s) enrolled: … test"` while the JSON beside it listed 2 — and a person
   with no usable photos can never match, so a caller would have inferred an identity that does not
@@ -143,6 +159,15 @@ than a strict versioning scheme.
   was `John Doe` after a cold start and `John_Doe` after the index was reloaded (the line-based
   index normalized on write only). The id and provenance are normalized at build time now, through
   the one shared rule (`normalize_entry_id`, declared in `gallery.hpp`).
+- **Raw image uploads were rejected with 413 for anything over 8 KB** whenever the client sent
+  `Content-Type: application/x-www-form-urlencoded` — which is exactly what
+  `curl --data-binary @photo.jpg` sends by default, so the most natural invocation of the raw
+  endpoint failed with a body-less 413 while the JSON form worked. Cause: cpp-httplib caps
+  form-encoded bodies at 8 KB, and whether that cap fires at all depends on the number of
+  translation units that include `httplib.h` (same request, same header: 200 with two, 413 with
+  three — measured with the same binary inputs). Rather than inherit a library quirk, the build
+  pins `CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH` far above the payload limit, so
+  `--max-request-mb` is the only size gate and `Content-Type` cannot change what the API means.
 - A bare first argument that is not a path, URL, camera index or existing file (`./main compaer`)
   is reported as an unknown subcommand instead of being opened as a video source.
 - `CMakeLists.txt` sets a default `CMAKE_BUILD_TYPE=Release` when none is given: an unconfigured
