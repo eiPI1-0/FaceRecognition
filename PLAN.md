@@ -549,14 +549,20 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
 - **验收**：`ctest` 全绿；把 `priorbox.cpp` 的分数门改回 `score < ignore_score` 必须让 ① 变红
   （测试必须真的能失败 —— 这是最有价值的一条）。
 
-### D7 模型：把 per-level 导出扶正，fused 降级为 legacy（待 A/B）
+### D7 模型：fused yunet_120x160 保留为默认，per-level 2023mar 不扶正（A/B 已跑）
 
-- **决策**：per-level（2023mar, 320×320）跑完 augmentation harness 后，若 margin 不低于当前
-  0.874 的同等条件，则改为默认；fused 导出保留但降级。**decode 的两道门不管换不换都留着**。
-- **为什么**：一个"最后一级 6 个 anchor 会写出 NaN"的模型是永久性地雷，靠解码侧兜住是伤疤不是
-  免疫。但换默认值必须有同样的测量（同 seed、同 warp、同身份集合）。
-- **否决**：① 现在就换（没有 A/B 就是猜）；② 保留 fused 并删掉兜底（不可能）。
-- **验收**：harness 报告 within/between/margin 三组数字；换默认后 24 路并发仍只有 1 种结果。
+- **决策**：**保留 fused yunet_120x160 作为默认检测器**，不切换到 per-level 2023mar。Augmentation A/B
+  已用同一套 warp 种子（seed 12345，12 warps + 原图）跑过两款检测器：fused within +0.753 /
+  between +0.009 / margin +0.744；per-level within +0.714 / between +0.022 / margin +0.693。Fused 更优。
+- **为什么**：AGENTS.md 已记：at equal detector-space face size，fused 120×160 胜过 per-level 320×320
+ （0.51 vs nothing at 38 px）；per-level 只在"等场景尺寸"下领先（4:3 场景买来 ~2.7× 人脸像素），那是
+  检测召回的问题，不是识别边距。一张脸一旦被检测到，fused 的对齐+嵌入给出更好的 within/between
+  分离。同时，fused 的最后一级 NaN anchor 已被 `priorbox.cpp` 的两道 decode 门兜住（24 路并发
+  只有一种结果，真实检测一字未变），不再是生产风险。
+- **否决**：① 改默认到 per-level（A/B 显示更差，没有换的理由）；② 删掉 decode 门（没有它们 fused
+  不可用，有了它们 fused 更优）。
+- **验收**：`tests/augmentation_ab.cpp` 报告 fused margin > per-level margin；24 路并发 identify 同一张图
+  只有一种结果（已在 P5 回归中覆盖）。
 
 ### D8 API 契约只增不减；破坏性变更走 `/v2`
 
@@ -619,7 +625,8 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
    24 路并发 → 1 种结果）目前以脚本化手工检查存在（`scripts/stress.py` + 同端口多实例验证），
    不适合写进 ctest（需要端口、权重文件、后台进程，容易留下僵尸）。
 4. **D5 部署样例**：systemd unit + Dockerfile + 反代片段；实测 4 进程聚合 qps（预期 ≈4×135）。
-5. **D7 模型 A/B**：per-level 导出跑 augmentation harness，再决定是否改默认。
+5. ~~**D7 模型 A/B**：per-level 导出跑 augmentation harness，再决定是否改默认。~~ **已完成**：
+   fused yunet_120x160 保留为默认（margin +0.744 vs per-level +0.693，详见 §D7 决策记录）。
 6. 日志分级（audit 之外的运行日志）、`/metrics` 里 lease 等待与 503 的独立计数（现混在
    `request_errors_total`）。
 7. 可选项：CLI 的 `compare`/`verify` 子命令（与 server/MCP 对齐）。

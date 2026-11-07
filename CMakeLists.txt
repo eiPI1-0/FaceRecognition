@@ -72,4 +72,11 @@ if(FACEREC_BUILD_TESTS)
     target_include_directories(tracker_scenarios PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(tracker_scenarios ${OpenCV_LIBS})
     add_test(NAME tracker_scenarios COMMAND tracker_scenarios)
+
+    # augmentation A/B：同一套 warp 种子下，对比不同检测器的 within/between margin。
+    add_executable(augmentation_ab tests/augmentation_ab.cpp src/engine.cpp
+        priorbox.cpp detector_head.cpp utils.cpp face_tracker.cpp)
+    target_include_directories(augmentation_ab PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(augmentation_ab ${OpenCV_LIBS})
+    # 不加入 ctest：需要 models/ 和 data/ 资产，且运行时间取决于身份数。
 endif()
