@@ -4,7 +4,7 @@ Notable changes to this repository. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses release tags rather
 than a strict versioning scheme.
 
-## Unreleased — production shells (CLI / HTTP / MCP)
+## v1.2.0 — 2026-11-07 — production shells (CLI / HTTP / MCP)
 
 ### Added
 
