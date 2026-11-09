@@ -73,6 +73,28 @@ public:
     bool best_match(const cv::Mat& feature, float threshold, float& score,
                     std::string& name) const;
 
+    // 用**库自己**的人互相配对，估出"一个陌生人在这个库里被认成某人的概率"。
+    //
+    // 为什么重要：identify 的匹配是对整个库取最大值，所以同一个余弦阈值下的误接受率
+    // 随库增长——单对 1% 在 610 人库里就是 ~99.7%（1-0.99^609）。阈值单独看没有意义，
+    // 必须和库规模一起看。这个估计不需要任何外部数据集：库内 N(N-1) 个对全是不同人，
+    // 直接就是误接受样本。
+    //
+    // 精度是**实测出来的，不是推出来的**：200 个 LFW 身份上它给 95.3%，同一批人留出集
+    // 实测 84.0%（偏高 11 个点）。偏差方向不可推：注册照更干净会把 p 拉低，但同一个注册
+    // 记录会出现在很多个对里、而且它不像融合后的条目那样平均掉噪声，又会把 p 拉高。
+    // 所以结论只在数量级上成立：它能区分"0.2 在这个库里几乎必错"与"0.45 不会"，
+    // 不能用来对外声称 FAR。要量真实的，用 `./main evaluate` 在自有数据上跑。
+    struct SelfEstimate {
+        size_t gallery = 0;      // 库内人数
+        size_t sampled = 0;      // 参与配对的人数（等距采样，上限 cap）
+        size_t pairs = 0;        // 比较过的不同人对数
+        size_t above = 0;        // 其中分数 >= threshold 的数量
+        double pair_rate = 0.0;  // 单对比误接受率 p
+        double far_1n = 0.0;     // 1-(1-p)^gallery：一个**未注册**的脸在这个库里被认成某人的概率
+    };
+    SelfEstimate self_estimate(double threshold, size_t cap = 512) const;
+
 private:
     std::string fingerprint_;
     std::string embedder_sha256_;

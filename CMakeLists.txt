@@ -35,6 +35,7 @@ add_executable(main
     src/gallery.cpp
     src/log.cpp
     src/metrics.cpp
+    src/evaluation.cpp
     face_tracker.cpp
 )
 target_include_directories(main PRIVATE src ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party)
@@ -80,6 +81,12 @@ if(FACEREC_BUILD_TESTS)
     target_include_directories(admission PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(admission Threads::Threads)
     add_test(NAME admission COMMAND admission)
+
+    # 阈值评测的统计层：用已知角度的手造特征断言 FAR/FRR。不需要模型与数据 ——
+    # 错的不是分数（那由模型决定），是分数到阈值的映射（那由这份代码决定）。
+    add_executable(evaluation tests/evaluation.cpp src/evaluation.cpp)
+    target_include_directories(evaluation PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME evaluation COMMAND evaluation)
 
     # augmentation A/B：同一套 warp 种子下，对比不同检测器的 within/between margin。
     add_executable(augmentation_ab tests/augmentation_ab.cpp src/engine.cpp

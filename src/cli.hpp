@@ -17,4 +17,10 @@ int cmd_compare(int argc, char* argv[]);
 // verify <img> --name <person>：图中最优人脸是否属于指定身份。
 int cmd_verify(int argc, char* argv[]);
 
+// evaluate <dataset-dir>：量出阈值在 1:1（compare）与 1:N（identify）两种语义下的
+// FAR/FRR。存在的理由：recognize.thresh 必须是量出来的数，不是“看着合理”的默认值。
+// 预处理与生产一致（letterbox + 同一个模型 + 同一个取脸规则），否则量出来的阈值
+// 不适用于线上。
+int cmd_evaluate(int argc, char* argv[]);
+
 #endif // FACERECOGNITION_CLI_HPP

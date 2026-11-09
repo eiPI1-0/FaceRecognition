@@ -17,6 +17,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include "encoding.hpp"
+#include "evaluation.hpp"
 #include "sha256.hpp"
 
 namespace facerec {
@@ -173,6 +174,43 @@ bool Gallery::best_match(const cv::Mat& feature, float threshold, float& score,
     score = ranked.front().second;
     name = entries_[ranked.front().first].person_id;
     return score >= threshold;
+}
+
+Gallery::SelfEstimate Gallery::self_estimate(double threshold, size_t cap) const {
+    SelfEstimate e;
+    e.gallery = entries_.size();
+    if (e.gallery < 2 || dim_ <= 0) return e;    // 一个人没有"不同人对"，估不了
+
+    // 等距采样而不是前 cap 个：索引是按人排序的，取前段会把整个库的后段完全
+    // 漏掉；库小于一万时 cap=512 已经能把单对尾概率的相对误差控制在几个百分点。
+    size_t step = 1;
+    if (e.gallery > cap) step = (e.gallery + cap - 1) / cap;
+    std::vector<int> idx;
+    for (size_t i = 0; i < e.gallery; i += step) idx.push_back(static_cast<int>(i));
+    const int m = static_cast<int>(idx.size());
+
+    cv::Mat matrix(m, dim_, CV_32F);
+    for (int r = 0; r < m; ++r) {
+        const auto& f = entries_[static_cast<size_t>(idx[r])].fused;
+        std::copy(f.begin(), f.end(), matrix.ptr<float>(r));
+    }
+    cv::Mat scores;   // m x m：库内两两点积（两边都 unit-norm，即 cosine）
+    cv::gemm(matrix, matrix, 1.0, cv::noArray(), 0.0, scores, cv::GEMM_2_T);
+
+    for (int r = 0; r < m; ++r) {
+        const float* s = scores.ptr<float>(r);
+        for (int c = 0; c < m; ++c) {
+            if (r == c) continue;                       // 自己不是"别人"
+            ++e.pairs;
+            if (s[c] >= threshold) ++e.above;
+        }
+    }
+    e.sampled = static_cast<size_t>(m);
+    if (e.pairs) e.pair_rate = static_cast<double>(e.above) / static_cast<double>(e.pairs);
+    // 自检回答的是"**未注册**的脸会不会被认成某个人"：它对库里全部 G 条记录取最大值，
+    // 所以 n = G（不是采样数 m；G-1 是已注册探针的语义，那是另一个问题）。
+    e.far_1n = one_n_far_from_pair_rate(e.pair_rate, e.gallery);
+    return e;
 }
 
 // ---------------------------------------------------------------------------
