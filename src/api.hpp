@@ -118,6 +118,28 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// 启动自检：阈值 + 库规模（见 Gallery::self_estimate）
+// ---------------------------------------------------------------------------
+
+// 把"当前阈值在当前库规模下意味着什么"算成一个数，几个外壳共用同一条判定与同一
+// 句话（两份描述一定有一份会过时）。背景：knob 注释曾写 "cross-identity near 0"——
+// 在 610 人库里 probe 对单张注册照的均值确实是 0.0051，但对 609 个对手取最大值后均值
+// 变成 0.3125。1:1 与 1:N 不是同一个分布，所以那句话用在 identify 上是错的。
+struct ThresholdCheck {
+    Gallery::SelfEstimate est;
+    float threshold = 0.0f;
+    bool too_permissive = false;   // far_1n >= recognize.self_far_warn
+    bool estimable = false;        // 库里至少两人，否则没有"不同人配对"
+    // 这个库能证的**最小** 1:N 误接受率（把一个配对算进去时的值）。far_1n 低于它
+    // 就只是"没观察到"，不是"已证明"。
+    double far_1n_resolution = 0.0;
+    std::string human;             // 一行话（banner / stderr）
+    std::string fields;            // log.event 的 fields（对象成员列表）
+};
+
+ThresholdCheck check_recognize_threshold(const Gallery& gallery, const PipelineConfig& cfg);
+
+// ---------------------------------------------------------------------------
 // JSON 序列化（stdout / HTTP 响应共用一份，避免两个外壳输出不一致）
 // ---------------------------------------------------------------------------
 

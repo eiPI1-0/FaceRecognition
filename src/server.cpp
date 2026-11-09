@@ -306,6 +306,15 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     std::cout << "Ready: " << pool.size() << " worker(s), gallery "
               << pool.gallery_size() << " person(s) from " << cfg.data_dir << std::endl;
 
+    // 启动自检：阈值不是孤立的数。同一个 0.20 在 2 人库里看着合理，在 610 人库里
+    // 等于"每个陌生人都能匹配到谁"（实测 99.7%）。不报这个数，服务就是在默认配置下
+    // 默许放行陌生人 —— 而 503、延迟、错框都会报错，只有误接受不会。
+    const ThresholdCheck thresh = check_recognize_threshold(pool.gallery(), cfg);
+    std::cout << thresh.human << std::endl;
+    if (log.enabled(thresh.too_permissive ? LogLevel::Warn : LogLevel::Info))
+        log.event(thresh.too_permissive ? LogLevel::Warn : LogLevel::Info,
+                  "threshold_check", thresh.fields);
+
     // 指纹在启动时算一次：gallery 在进程生命周期内不变，缓存必须跟着它失效。
     ResultCache cache(pool.fingerprint(), static_cast<size_t>(opt.cache_entries));
     Metrics metrics;
@@ -354,7 +363,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         set_json(res, 200, "{\"status\":\"ok\"}");
     });
 
-    svr.Get("/readyz", [&cfg, &cache](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/readyz", [&cfg, &cache, &thresh, &pool](const httplib::Request&, httplib::Response& res) {
         const ResultCache::Stats st = cache.stats();
         std::ostringstream os;
         os << "{\"status\":\"ready\",\"model\":{\"detector\":\""
@@ -362,7 +371,16 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
            << json_escape(cfg.embedder_model) << "\"},\"detector_input\":["
            << cfg.detector_input_w << "," << cfg.detector_input_h << "]"
            << ",\"cache\":{\"hits\":" << st.hits << ",\"misses\":" << st.misses
-           << ",\"entries\":" << st.entries << ",\"bytes\":" << st.bytes << "}}";
+           << ",\"entries\":" << st.entries << ",\"bytes\":" << st.bytes << "}"
+           // 阈值与库规模必须同屏：它们是一对，分开看就会误读（0.45 在 2 人库与
+           // 2000 人库不是同一个安全级别）。指纹则让"滚动重启窗口里两个实例的库
+           // 不一致"变成可观测的事，而不是事后猜。
+           << ",\"recognize\":{\"thresh\":" << format_float(cfg.recogn_thresh, 4)
+           << ",\"gallery_persons\":" << thresh.est.gallery
+           << ",\"far_1n_estimate\":" << format_float(thresh.est.far_1n, 6)
+           // 与 estimate 同屏：0 只有在高于这个分辨率时才是信息。
+           << ",\"far_1n_resolution\":" << format_float(thresh.far_1n_resolution, 6)
+           << ",\"gallery_fingerprint\":\"" << json_escape(pool.fingerprint()) << "\"}}";
         set_json(res, 200, os.str());
     });
 
@@ -541,6 +559,8 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         std::ostringstream os;
         os << "\"host\":\"" << json_escape(opt.host) << "\",\"port\":"
            << opt.port << ",\"workers\":" << workers << ",\"persons\":" << pool.gallery_size()
+           << ",\"recognize_thresh\":" << format_float(cfg.recogn_thresh, 4)
+           << ",\"far_1n_estimate\":" << format_float(thresh.est.far_1n, 6)
            << ",\"gallery_fingerprint\":\"" << json_escape(pool.fingerprint())
            << "\",\"detector\":\"" << json_escape(cfg.detector_model)
            << "\",\"embedder\":\"" << json_escape(cfg.embedder_model)

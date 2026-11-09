@@ -166,8 +166,15 @@ const std::vector<Knob>& knobs() {
                            "names and decoded automatically - these three keys do not apply to it"},
 
         {"recognize.thresh", &PipelineConfig::recogn_thresh, 0.0, 1.0,
-         "recognition", "cosine above which a match is reported; after the alignment fix "
-                        "same-identity sits near 1.0 and cross-identity near 0"},
+         "recognition", "cosine above which a match is reported. It is NOT a per-pair "
+                        "number: identify takes a max over the whole gallery, so the "
+                        "false-accept rate grows with gallery size (measured on LFW: "
+                        "per-pair FAR 1.3% at 0.20, but ~100% against a 610-person "
+                        "gallery). Pick it with './main evaluate <dataset>' on your own "
+                        "population; serve/mcp log the estimate at startup"},
+        {"recognize.self_far_warn", &PipelineConfig::self_far_warn, 0.0, 1.0,
+         "recognition", "warn at startup when the gallery's own cross-match estimate of "
+                        "the 1:N false-accept rate reaches this (0 = always warn)"},
         {"display.rfactor", &PipelineConfig::rfactor, 1, 16,
          "display", "display frame = detector input x rfactor; letterbox canvas, and the "
                     "scale draw()/putText() map detection coords by"},

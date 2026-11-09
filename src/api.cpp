@@ -9,6 +9,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "evaluation.hpp"   // one_n_far_from_pair_rate：阈值自检的算术在这里，只写一次
+
 namespace facerec {
 
 namespace {
@@ -261,6 +263,66 @@ cv::Mat Pipeline::embed_image(const cv::Mat& img, int face_index) {
         return {};
     }
     return extract_face_feature(work, dets[face_index], *extractor_, det_shape_);
+}
+
+ThresholdCheck check_recognize_threshold(const Gallery& gallery, const PipelineConfig& cfg) {
+    ThresholdCheck c;
+    c.threshold = cfg.recogn_thresh;
+    c.est = gallery.self_estimate(static_cast<double>(cfg.recogn_thresh));
+    c.estimable = c.est.gallery >= 2 && c.est.pairs > 0;
+    if (c.est.pairs)
+        // 与 est.far_1n 用同一个 n（=库大小），两个数才能直接比。
+        c.far_1n_resolution = one_n_far_from_pair_rate(1.0 / static_cast<double>(c.est.pairs),
+                                                       c.est.gallery);
+
+    char buf[700];
+    std::snprintf(buf, sizeof buf,
+                  "\"thresh\":%.4f,\"gallery\":%zu,\"sampled\":%zu,\"pairs\":%zu,"
+                  "\"above\":%zu,\"pair_rate\":%.3e,\"far_1n\":%.3e,"
+                  "\"far_1n_resolution\":%.3e,\"estimable\":%s",
+                  c.threshold, c.est.gallery, c.est.sampled, c.est.pairs, c.est.above,
+                  c.est.pair_rate, c.est.far_1n, c.far_1n_resolution,
+                  c.estimable ? "true" : "false");
+    c.fields = buf;
+
+    if (!c.estimable) {
+        c.human = "threshold check: fewer than 2 enrolled people, so the 1:N "
+                  "false-accept rate cannot be estimated yet";
+        return c;
+    }
+    c.too_permissive = c.est.far_1n >= static_cast<double>(cfg.self_far_warn);
+    if (c.too_permissive) {
+        std::snprintf(buf, sizeof buf,
+                      "recognize.thresh=%.2f against a %zu-person gallery admits "
+                      "strangers: an unenrolled face is matched to somebody with "
+                      "probability %.1f%% (per-pair rate %.3e over %zu gallery "
+                      "cross-matches; a gallery-side estimate is good to the order of "
+                      "magnitude, not the third digit - on LFW it ran 11 points high vs "
+                      "held-out probes). Raise recognize.thresh, or calibrate on your "
+                      "own population with './main evaluate <dataset>'.",
+                      c.threshold, c.est.gallery, 100.0 * c.est.far_1n,
+                      c.est.pair_rate, c.est.pairs);
+    } else if (c.est.above == 0) {
+        // "一个都没超"不是"零"：库内配对只有 pairs 个，能证的尾概率下限是
+        // 1/pairs。不报这个下限，0.00 会被读成"已证明安全"——那和把 0.2 当真
+        // 是同一个错，只是方向相反。
+        const double floor_far = c.far_1n_resolution;
+        std::snprintf(buf, sizeof buf,
+                      "recognize.thresh=%.2f against a %zu-person gallery: no cross-person "
+                      "pair among %zu exceeded it, so the expected false-accept rate is "
+                      "below %.1e (this gallery's one-pair resolution). Enroll more people, "
+                      "or run './main evaluate <dataset>' for a tighter number.",
+                      c.threshold, c.est.gallery, c.est.pairs, floor_far);
+    } else {
+        std::snprintf(buf, sizeof buf,
+                      "recognize.thresh=%.2f against a %zu-person gallery: an "
+                      "unenrolled face is matched to somebody with probability %.2e "
+                      "(per-pair rate %.3e over %zu gallery cross-matches; order of "
+                      "magnitude, not the third digit).",
+                      c.threshold, c.est.gallery, c.est.far_1n, c.est.pair_rate, c.est.pairs);
+    }
+    c.human = buf;
+    return c;
 }
 
 // ---------------------------------------------------------------------------

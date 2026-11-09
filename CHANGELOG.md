@@ -8,6 +8,61 @@ than a strict versioning scheme.
 
 ### Added
 
+- **`./main evaluate <dataset>` — held-out-set evaluation, so the recognition threshold can be
+  measured instead of guessed.** A dataset in the same layout as `data/` (one directory per
+  person, ≥ 4 photos): the first N photos become the enrollment side, the next M are held out
+  and never enrolled, so 1:N numbers are not read off the training set. Reports genuine /
+  impostor / max-other distributions at both 1:1 and 1:N, FAR/FRR/EER at every threshold, and
+  writes a CSV. The impostor tail is reported as `unreachable` rather than `0` when it is below
+  the sample's resolution — the smallest rate that gallery can certify — because a printed
+  `0.000000` reads as proof rather than as a missing measurement (at 610 identities the measured
+  1:N FAR bottoms out at 8.2e-4 = 1 probe in 1220; below that nothing is observable).
+  1:1 and 1:N get separate columns because the same gallery at the same threshold sits **three
+  orders apart**: at t=0.80 the per-pair FAR is 6.7e-7 while the 1:N FAR is 8.2e-4.
+- **Startup threshold self-check (`check_recognize_threshold` in `src/api.{hpp,cpp}`).** Every
+  shell that holds a gallery now prints what that threshold does *to that gallery*, with no
+  external dataset: every cross-person pair inside the gallery is already an impostor pair, and
+  the per-pair rate converts to the 1:N rate by the binomial. One estimate, one arithmetic path
+  (the pure function `one_n_far_from_pair_rate` in `src/evaluation.{hpp,cpp}` — the relation was
+  previously asserted in a comment with no code anywhere computing it). `serve` logs a
+  `threshold_check` event (WARN at `recognize.self_far_warn`, default 0.01), prints it in the
+  banner, and answers it at `/readyz`; `mcp` logs it in both transports; `identify` stays silent
+  because it is one-shot. Motivation: a false accept emits no error, no 503 and no latency
+  spike — it looks like success, so a too-permissive threshold can run for months unnoticed.
+  Its precision is stated rather than assumed: on 200 LFW identities it said 95% where held-out
+  probes measured 84% (gallery-side pairs are not probe-side pairs — the sign of the bias is
+  empirical), and the same conversion applied to the measured 1:1 tail gives 1.14% at N=610 vs
+  1.31% measured directly. Order-of-magnitude agreement is what the check needs: it must
+  distinguish 0.2 (99.7%) from 0.45 (1.3%), not resolve a third digit.
+- **`recognize.self_far_warn`** — the warning line for that check (a reporting threshold, not a
+  safety one: it decides when to shout, not who gets in).
+- **`PipelinePool::fingerprint()` — the live gallery's fingerprint, the same string the
+  result-cache key already carried.** `/readyz` now reports it next to the person count, so the
+  answer "which gallery was this result computed against?" is checkable by eye instead of by
+  reading source.
+
+### Changed
+
+- **`recognize.thresh` default: 0.20 → 0.45.** The old value was never calibrated: it came from
+  an augmentation harness that only ever measured 1:1 margins, while `identify`/`verify` are 1:N.
+  Measured on LFW through the production path (610 identities × 2 enrolled photos, and a
+  disjoint 1680 × 1 — their 1:1 tails agree to ~2% on FAR): the per-pair false-accept rate at 0.20 is
+  1.26%, but `identify` takes a max over the gallery, so the probability that a stranger matches
+  *somebody* is **99.7% at 610 people and 100% at 1680**. 0.45 brings that to 1.3% / 3.0% for
+  +0.9 pt of false rejects; going higher buys FAR linearly and pays rejections superlinearly
+  (0.45 → 0.55 halves FAR again and *doubles* FRR). README's "Choosing the recognition threshold"
+  has the full table. If 0.2 was set deliberately, set it explicitly — the self-check now says
+  out loud what it costs.
+
+### Fixed
+
+- The `recognize.thresh` knob comment asserted the old default "is not a per-pair number… pick
+  it with `./main evaluate`" while quoting a default (0.2) that was itself ~100% permissive at
+  the very gallery size the comment named. The comment was right about the mechanism and wrong
+  about its own value.
+
+### Added
+
 - **Admission control (edge shedding) with one capacity-wait budget across both admission
   points.** Waiting for capacity happens twice — in cpp-httplib's task queue (accept thread →
   worker) and in `PipelinePool` (handler → pipeline) — and only the second one had a bound, so the

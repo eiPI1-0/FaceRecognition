@@ -566,6 +566,16 @@ int run_mcp(const PipelineConfig& cfg, const McpOptions& opt) {
     cv::setNumThreads(1);
     PipelinePool pool(cfg, workers);
     ResultCache cache(pool.fingerprint(), static_cast<size_t>(opt.cache_entries));
+
+    // 阈值自检：与 serve 用同一条判定、同一句描述（两个外壳各写一份时，mcp 这份
+    // 很容易变成没人看过的那份）。stdio 模式下 stdout 是协议通道，所以只进日志。
+    const ThresholdCheck thresh = check_recognize_threshold(pool.gallery(), cfg);
+    if (access.log.enabled(thresh.too_permissive ? LogLevel::Warn : LogLevel::Info))
+        access.log.event(thresh.too_permissive ? LogLevel::Warn : LogLevel::Info,
+                         "threshold_check", thresh.fields);
+    // 人读的那一句也要输出：只有 log.event 字段时，在终端里跑 `./main mcp` 的人什么都
+    // 看不见，而这句话是写成能直接拿去改配置用的。stdout 是协议通道，所以走 stderr。
+    std::cerr << thresh.human << std::endl;
     {
         std::ostringstream os;
         os << "\"op\":\"startup\",\"transport\":\""
@@ -574,7 +584,9 @@ int run_mcp(const PipelineConfig& cfg, const McpOptions& opt) {
            << json_escape(pool.fingerprint()) << "\",\"auth\":\""
            << (access.tokens.empty() ? "off"
                                      : std::to_string(access.tokens.size()) + " token(s)")
-           << "\"";
+           << "\""
+           << ",\"recognize_thresh\":" << format_float(cfg.recogn_thresh, 4)
+           << ",\"far_1n_estimate\":" << format_float(thresh.est.far_1n, 6);
         access.log.audit("startup", os.str());
     }
     return opt.transport == McpTransport::Http ? serve_http(pool, opt, cache, access)

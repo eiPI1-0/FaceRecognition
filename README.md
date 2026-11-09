@@ -123,6 +123,8 @@ commands are for scripting, services and LLM tool use.
 ./main mcp    [--transport stdio|http] [--port P]    # MCP tools for LLM clients
 ./main compare  <img-a> <img-b>                      # cosine between two images' faces
 ./main verify   <img> --name <person>                # is this image this person?
+./main evaluate <dataset> [--gallery-photos N] [--probe-photos N] [--csv out.csv]
+                                         # FAR/FRR + EER at 1:1 and 1:N — picks the threshold
 ```
 
 `./main <source>` without a command is still treated as `./main demo <source>`, so older
@@ -180,7 +182,11 @@ model would repeat to the user.
 | 3 | pipeline error |
 
 The JSON verdict (`verified`, `cosine`, `matched`, `threshold`) is printed for every exit
-code. The non-zero-on-"no" is deliberate and differs from `identify`, which exits 0 even
+code. `cosine` is the **best match's** score and `matched` names who — not a score against the
+named person. So `"verified":false,"cosine":1.0,"matched":"BruceLi"` with `--name IvanYang` means
+"this is confidently somebody else", which is a different answer from the other no: `cosine` below
+`threshold` means nobody in the gallery is close enough. Scripts should branch on the exit code or
+on `matched`, never on `cosine` alone. The non-zero-on-"no" is deliberate and differs from `identify`, which exits 0 even
 when no face is found: `identify` reports a measurement, while `verify` is an
 authentication-style decision, and a check that always exits 0 turns every script that
 forgets to parse the JSON into a silent pass.
@@ -650,13 +656,122 @@ ones worth knowing:
 
 | key | default | effect |
 |---|---|---|
-| `recognize.thresh` | `0.2` | cosine threshold above which a match is reported. After the alignment fix, same-identity scores sit near 1.0 and cross-identity near 0, so there is wide headroom. |
+| `recognize.thresh` | `0.45` | cosine above which a match is reported. **Not a per-pair number** — see [Choosing the recognition threshold](#choosing-the-recognition-threshold-measured-not-chosen) below: `identify` takes a max over the whole gallery, so the same value means something different at every gallery size. The old default `0.2` admitted essentially every stranger to a 610-person gallery. |
 | `display.rfactor` | `6` | display frame = `detector input × rfactor` = 960×720; the letterbox canvas and the coord scale for `draw()`/`putText()`. |
 | `detector.conf_thresh` / `detector.nms_thresh` / `detector.keep_top_k` | `0.6` / `0.3` / `750` | detection sensitivity and box suppression. |
 | `tracker.iou` / `tracker.dist_ratio` | `0.30` / `0.60` | association gates: a detection is the same track if box IoU ≥ `iou` **or** its centre moved less than `dist_ratio` × box size. Two gates, not one: a face at the frame edge alternates between the whole-face box and the visible-part-only box (measured adjacent-frame IoU **0.37**), so IoU alone splits one face into two tracks that are both drawn forever. |
 | `tracker.detect_every` / `tracker.max_lost` / `tracker.min_hits` | `1` / `5` / `2` | `detect_every` below; a confirmed track is carried — box *and* its last real label — for at most `max_lost` frames of pure prediction; a track needs `min_hits` detections before it is shown, so a detection that exists for one frame never reaches the screen. |
 | `align.border` | `constant` | how to fill the part of the alignment window that falls outside the frame for edge-clipped faces: `constant` (black) / `reflect` / `replicate`. Does not move the warp; see the measurement above. |
 
+
+### Choosing the recognition threshold (measured, not chosen)
+
+`identify` answers "who is this?" by scoring the query against **every** enrolled person
+and keeping the maximum. So the false-accept rate is a property of the gallery size, not
+just of the threshold: a per-pair false-accept rate of 1% means ~99.7% against a 610-person
+gallery (1 − 0.99^609). That is arithmetic, not a prediction.
+
+Measured on LFW (deepfunneled) through the **production** path — YuNet detection, landmark
+alignment, MobileFaceNet, the same letterbox canvas, the same enrollment fusion — with
+photos held out of enrollment (`./main evaluate <dataset>`):
+
+| thresh | 1:1 FAR | 1:1 FRR | 1:N FAR, N=610 | 1:N FAR, N=1680 | 1:N FRR, N=610 |
+|---|---|---|---|---|---|
+| 0.20 (old default) | 1.26e-2 | 0.022 | **0.997** | **1.000** | 0.017 |
+| 0.30 | 1.36e-3 | 0.027 | 0.548 | 0.817 | 0.019 |
+| 0.40 | 8.6e-5 | 0.041 | 0.068 | 0.122 | 0.023 |
+| 0.45 (default) | 1.9e-5 | 0.057 | 0.013 | 0.030 | 0.026 |
+| 0.50 | 3.4e-6 | 0.088 | 0.0016 | 0.011 | 0.040 |
+| 0.55 | 3.4e-6 | 0.140 | 0.0008 | 0.0054 | 0.065 |
+
+The 1:1 columns and the two N=610 columns come from **one** run; the N=1680 column comes from
+the second run below it (fewer enrolled photos per person, so its 1:1 tail is slightly thinner).
+1:1 EER sits at threshold ≈ 0.18, rate ≈ 4.1% in the 610-identity run. Two runs over disjoint identity sets
+(610 identities × 2 enrolled photos; 1680 × 1, a disjoint set) put the 1:1 FAR within ~2% of
+each other at every threshold (1.88e-5 vs 1.84e-5 at 0.45) and the 1:1 FRR within ~13%. So the
+*shape* belongs to the model; the decimals belong to the sample — which is why the last column is
+rounded to two significant figures.
+
+`0.45` is where the trade steepens: 0.20 → 0.45 cuts the 610-person false-accept rate 76×
+for +0.9 pt of rejections, while 0.45 → 0.55 cuts it another 16× and *doubles* the
+rejections. It is a defensible starting point for a small gallery, not a certified operating
+point. Pushing to FAR=1e-3 at N=610 wants threshold ≈ 0.71 — that number comes from the
+independence model, because this run cannot *measure* a 1:N FAR below 8.2e-4 (one probe in 1220;
+the table prints `unreachable` below it), and at 0.70 the measured false-reject rate is already
+29%. So a large unconstrained gallery is limited by the embedder, not by the threshold: no
+threshold choice buys you past the model.
+
+Two columns and one word are there deliberately:
+
+- **1:1 and 1:N are separate columns.** `/v1/compare` and `compare_faces` are 1:1;
+  `/v1/identify`, `/v1/verify` and `./main verify` are 1:N. A threshold tuned on one is
+  wrong for the other by orders of magnitude.
+- **`unreachable` and measurement resolution.** N people give N(N−1) impostor pairs, so a
+  FAR below 1/(pairs) cannot be certified — only extrapolated. The report says `unreachable`
+  and prints the certifiable floor instead of inventing a confident number.
+
+Every shell that holds a gallery estimates this at startup **from the gallery itself** — no
+dataset needed, because every cross-person pair inside it *is* an impostor pair:
+
+```
+recognize.thresh=0.20 against a 200-person gallery admits strangers: an unenrolled face is
+matched to somebody with probability 95.3% (per-pair rate 1.518e-02 over 39800 gallery
+cross-matches; a gallery-side estimate is good to the order of magnitude, not the third digit -
+on LFW it ran 11 points high vs held-out probes). Raise recognize.thresh, or calibrate on your
+own population with './main evaluate <dataset>'.
+```
+
+And the opposite failure — a threshold that looks safe but only because the gallery is too small
+to see the tail:
+
+```
+recognize.thresh=0.45 against a 200-person gallery: no cross-person pair among 39800 exceeded
+it, so the expected false-accept rate is below 5.0e-03 (this gallery's one-pair resolution).
+Enroll more people, or run './main evaluate <dataset>' for a tighter number.
+```
+
+`serve` logs it as a `threshold_check` event (WARN once the estimate reaches
+`recognize.self_far_warn`, default 0.01), prints it in its banner, and answers it at
+`/readyz` (`recognize.far_1n_estimate`, `far_1n_resolution`, `gallery_persons`,
+`gallery_fingerprint`); `mcp` logs the same event and prints the same sentence to **stderr** in
+both transports (stdout is the protocol channel). `identify` deliberately stays silent: it is one
+shot per process, so it would pay the estimate's matmul on every call and bury a caller's JSON in
+prose — read `/readyz` or a server banner instead.
+
+The estimate is good to the **order of magnitude, not the third digit**: on 200 LFW identities it said 95% where held-out probes measured 84% (gallery-side
+pairs are not probe-side pairs, so the sign of that bias is empirical, not derivable), and
+applying the same conversion to the measured 1:1 tail gives 1.14% at N=610 against 1.31%
+measured directly. That is enough for what the check is for — telling 0.2 (99.7%) from 0.45
+(1.3%) — and it recomputes itself whenever the gallery changes. The mechanism exists because a
+false accept emits no error, no 503 and no latency spike: it looks exactly like success.
+
+To get a number that applies to *your* population, measure on your own photos:
+
+```sh
+./main evaluate /path/to/dataset --gallery-photos 2 --probe-photos 2 --workers 8 --csv t.csv
+# same layout as data/: one directory per person, >=4 photos each. The first 2 photos are
+# the enrollment side; the next 2 are held out and never enrolled. --limit/--seed sample
+# identities deterministically.
+```
+
+Provenance of the table above, so it is checkable rather than folklore — the numbers come from
+these two runs (the original `vis-www.cs.umass.edu/lfw` host does not answer from this machine,
+so the corpus is the ModelScope re-host of the Kaggle LFW package: dataset
+`Composable/labeled_faces_in_the_wild`, file `LFW人脸数据集.zip`, which contains
+`lfw-deepfunneled/`):
+
+```sh
+# 610 identities (those with >= 4 photos): 2 enrolled, 2 held out
+./main evaluate <path>/lfw-deepfunneled --workers 8 --csv lfw_eval.csv
+# 1680 identities (those with >= 2 photos): 1 enrolled, 1 held out
+./main evaluate <path>/lfw-deepfunneled --workers 8 --gallery-photos 1 --probe-photos 1 \
+    --csv lfw_eval_1680.csv
+```
+
+LFW is not your population: it is webcam-quality, near-frontal, and enrolled from a single
+photo per person in the second run. Treat the *shape* (how steeply FAR falls, how far 1:1 and
+1:N separate) as transferable and the absolute numbers as a floor to re-measure on your own
+photos.
 
 `detect_every` is the main performance/accuracy dial. Measured here (CPU, 960×720,
 one face):
@@ -844,8 +959,14 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
   still.
 - Detection runs at a fixed 160×120, so **very small or very distant faces** are missed;
   there is no image pyramid / tiling pass.
-- Recognition scales linearly with the enrolled population (`O(N)` scan per face). Fine
-  for tens of people; hundreds would need an index.
+- Recognition scales linearly with the enrolled population (`O(N)` scan per face — a few
+  microseconds per person at 512-d, so 10k people is still only tens of ms). The real ceiling
+  at large N is **accuracy, not compute**: at the default threshold the 1:N false-accept rate
+  is 1.3% at 610 people and 3.0% at 1680, and the threshold that FAR=1e-3 would require (≈0.71)
+  already rejects 29% of genuine faces at that gallery size
+  ([Choosing the recognition threshold](#choosing-the-recognition-threshold-measured-not-chosen)).
+  A gallery of thousands needs a stronger embedder and/or a two-stage search (ANN candidate set,
+  then re-verify at a per-candidate threshold), not just an index.
 - The shipped sample data contains 2 identities with 1 photo each — useful as a regression
   signal, **not** an accuracy benchmark.
 - The pinned **fused** YuNet export computes its last level unreliably under OpenCV 4.13:
@@ -855,7 +976,10 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
   in this frame), so they never surface in an API. The per-level export
   (`face_detection_yunet_2023mar.onnx`) showed 0/44 forwards affected, but has never been run
   through the augmentation harness, so it is not the default.
-- No tests, CI, or lint config.
+- Four `ctest` targets cover config parsing/validation, the tracker harness, the decode gates and
+  the evaluation report — all without model weights, in ~0.3 s. There is still no CI runner and no
+  lint config, and the accuracy path is exercised only by `./main evaluate`, which needs a real
+  dataset and is therefore run by hand.
 
 ---
 

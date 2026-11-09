@@ -31,6 +31,11 @@ public:
     size_t gallery_size() const {
         return pipelines_.empty() ? 0 : pipelines_.front()->gallery_size();
     }
+    // 库本身（启动自检用）。所有实例同一份，取第一个。
+    const Gallery& gallery() const {
+        static const Gallery empty;
+        return pipelines_.empty() ? empty : pipelines_.front()->gallery();
+    }
     // 缓存指纹：所有实例的配置与 gallery 相同，取第一个即可。
     std::string fingerprint() const {
         return pipelines_.empty() ? std::string() : pipelines_.front()->fingerprint();

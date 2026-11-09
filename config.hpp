@@ -44,7 +44,17 @@ struct PipelineConfig {
     std::string out_loc = "loc", out_conf = "conf", out_iou = "iou";
 
     // 识别与显示
-    float recogn_thresh = 0.2f;
+    //
+    // 默认 0.45 是**量出来的**，不是选好的（./main evaluate 在 LFW 上跑出的表，见
+    // README "阈值"一节）。关键事实：identify 是对整个库取最大值，所以同一个阈值的
+    // 误接受率随库增长：单对比 FAR@0.20 = 1.26%，而在 610 人库里 1:N 误接受率是
+    // 99.7%，在 1680 人库里是 100%。0.45 是"FRR 开始陡峭上升之前能拿到的最大安全
+    // 边际"：610 人库的 FAR_1N 从 0.997 降到 0.013，代价是 FRR_1N 从 1.7% 升到 2.6%。
+    float recogn_thresh = 0.45f;
+    // 启动自检的告警线：库内自校对估出的 1:N 误接受率 >= 此值时 WARNING。
+    // 它是报告阈值，不是安全阈值：决定的是什么时候开口，不是谁能进门
+    // （那是 recogn_thresh 的事）；0 = 总是告警。
+    float self_far_warn = 0.01f;
     int   rfactor       = 6;      // display_shape = detector_input * rfactor（派生，不可单独设）
 
     // 跟踪（关联与生命周期，见 face_tracker.hpp 的设计说明）
