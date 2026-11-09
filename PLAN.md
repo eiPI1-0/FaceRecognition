@@ -468,7 +468,8 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
 
 ### D1 审计日志：查询不留身份，写入必留身份 —— **已实现**
 
-- **决策**：审计是**一行一个 JSON 对象**的请求日志（默认 stderr，`log.audit` 可改路径或 `off`）。
+- **决策**：审计是**一行一个 JSON 对象**的请求日志（默认 stderr，`log.sink` 可改路径或 `off`；
+  原名 `log.audit`，因为运行日志现在也走同一个流，旧名字已经名不副实）。
   查询类（identify/embed/compare/people/crop）记录 `req/caller/op/status/ms/faces/matched/cache/bytes`，
   **不记录** person_id、匹配到的名字、embedding、图像字节、bbox、内容哈希。
   写入类（enroll、gallery 重建、模型加载、鉴权拒绝）**必须**记录 person_id 与文件清单。
@@ -637,8 +638,8 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
      显示两条同端口 LISTEN（backlog 1024，`CPPHTTPLIB_LISTEN_BACKLOG` 生效）；60 次请求
      按 access 日志分布到两进程 = **21 / 39**，内核确实在分流。`systemd-analyze verify` 通过。
    - **部署时才知道的三件事**：① 探针成功**不记日志**（k8s 每 10s 一次会淹没日志），所以
-     用 healthz 验证分流会误以为"没流量"——要么看指标，要么用非探针路径。② `log.audit` 允许
-     `stderr`，容器里自然接到 stdout 采集，不需要 —log 文件挂载。③ 非 loopback 绑定 + 无 token
+     用 healthz 验证分流会误以为"没流量"——要么看指标，要么用非探针路径。② `log.sink` 允许
+     `stderr`，容器编排器同时采 stdout 与 stderr，不需要额外挂 log 卷。③ 非 loopback 绑定 + 无 token
      表 = **拒启动**（绑定约束），所以镜像默认 `auth.tokens_file: /etc/facerec/tokens`，失败就
      大声失败，而不是默默裸奔。
    - 包名坑：Leap 16 的运行时依赖是**单个** `libopencv413`，没有 `libopencv_core413` 这类分模块包
@@ -656,7 +657,32 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
      否则 `/random-N` 能把 map 撑爆。lease 等待时长由 `request_ms` 直方图的长尾覆盖。
    - **多进程注意**：计数器是进程内的，`--reuseport` 下一个 scrape 只落到某个实例，聚合需按
      实例分抓（`deploy/` 里已说明）。
-   - 未做：audit 之外的运行日志分级（info/debug 级别）。
+6b. ~~日志分级（audit 之外的运行日志）~~ **已完成**：`src/log.{hpp,cpp}` 成为唯一结构化日志出口。
+   - `log.sink`（原 `log.audit` 改名）= 目的地；`log.level` = off|error|warn|info|debug（默认 warn）
+     **只过滤运行事件**。审计行不受 level 影响 —— 唯一能关掉它的是 `log.sink: off`。
+     实测边界：`log.level: off` 下 401 仍写审计行（带 peer / presented），事件行归零。
+   - 两类行共用一个目的地 + 一把锁 → 按时间交错，"503 在索引重建前还是后"不用跨文件对时间戳。
+     整行在同一锁内写完（stderr 共享，两个 worker 各写半行会产出无法解析的行）。
+   - 事件：`pool_busy`(warn) / `lease_wait`(info) / `pipeline_error`(error) / `unknown_tool`(mcp)。
+     `lease_wait` 从 warn 降到 info：48 并发实测压出 87 行，默认级别不该为"排队前兆"刷屏。
+   - **改名后的迁移**：编辑距离跨不过改名（`log.audit`→`log.sink` 差 5），所以给候选建议加了
+     **同组**规则（前缀相同即列出该组全部键）。这是通用改进，不留永久别名。
+
+7. **本轮发现并修掉的架构级误解（重要，别退回去）**：README 与 CHANGELOG 都写着"背压就是 worker
+   池，池满回 503"。实测**默认配置下这条永远不会成立**：httplib 在 `listen_internal` 里只建
+   **一个共享任务队列**（`new_task_queue` 工厂只调用一次），线程数 = `--workers`，于是最多
+   `workers` 个 handler 并发，而每个 handler 要 pipeline 时必有空闲 → `PipelinePool::acquire`
+   从不等待 → 503 与 `pool_busy` 都是死代码（80 并发实测 0 次 503）。排队实际发生在 httplib
+   任务队列里，服务端**看不见**（没有 accept 时间戳，`request_ms` 直方图也不含它）。
+   - 处理：保留默认（`http_threads == workers`，不超订解码、内存有界），新增 `--http-threads`
+     显式解耦。设高之后池子才成为准入点：`--workers 2 --http-threads 16 --queue-timeout-ms 1`，
+     32 并发 → **30×503 + 30 条 pool_busy**（`waited_ms`/`workers`/`timeout_ms` 可查）。
+   - 代价写进 README：`http_threads` 张图并发解码（受 max-image-pixels 约束）+ CPU 超订。
+   - MCP HTTP 传输此前**没设** task queue，跑在 httplib 默认 `max(8, cores-1)` 上 → `--workers`
+     只约束 pipeline 数不约束并发，两个外壳行为分叉；现已统一为同一规则。
+   - `--queue-timeout-ms` 取代三处硬编码超时（2000/5000/5000）。
+   - 结论：`request_ms` 只覆盖 handler 内部；accept→handler 的排队要靠客户端观测或
+     `ss -lnt` 的 Recv-Q。若将来要做真正的边缘 shedding，需要 httplib 之外的 accept 层计数。
 7. 可选项：CLI 的 `compare`/`verify` 子命令（与 server/MCP 对齐）。
 
 > 更新本文件时：任何架构决策变更（并发模型、MCP tool 列表、API 端点）必须在此同步，并记录变更原因，防止 compaction 后记忆丢失。

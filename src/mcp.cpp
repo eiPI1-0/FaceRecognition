@@ -1,6 +1,7 @@
 #include "mcp.hpp"
 
 #include "auth.hpp"
+#include "log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -355,7 +356,7 @@ std::string tools_list_json() {
 // 单条 JSON-RPC 消息 -> 响应（notification 返回空串）。
 // 这是唯一的协议实现：stdio 与 HTTP 两种传输都走这里，行为不可能分叉。
 std::string handle_message(PipelinePool& pool, const std::string& msg, int max_pixels,
-                           ResultCache* cache) {
+                           ResultCache* cache, const Log& log, int queue_timeout_ms) {
     const std::string id = extract_id(msg);
     const std::string method = json::string(msg, "method");
     if (method.empty()) {
@@ -396,8 +397,19 @@ std::string handle_message(PipelinePool& pool, const std::string& msg, int max_p
         }
         const std::string args = json::object(params, "arguments");
 
-        Lease lease(pool, std::chrono::milliseconds(10000));
+        // 与 serve 同一个策略：排队有上限，满了要说得出"满了多久、当时几个 worker"，
+        // 而不是只回一句 "server busy, try again"。
+        const auto t0 = std::chrono::steady_clock::now();
+        Lease lease(pool, std::chrono::milliseconds(queue_timeout_ms));
+        const long long wait_ms = static_cast<long long>(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count());
         if (!lease) {
+            log.event(LogLevel::Warn, "pool_busy",
+                      std::string("\"tool\":\"") + json_escape(name) +
+                          "\",\"waited_ms\":" + std::to_string(wait_ms) + ",\"timeout_ms\":" +
+                          std::to_string(queue_timeout_ms) + ",\"workers\":" +
+                          std::to_string(pool.size()));
             return rpc_result(id, tool_err("server busy, try again"));
         }
         // 缓存键用参数里 base64 串的摘要：同一张图 -> 同一串 -> 同一键，
@@ -405,6 +417,10 @@ std::string handle_message(PipelinePool& pool, const std::string& msg, int max_p
         const std::string image_sha = sha256_hex(json::string(args, "image_b64"));
         std::string result = dispatch_tool(*lease.get(), name, args, max_pixels, cache, image_sha);
         if (result.empty()) {
+            // 值得留一行：调用方是谁（caller）+ 它要的是什么工具，是判断"提示注入在探
+            // enroll"这类行为的唯一线索，而 MCP 侧没有 /metrics 可看。
+            log.event(LogLevel::Warn, "unknown_tool",
+                      std::string("\"requested\":\"") + json_escape(name) + '"');
             return rpc_error(id, -32602, "unknown tool: " + name);
         }
         return rpc_result(id, result);
@@ -418,13 +434,16 @@ std::string handle_message(PipelinePool& pool, const std::string& msg, int max_p
 // ---------------------------------------------------------------------------
 
 // stdio：每行一条 JSON-RPC 消息。stdout 是协议通道，**任何日志都必须走 stderr**。
-int serve_stdio(PipelinePool& pool, const McpOptions& opt, ResultCache& cache) {
+int serve_stdio(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
+                const Log& log) {
     std::cerr << "facerec mcp: stdio transport, " << pool.size() << " worker(s), gallery "
               << pool.gallery_size() << " person(s)" << std::endl;
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
-        std::string response = handle_message(pool, line, opt.max_image_pixels, &cache);
+        std::string response =
+            handle_message(pool, line, opt.max_image_pixels, &cache, log,
+                           opt.queue_timeout_ms);
         if (!response.empty()) {
             std::cout << response << '\n' << std::flush;
         }
@@ -435,17 +454,21 @@ int serve_stdio(PipelinePool& pool, const McpOptions& opt, ResultCache& cache) {
 
 struct Access {
     TokenTable tokens;
-    AuditSink audit;
+    Log log;
 };
 
 int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
                const Access& access) {
     httplib::Server svr;
+    // 与 serve 同一条规则：之前没设，跑在 httplib 默认线程池 max(8, cores-1) 上，
+    // 于是 --workers 只约束 pipeline 数、不约束并发（两个外壳行为分叉）。
+    const int http_threads = opt.http_threads > 0 ? opt.http_threads : pool.size();
+    svr.new_task_queue = [http_threads] { return new httplib::ThreadPool(http_threads); };
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
 
     // 与 serve 同一套：/healthz 免鉴权，其余要 bearer；审计行不含 person_id（PLAN.md D1/D3）。
     // MCP 传输层不暴露 /metrics，也就没有 Metrics 实例（见 auth.hpp 的参数说明）。
-    install_access_control(svr, access.tokens, opt.quiet, access.audit, /*is_mcp=*/true,
+    install_access_control(svr, access.tokens, opt.quiet, access.log, /*is_mcp=*/true,
                            /*metrics=*/nullptr);
 
     svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
@@ -454,10 +477,10 @@ int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
 
     // streamable HTTP 传输：客户端 POST 一条 JSON-RPC 消息，服务端回 JSON。
     // 通知（无 id）按规范回 202 Accepted 且不携带响应体。
-    svr.Post("/mcp", [&pool, &opt, &cache](const httplib::Request& req,
+    svr.Post("/mcp", [&pool, &opt, &cache, &access](const httplib::Request& req,
                                             httplib::Response& res) {
-        const std::string response =
-            handle_message(pool, req.body, opt.max_image_pixels, &cache);
+        const std::string response = handle_message(pool, req.body, opt.max_image_pixels, &cache,
+                                                    access.log, opt.queue_timeout_ms);
         if (response.empty()) {
             res.status = 202;
             return;
@@ -513,8 +536,12 @@ int run_mcp(const PipelineConfig& cfg, const McpOptions& opt) {
     }
     {
         std::string err;
-        if (!access.audit.configure(cfg.log_audit, err)) {
-            std::cerr << "Fatal: log.audit: " << err << std::endl;
+        if (!access.log.configure(cfg.log_sink, err)) {
+            std::cerr << "Fatal: log.sink: " << err << std::endl;
+            return -1;
+        }
+        if (!access.log.set_level(cfg.log_level, err)) {
+            std::cerr << "Fatal: " << err << std::endl;
             return -1;
         }
     }
@@ -532,10 +559,10 @@ int run_mcp(const PipelineConfig& cfg, const McpOptions& opt) {
            << (access.tokens.empty() ? "off"
                                      : std::to_string(access.tokens.size()) + " token(s)")
            << "\"";
-        audit_event(access.audit, "startup", os.str());
+        access.log.audit("startup", os.str());
     }
     return opt.transport == McpTransport::Http ? serve_http(pool, opt, cache, access)
-                                               : serve_stdio(pool, opt, cache);
+                                               : serve_stdio(pool, opt, cache, access.log);
 }
 
 }  // namespace facerec

@@ -33,6 +33,7 @@ add_executable(main
     src/result_cache.cpp
     src/sha256.cpp
     src/gallery.cpp
+    src/log.cpp
     src/metrics.cpp
     face_tracker.cpp
 )

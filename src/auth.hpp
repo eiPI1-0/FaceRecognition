@@ -17,6 +17,8 @@
 
 #include <httplib.h>
 
+#include "log.hpp"
+
 namespace facerec {
 
 class Metrics;
@@ -50,18 +52,6 @@ const std::string& current_caller();
 
 bool is_loopback_host(const std::string& host);
 
-// 审计/访问日志：一行一个 JSON 对象。查询行不含 person_id / 名字 / embedding / 图像字节，
-// 见 PLAN.md D1 的理由。
-struct AuditSink {
-    enum Kind { Off, Stderr, File };
-    Kind kind = Stderr;
-    std::string path;
-
-    // spec: "off" | "stderr" | 其它=文件路径（追加写）。文件打不开算配置错误。
-    bool configure(const std::string& spec, std::string& err);
-    void emit(const std::string& json_object) const;
-};
-
 // 把鉴权与访问日志装到任何一个 httplib::Server 上（serve 与 mcp --transport http 共用）。
 //   - 除 /healthz、/readyz 外全部需要 `Authorization: Bearer <token>`（token 表为空则放行，
 //     此时启动阶段已保证只绑 loopback）；
@@ -71,11 +61,10 @@ struct AuditSink {
 // metrics 可为空（mcp server 不持有 Metrics）：非空时每个请求计一次
 // `http_requests_total{path,status}`。计数点放在这里而不是各 handler，是为了让
 // "加路由忘了计数" 与 "某个分支漏了错误码" 结构上不可能发生。
+// 审计行经 log.audit() 写出（不受 log.level 影响；查询行不含 person_id / 名字 /
+// embedding / 图像字节，见 PLAN.md D1 的理由）。
 void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool quiet,
-                            const AuditSink& audit, bool is_mcp, Metrics* metrics);
-
-// 非请求事件（startup / enroll / gallery 重建）：fields 是已序列化好的 JSON 片段。
-void audit_event(const AuditSink& sink, const char* kind, const std::string& fields);
+                            const Log& log, bool is_mcp, Metrics* metrics);
 
 // 生成一个新 token（32 字节 CSPRNG 的十六进制）与它在该文件里应有的那一行。
 // 分两步给调用方：token 只显示一次，文件里只存 sha256。

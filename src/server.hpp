@@ -24,7 +24,20 @@ struct ServerOptions {
     // 但 4/8 worker 下吞吐 +32%/+26%、p99 更低 —— 每个 worker 再开 16 线程只会互相抢核。
     // 单 worker + 大 batch 或 GPU 后端时才值得调大。
     int cv_threads = 1;
-    bool quiet = false;          // 抑制每请求访问日志
+    // 拿不到 pipeline 时的排队上限：超时回 503，而不是无限排队。它决定背压落在这里还是
+    // 落到客户端，所以是运维旋钮而不是实现细节；配套的可观测信号是 `pool_busy` 事件与
+    // http_requests_total{status="503"}。三个用 pipeline 的路由共用它。
+    int queue_timeout_ms = 5000;
+    // HTTP 层线程数。0 = 等于 workers（默认，也是最保守的正确值：解码与推理都不超订，
+    // 内存上限就是 workers 张解码后的图）。此时 handler 永远拿得到 pipeline，
+    // PipelinePool 不构成准入点，503 与 pool_busy 都不会出现 —— 排队发生在 httplib 的
+    // 任务队列里，服务端看不见。
+    // 设为 > workers 时 PipelinePool 才真正成为准入点：等不到就 503 + pool_busy 事件，
+    // 排队时长可测（waited_ms）。代价是 http_threads 张并发解码的图（受 max-image-pixels
+    // 约束）与 CPU 超订，只有在"解码/排队要和推理重叠"或"pipeline 比核数少（RSS 预算）"
+    // 时才值得。
+    int http_threads = 0;
+    bool quiet = false;          // 抑制每请求访问日志（只影响日志量，不影响指标）
     // 端口冲突策略。false（默认）：SO_REUSEADDR 开 + SO_REUSEPORT 关 —— 端口被活着的
     // 监听者占用时**启动失败**，而不是与它静默分摊连接（httplib 的默认值正是后者，见
     // server.cpp 里那段注释）。true：开 SO_REUSEPORT，多个进程绑同一端口由内核分流，

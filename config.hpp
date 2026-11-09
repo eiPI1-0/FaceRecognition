@@ -25,8 +25,12 @@ struct PipelineConfig {
     // 进程内 bearer 鉴权（PLAN.md D3）：空 = 关闭，此时只允许绑 loopback。
     // 文件只存 sha256，磁盘上没有可用凭据；`./main token --name x` 生成一行。
     std::string auth_tokens_file = "";
-    // 审计/访问日志：stderr（默认）| off | 文件路径。查询行不含 person_id（PLAN.md D1）。
-    std::string log_audit = "stderr";
+    // 结构化日志目的地：stderr（默认）| off | 文件路径。审计行与运行行共用它 ——
+    // 同一份 JSON-lines 流按时间交错，排障不需要跨文件对时间戳。查询行不含 person_id。
+    std::string log_sink = "stderr";
+    // 运行日志级别：off|error|warn|info|debug。审计行不受它影响（安全记录不能被静音），
+    // 唯一能关掉审计的是 log_sink: off —— 那是显式配置动作，不是调级别的手滑。
+    std::string log_level = "warn";
 
     // 模型契约：改错不会崩，只会输出垃圾。只应在换模型文件时一同修改。
     int detector_input_w = 160, detector_input_h = 120;   // YuNet + PriorBox::decode 的先验框布局

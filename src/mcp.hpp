@@ -21,6 +21,13 @@ struct McpOptions {
     int max_request_mb = 32;
     int max_image_pixels = 40000000;
     int cache_entries = 256;     // 识别结果缓存条目数；0 = 关闭
+    // 拿不到 pipeline 时的排队上限（与 serve 同一个旋钮）：超时后 tool 结果是
+    // "server busy"，并发一条 pool_busy 事件。
+    int queue_timeout_ms = 5000;
+    // HTTP 传输的线程数。0 = 等于 workers。之前这里是 httplib 的默认值
+    // max(8, cores-1)，与 --workers 无关 —— 于是 pipeline 池才是真正的准入点，
+    // 而 serve 却不是，两个外壳的行为分叉了。现在两边同一个规则。
+    int http_threads = 0;
     bool quiet = false;
 };
 

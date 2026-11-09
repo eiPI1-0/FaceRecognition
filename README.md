@@ -225,7 +225,7 @@ curl -H "Authorization: Bearer <token>" -X POST --data-binary @photo.jpg \
 `tokens.txt` is line-based (`name:sha256:<64 hex>`, `#` comments), compared in constant time, and
 written `0600` — the file holds no usable credential, so a leaked copy is not a leaked key.
 `/healthz` and `/readyz` stay open (probes); everything else, `/metrics` included, needs the
-token. Every request is one JSON line on `log.audit` (`stderr` by default, or a file path, or
+token. Every request is one JSON line on `log.sink` (`stderr` by default, or a file path, or
 `off`), and `--quiet` silences only successes — a refused request is always logged, because a
 silent brute-force attempt is exactly what you cannot afford:
 
@@ -252,6 +252,35 @@ wrote), because writing a template is the irreversible act.
   route can never be under-counted and an early-return branch can never be missed.
   Note: counters are **per process**; with `--reuseport` a scrape lands on one arbitrary
   instance, so aggregate across instances (see `deploy/`) instead of trusting a single scrape.
+- **Logging: one JSON-lines stream, two guarantees.** `log.sink` picks the destination
+  (`stderr` default, `off`, or a file path); `log.level` (`off|error|warn|info|debug`, default
+  `warn`) filters **operational** events only. Audit lines ignore the level — the only way to
+  silence them is `log.sink: off`, which is a deliberate configuration act, not a level slip.
+  Both kinds share one destination and one lock, so they interleave in time order: "was the 503
+  before or after the index rebuild" does not require correlating two files. Measured: with
+  `log.level: off` a 401 still produces its audit line (with peer address and whether a token was
+  presented) while every event line disappears.
+  Events: `pool_busy` (warn — a 503 the client actually received, with `waited_ms`, `workers`,
+  `timeout_ms`), `lease_wait` (info — saturation precursor; 48 concurrent requests produce ~87 of
+  these, which is why it is not warn), `pipeline_error` (error — the exception text otherwise
+  only ever reaches the response body), `unknown_tool` (MCP: the trace a prompt-injection probe
+  for `enroll_person` leaves server-side).
+- **Backpressure has two shapes, and only one of them is visible by default.**
+  `new_task_queue` is set to `--http-threads` (default: equal to `--workers`). With them equal —
+  the default — at most `workers` handlers run, so a pipeline is always free when a handler asks:
+  `PipelinePool` never blocks, and **neither the 503 nor `pool_busy` can fire**; queuing happens
+  inside httplib's task queue, where the server cannot see it, so the only symptom is growing
+  client-side latency. Setting `--http-threads` above `--workers` makes `PipelinePool` the real
+  admission point, and then the valve works: measured with `--workers 2 --http-threads 16
+  --queue-timeout-ms 1`, 32 concurrent requests gave **30×503 + 30 `pool_busy` lines**. The cost
+  of raising it is real: `http_threads` images may be decoded concurrently (each bounded by
+  `--max-image-pixels`) and CPU is oversubscribed, so raise it only when you want the 503 to mean
+  something or want decode to overlap inference. The MCP HTTP transport previously ran on
+  httplib's own default pool (`max(8, cores-1)`), so `--workers` bounded pipelines but not
+  concurrency there — it now follows the same rule.
+- `--queue-timeout-ms` (default 5000) is how long a request waits for a free pipeline before it
+  gets 503; it applies to all three pipeline-using routes (`/v1/identify`, `/v1/embed`,
+  `/v1/people`), replacing three hard-coded numbers (2000/5000/5000).
 - SIGINT/SIGTERM stops accepting new connections and lets in-flight handlers finish.
 - The listen backlog is set to 1024 (`CPPHTTPLIB_LISTEN_BACKLOG`, see `CMakeLists.txt`);
   cpp-httplib's default of 5 makes the kernel drop SYNs past 5 simultaneous connects, which
@@ -299,8 +328,9 @@ Verified here: two processes on one port, `ss -lnt` shows two LISTEN lines, and 
 - `/metrics` is **per process**. With `--reuseport` a scrape reaches one arbitrary instance, so
   configure one scrape target per instance (or a sidecar) and sum in PromQL; a single scrape is a
   sample, not the total.
-- `log.audit: stderr` is the default and is the right choice in a container (the orchestrator
-  collects stdout); no log-volume mount needed.
+- `log.sink: stderr` is the default and is the right choice in a container: the orchestrator
+  collects stderr alongside the stdout banner, so no log-volume mount is needed. (`log.sink` is
+  the renamed `log.audit`; operational lines from `log.level` go to the same stream.)
 - The runtime dependency on openSUSE Leap 16 is the **single** `libopencv413` package — there is no
   per-module `libopencv_core413` (§ note: `rpm -qf /usr/lib64/libopencv_core.so.413`).
 

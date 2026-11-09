@@ -578,6 +578,26 @@ int cmd_serve(int argc, char* argv[]) {
                 std::cerr << "--cache-entries expects an integer" << std::endl;
                 return -1;
             }
+        } else if (arg == "--http-threads" || arg.rfind("--http-threads=", 0) == 0) {
+            try { opt.http_threads = std::stoi(value_of("--http-threads")); } catch (...) {
+                std::cerr << "--http-threads expects an integer" << std::endl;
+                return -1;
+            }
+            if (opt.http_threads < 1) {
+                std::cerr << "--http-threads must be >= 1 (default = same as --workers)"
+                          << std::endl;
+                return -1;
+            }
+        } else if (arg == "--queue-timeout-ms" || arg.rfind("--queue-timeout-ms=", 0) == 0) {
+            try { opt.queue_timeout_ms = std::stoi(value_of("--queue-timeout-ms")); } catch (...) {
+                std::cerr << "--queue-timeout-ms expects an integer" << std::endl;
+                return -1;
+            }
+            if (opt.queue_timeout_ms < 0) {
+                std::cerr << "--queue-timeout-ms must be >= 0 (0 = fail immediately when busy)"
+                          << std::endl;
+                return -1;
+            }
         } else if (arg == "--reuseport") {
             opt.reuseport = true;
         } else if (arg == "--quiet") {
@@ -597,11 +617,13 @@ int cmd_serve(int argc, char* argv[]) {
     if (show_help) {
         std::cout << "Usage: facerec serve [--host 127.0.0.1] [--port 8080] [--workers N]\n"
                   << "                     [--cv-threads 1] [--max-request-mb 32] [--cache-entries 256]\n"
-                  << "                     [--reuseport] [--quiet]\n"
+                  << "                     [--reuseport] [--quiet] [--queue-timeout-ms 5000]\n"
+                  << "                     [--http-threads N]\n"
                   << "                     [--config <path>] [--set key=value]\n"
                   << "  --workers     pipeline instances / concurrent requests (default: CPU count)\n"
                   << "  --cv-threads  OpenCV internal thread pool per worker (default: 1)\n"
                   << "  --reuseport   SO_REUSEPORT: run N processes on one port (kernel load-balances)\n"
+                  << "  --queue-timeout-ms  how long to wait for a free pipeline before 503\n"
                   << "Endpoints: POST /v1/identify /v1/embed /v1/compare, GET /v1/people,\n"
                   << "           GET /healthz, GET /readyz\n";
         return 0;
@@ -656,6 +678,26 @@ int cmd_mcp(int argc, char* argv[]) {
                 std::cerr << "--max-request-mb expects an integer" << std::endl;
                 return -1;
             }
+        } else if (arg == "--http-threads" || arg.rfind("--http-threads=", 0) == 0) {
+            try { opt.http_threads = std::stoi(value_of("--http-threads")); } catch (...) {
+                std::cerr << "--http-threads expects an integer" << std::endl;
+                return -1;
+            }
+            if (opt.http_threads < 1) {
+                std::cerr << "--http-threads must be >= 1 (default = same as --workers)"
+                          << std::endl;
+                return -1;
+            }
+        } else if (arg == "--queue-timeout-ms" || arg.rfind("--queue-timeout-ms=", 0) == 0) {
+            try { opt.queue_timeout_ms = std::stoi(value_of("--queue-timeout-ms")); } catch (...) {
+                std::cerr << "--queue-timeout-ms expects an integer" << std::endl;
+                return -1;
+            }
+            if (opt.queue_timeout_ms < 0) {
+                std::cerr << "--queue-timeout-ms must be >= 0 (0 = fail immediately when busy)"
+                          << std::endl;
+                return -1;
+            }
         } else if (arg == "--quiet") {
             opt.quiet = true;
         } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
@@ -673,6 +715,7 @@ int cmd_mcp(int argc, char* argv[]) {
     if (show_help) {
         std::cout << "Usage: facerec mcp [--transport stdio|http] [--host H] [--port P]\n"
                   << "                   [--workers N] [--max-request-mb 32] [--quiet]\n"
+                  << "                   [--queue-timeout-ms 5000] [--http-threads N]\n"
                   << "                   [--config <path>] [--set key=value]\n"
                   << "\nTools (read-only): identify_faces, compare_faces, list_people, get_face_crop\n"
                   << "Enrollment is deliberately NOT exposed as a tool.\n"

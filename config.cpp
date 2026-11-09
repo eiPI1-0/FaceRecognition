@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <fstream>
 
+#include "log.hpp"   // parse_log_level：把枚举校验放在配置层（file:line 报错）
+
 namespace {
 
 // 极小编辑距离，用于 "recog_thresh" 这类拼错的提示
@@ -48,6 +50,12 @@ std::string normalize_key(const std::string& key) {
 std::string last_segment(const std::string& key) {
     const size_t dot = key.rfind('.');
     return dot == std::string::npos ? key : key.substr(dot + 1);
+}
+
+// 组前缀（`log.audit` → `log`）。空串表示这个 key 没有组，不参与同组提示。
+std::string head_segment(const std::string& key) {
+    const size_t dot = key.find('.');
+    return dot == std::string::npos ? std::string() : key.substr(0, dot);
 }
 
 // 读 knob 当前值（数值类型统一成 double；string 返回 false）
@@ -111,11 +119,17 @@ const std::vector<Knob>& knobs() {
          "only allowed while the server binds a loopback address; a non-loopback `--host` "
          "without this file refuses to start",
          true},
-        {"log.audit", &PipelineConfig::log_audit,
+        {"log.sink", &PipelineConfig::log_sink,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
          "logging",
-         "structured audit/access log: stderr | off | a file path (relative to cwd). One JSON "
-         "object per line; query lines carry no person id, name, embedding or image bytes"},
+         "structured log destination: stderr | off | a file path (relative to cwd). One JSON "
+         "object per line, shared by audit lines and operational lines so they interleave in "
+         "time order; query lines carry no person id, name, embedding or image bytes"},
+        {"log.level", &PipelineConfig::log_level,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "logging",
+         "operational log level: off | error | warn | info | debug (audit lines ignore it - "
+         "only log.sink=off can silence those)"},
 
         {"paths.data_dir", &PipelineConfig::data_dir,
          -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
@@ -210,11 +224,15 @@ bool find_knob(const std::string& key, const Knob** knob, std::vector<std::strin
     // 相近 key 提示：去掉分隔符后比编辑距离（`recogn_thresh` → `recognize.thresh` 只差 3），
     // 或末段相同（拼错末段的常见情形）。
     const std::string want = normalize_key(key);
+    const std::string head = head_segment(key);
     for (const auto& k : knobs()) {
         const bool near = edit_distance(want, normalize_key(k.key)) <= 3;
         // 末段相同也能命中：用户漏掉组前缀时（`thresh` → `recognize.thresh`）
         const bool same_tail = last_segment(key) == last_segment(k.key);
-        if (near || same_tail) candidates->push_back(k.key);
+        // 同组也命中：编辑距离对**改名**无能为力（`log.audit` 与 `log.sink` 差 5），
+        // 而改名后旧配置文件里那一行正是最常见的事故。列出同组全部键，用户自己就能挑对。
+        const bool same_group = !head.empty() && head == head_segment(k.key);
+        if (near || same_tail || same_group) candidates->push_back(k.key);
     }
     return false;
 }
@@ -365,6 +383,15 @@ bool validate_config(const PipelineConfig& cfg, std::string& err,
         if (value < k.lo || value > k.hi) {
             err = std::string(k.key) + ": " + std::to_string(value) + " is out of range " +
                   format_range(k);
+            return false;
+        }
+    }
+
+    {
+        facerec::LogLevel lvl = facerec::LogLevel::Warn;
+        if (!facerec::parse_log_level(cfg.log_level, lvl)) {
+            err = "log.level: '" + cfg.log_level +
+                  "' must be one of off, error, warn, info, debug";
             return false;
         }
     }

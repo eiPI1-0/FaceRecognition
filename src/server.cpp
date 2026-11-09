@@ -20,6 +20,7 @@
 #include "api.hpp"
 #include "encoding.hpp"
 #include "json_util.hpp"
+#include "log.hpp"
 #include "pipeline_pool.hpp"
 #include "metrics.hpp"
 #include "result_cache.hpp"
@@ -184,6 +185,44 @@ int listen_with_signals(::httplib::Server& svr, const std::string& host, int por
     return ok ? 0 : 1;
 }
 
+
+// 等过这个时长但没超时：池子还没满，已经是饱和前兆。warn 级别足够看趋势，不需要每条请求。
+constexpr long long kLeaseWarnMs = 100;
+
+// 借一个 pipeline：顺带计排队时长，满了发 pool_busy，等久了发 lease_wait。
+// 三个用 pipeline 的路由都要这套东西，复制三份必然写歪 —— 本项目第一轮就漏过 /v1/embed。
+// 排队时长只有这里知道：指标给的是 {path,status} 的计数，看不出是池子满了还是这张图特别贵。
+Lease acquire_logged(PipelinePool& pool, const ServerOptions& opt, const Log& log,
+                     const char* route, long long& wait_ms) {
+    const auto t0 = std::chrono::steady_clock::now();
+    Lease lease(pool, std::chrono::milliseconds(opt.queue_timeout_ms));
+    wait_ms = static_cast<long long>(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    const std::string ctx = std::string("\"route\":\"") + route + "\",\"workers\":" +
+                            std::to_string(pool.size()) + ",\"waited_ms\":" +
+                            std::to_string(wait_ms) + ",\"caller\":\"" +
+                            json_escape(current_caller()) + '"';
+    if (!lease) {
+        // 503 在加这段之前是完全不可见的：只回一个响应体，服务端既无日志也无处可查
+        // "满了多久、当时几个 worker"。warn：对应一个真实的客户端失败，量受 503 率约束。
+        log.event(LogLevel::Warn, "pool_busy",
+                  ctx + ",\"timeout_ms\":" + std::to_string(opt.queue_timeout_ms));
+    } else if (wait_ms >= kLeaseWarnMs) {
+        // info 而不是 warn：一淘并发就能压出几十行（实测 48 并发 → 87 行），默认级别不该
+        // 为"排队前兆"刷屏。事故时把 log.level 调到 info，饱和趋势立刻可见。
+        log.event(LogLevel::Info, "lease_wait", ctx);
+    }
+    return lease;
+}
+
+// pipeline 抛异常的结构化说明。异常文本只进响应体的话，一次事故只在客户端那一侧留痕，
+// 服务端日志里搜不到任何东西。
+void log_pipeline_error(const Log& log, const char* route, const cv::Exception& e) {
+    log.event(LogLevel::Error, "pipeline_error",
+              std::string("\"route\":\"") + route + "\",\"msg\":\"" + json_escape(e.what()) +
+                  "\",\"caller\":\"" + json_escape(current_caller()) + '"');
+}
+
 int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     // ---- 鉴权与审计 ----
     // 安全是绑定约束而不是开关：没有 token 表就只允许绑 loopback。这样"忘了配鉴权又对外监听"
@@ -204,11 +243,17 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
                      "./tokens.txt" << std::endl;
         return -1;
     }
-    AuditSink audit;
+    // 级别由 validate_config 在进 run_server 之前查过；这里再设一次是防御 —— 直接调
+    // run_server 的路径不该静默拿到默认级别。
+    Log log;
     {
         std::string err;
-        if (!audit.configure(cfg.log_audit, err)) {
-            std::cerr << "Fatal: log.audit: " << err << std::endl;
+        if (!log.configure(cfg.log_sink, err)) {
+            std::cerr << "Fatal: log.sink: " << err << std::endl;
+            return -1;
+        }
+        if (!log.set_level(cfg.log_level, err)) {
+            std::cerr << "Fatal: " << err << std::endl;
             return -1;
         }
     }
@@ -243,7 +288,10 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
               << std::endl;
 
     httplib::Server svr;
-    svr.new_task_queue = [workers] { return new httplib::ThreadPool(workers); };
+    // 见 ServerOptions::http_threads：默认与 workers 相等（不超订），调高才让 PipelinePool
+    // 变成准入点。
+    const int http_threads = opt.http_threads > 0 ? opt.http_threads : workers;
+    svr.new_task_queue = [http_threads] { return new httplib::ThreadPool(http_threads); };
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
     svr.set_read_timeout(10, 0);
     svr.set_write_timeout(30, 0);
@@ -251,7 +299,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
 
     // 鉴权 + 结构化审计（PLAN.md D1/D3）：探针免鉴权，其余全要 bearer；
     // 401 永远记审计，成功行受 --quiet 影响。
-    install_access_control(svr, auth, opt.quiet, audit, /*is_mcp=*/false, &metrics);
+    install_access_control(svr, auth, opt.quiet, log, /*is_mcp=*/false, &metrics);
 
     // ---- 指标 ----
     svr.Get("/metrics", [&metrics, &cache](const httplib::Request&, httplib::Response& res) {
@@ -284,8 +332,9 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         set_json(res, 200, os.str());
     });
 
-    svr.Get("/v1/people", [&pool](const httplib::Request&, httplib::Response& res) {
-        Lease lease(pool, std::chrono::milliseconds(2000));
+    svr.Get("/v1/people", [&pool, &opt, &log](const httplib::Request&, httplib::Response& res) {
+        long long wait_ms = 0;
+        Lease lease = acquire_logged(pool, opt, log, "/v1/people", wait_ms);
         if (!lease) {
             set_json(res, 503, error_to_json("server busy", "unavailable"));
             return;
@@ -294,8 +343,10 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     });
 
     // ---- 识别 ----
-    svr.Post("/v1/identify", [&pool, &opt, &cache, &metrics](const httplib::Request& req,
-                                                             httplib::Response& res) {
+    svr.Post("/v1/identify",
+             [&pool, &opt, &cache, &metrics, &log](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        constexpr const char* ROUTE = "/v1/identify";
         const auto t_request = std::chrono::steady_clock::now();
         // 请求数与错误数不在这里计：auth.cpp 的访问日志钩子按 {path,status} 统一计，
         // 否则 400 bad_request / 503 server busy 这类早退分支必然漏计。
@@ -333,7 +384,8 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
             return;
         }
 
-        Lease lease(pool, std::chrono::milliseconds(5000));
+        long long wait_ms = 0;
+        Lease lease = acquire_logged(pool, opt, log, ROUTE, wait_ms);
         if (!lease) {
             set_json(res, 503, error_to_json("server busy", "unavailable"));
             return;
@@ -348,13 +400,15 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
             res.set_header("X-Cache", "MISS");
             set_json(res, 200, identify_to_json(result, iopt));
         } catch (const cv::Exception& e) {
+            log_pipeline_error(log, ROUTE, e);
             set_json(res, 500, error_to_json(e.what(), "pipeline_error"));
         }
     });
 
     // ---- 提特征 ----
-    svr.Post("/v1/embed", [&pool, &opt](const httplib::Request& req,
-                                        httplib::Response& res) {
+    svr.Post("/v1/embed", [&pool, &opt, &log](const httplib::Request& req,
+                                              httplib::Response& res) {
+        constexpr const char* ROUTE = "/v1/embed";
         std::string bytes, err;
         if (!image_bytes_from_request(req, bytes, err)) {
             set_json(res, 400, error_to_json(err, "bad_request"));
@@ -370,7 +424,8 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         double num = 0;
         if (json::number(req.body, "face_index", num)) face_index = static_cast<int>(num);
 
-        Lease lease(pool, std::chrono::milliseconds(5000));
+        long long wait_ms = 0;
+        Lease lease = acquire_logged(pool, opt, log, ROUTE, wait_ms);
         if (!lease) {
             set_json(res, 503, error_to_json("server busy", "unavailable"));
             return;
@@ -392,6 +447,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
             os << "]}";
             set_json(res, 200, os.str());
         } catch (const cv::Exception& e) {
+            log_pipeline_error(log, ROUTE, e);
             set_json(res, 500, error_to_json(e.what(), "pipeline_error"));
         }
     });
@@ -435,8 +491,10 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
 
     // ---- 启动 ----
     std::cout << "Listening on http://" << opt.host << ":" << opt.port
-              << "  (workers=" << workers << (opt.reuseport ? ", SO_REUSEPORT" : "") << ")"
-              << std::endl;
+              << "  (workers=" << workers << ", http-threads=" << http_threads
+              << ", queue-timeout=" << opt.queue_timeout_ms << "ms"
+              << ", log=" << log_level_name(log.level())
+              << (opt.reuseport ? ", SO_REUSEPORT" : "") << ")" << std::endl;
     {
         std::ostringstream os;
         os << "\"host\":\"" << json_escape(opt.host) << "\",\"port\":"
@@ -446,7 +504,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
            << "\",\"embedder\":\"" << json_escape(cfg.embedder_model)
            << "\",\"auth\":\"" << (auth.empty() ? "off" : std::to_string(auth.size()) + " token(s)")
            << "\"";
-        audit_event(audit, "startup", os.str());
+        log.audit("startup", os.str());
     }
 
     if (listen_with_signals(svr, opt.host, opt.port, opt.reuseport) != 0) {

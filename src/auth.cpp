@@ -51,21 +51,6 @@ bool ct_equal(const std::string& a, const std::string& b) {
     return diff == 0;
 }
 
-std::string iso8601_now() {
-    using namespace std::chrono;
-    const auto now = system_clock::now();
-    const auto secs = time_point_cast<seconds>(now);
-    const auto ms = duration_cast<milliseconds>(now - secs).count();
-    const std::time_t t = system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    char buf[40];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tm.tm_year + 1900,
-                  tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-                  static_cast<int>(ms));
-    return buf;
-}
-
 // `Authorization: Bearer <token>`，大小写不敏感地匹配 scheme。
 std::string bearer(const httplib::Request& req) {
     const std::string auth = req.get_header_value("Authorization");
@@ -170,55 +155,12 @@ bool TokenTable::authenticate(const std::string& token, std::string& caller) con
     return true;
 }
 
-bool AuditSink::configure(const std::string& spec, std::string& err) {
-    if (spec == "off") {
-        kind = Off;
-        path.clear();
-        return true;
-    }
-    if (spec.empty() || spec == "stderr") {
-        kind = Stderr;
-        path.clear();
-        return true;
-    }
-    // 打开一次确认可写：启动期失败好过运行时每行都静默丢掉。
-    {
-        std::ofstream probe(spec, std::ios::app);
-        if (!probe) {
-            err = "cannot open audit log for append: " + spec;
-            return false;
-        }
-    }
-    kind = File;
-    path = spec;
-    return true;
-}
-
-void AuditSink::emit(const std::string& json_object) const {
-    if (kind == Off) return;
-    if (kind == Stderr) {
-        std::cerr << json_object << '\n';
-        return;
-    }
-    // 每次 open/append/close：O_APPEND 下的单次写是原子的，多线程无需再加锁。
-    std::ofstream out(path, std::ios::app);
-    if (out) out << json_object << '\n';
-}
-
-void audit_event(const AuditSink& sink, const char* kind, const std::string& fields) {
-    std::ostringstream os;
-    os << "{\"audit\":\"" << kind << "\",\"ts\":\"" << iso8601_now() << "\"";
-    if (!fields.empty()) os << ',' << fields;
-    os << '}';
-    sink.emit(os.str());
-}
-
 void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool quiet,
-                            const AuditSink& audit, bool is_mcp, Metrics* metrics) {
+                            const Log& log, bool is_mcp, Metrics* metrics) {
     const char* svc = is_mcp ? "mcp" : "http";
 
-    svr.set_pre_routing_handler([&tokens, &audit, svc](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    svr.set_pre_routing_handler([&tokens, svc](const httplib::Request& req,
+                                                httplib::Response& res) {
         tl_caller.clear();
         tl_request_start = std::chrono::steady_clock::now();
         if (tokens.empty() || is_probe_path(req.path)) {
@@ -237,8 +179,8 @@ void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    svr.set_logger([quiet, &audit, svc, metrics](const httplib::Request& req,
-                                                const httplib::Response& res) {
+    svr.set_logger([quiet, &log, svc, metrics](const httplib::Request& req,
+                                               const httplib::Response& res) {
         // 计数在**所有提前返回之前**：quiet 与"探针成功不记日志"只影响日志量，
         // 不该让流量从指标里消失（否则 quiet 生产部署的 requests 恒为 0）。
         if (metrics) {
@@ -251,12 +193,12 @@ void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                      tl_request_start)
                 .count();
+        // 只拼字段：时间戳与 "audit" 键由 Log 统一加（同一份流里两类行的 ts 格式必须一致）。
         std::ostringstream os;
-        os << "{\"audit\":\"request\",\"ts\":\"" << iso8601_now() << "\",\"svc\":\"" << svc
-           << "\",\"method\":\"" << json_escape(req.method) << "\",\"path\":\""
-           << json_escape(req.path) << "\",\"status\":" << res.status << ",\"ms\":"
-           << static_cast<long long>(ms) << ",\"caller\":\"" << json_escape(current_caller())
-           << "\",\"bytes\":" << req.body.size();
+        os << "\"svc\":\"" << svc << "\",\"method\":\"" << json_escape(req.method)
+           << "\",\"path\":\"" << json_escape(req.path) << "\",\"status\":" << res.status
+           << ",\"ms\":" << static_cast<long long>(ms) << ",\"caller\":\""
+           << json_escape(current_caller()) << "\",\"bytes\":" << req.body.size();
         if (res.status == 401) {
             // 拒绝永远是安全事件：即使 --quiet 也记，且带上对端与"是否出示了 token"。
             os << ",\"auth\":\"denied\",\"peer\":\""
@@ -264,8 +206,7 @@ void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool
                << "\",\"presented\":"
                << (req.get_header_value("Authorization").empty() ? "false" : "true");
         }
-        os << '}';
-        audit.emit(os.str());
+        log.audit("request", os.str());
     });
 }
 

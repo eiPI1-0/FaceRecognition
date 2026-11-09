@@ -15,8 +15,10 @@ paths.gallery_index: gallery.idx
 auth.tokens_file: 
 
 # --- logging ---
-# structured audit/access log: stderr | off | a file path (relative to cwd). One JSON object per line; query lines carry no person id, name, embedding or image bytes
-log.audit: stderr
+# structured log destination: stderr | off | a file path (relative to cwd). One JSON object per line, shared by audit lines and operational lines so they interleave in time order; query lines carry no person id, name, embedding or image bytes
+log.sink: stderr
+# operational log level: off | error | warn | info | debug (audit lines ignore it - only log.sink=off can silence those)
+log.level: warn
 
 # --- paths ---
 # one subfolder per enrolled person

@@ -22,6 +22,29 @@ than a strict versioning scheme.
     proxy to a loopback-bound instance. nginx does no load balancing, because the kernel already
     does; it only does edge work.
 
+### Added
+
+- **Operational log levels: `log.level` (`off|error|warn|info|debug`, default `warn`).**
+  `src/log.{hpp,cpp}` is now the single structured-log writer: one JSON-lines stream, one
+  destination (`log.sink`, renamed from `log.audit`), one lock, so audit and operational lines
+  interleave in time order instead of living in two places. The two kinds keep different
+  guarantees — `audit(...)` is never filtered by level (only `log.sink: off` silences it),
+  `event(...)` is. Measured: at `log.level: off` a 401 still writes its audit line with peer and
+  `presented`, while every event line disappears.
+  Events: `pool_busy` (warn), `lease_wait` (info), `pipeline_error` (error), `unknown_tool` (MCP).
+  Until now a 503 left no server-side trace at all, and an exception's text reached only the
+  response body.
+- **`--http-threads`** (serve and MCP HTTP): the transport thread count. Default equals
+  `--workers`, which means a pipeline is always free when a handler asks it — so the pool is not
+  the admission point and 503/`pool_busy` cannot fire. Raising it makes them fire for real
+  (measured: `--workers 2 --http-threads 16 --queue-timeout-ms 1`, 32 concurrent → 30×503 with
+  30 `pool_busy` lines), at the cost of concurrent decodes and CPU oversubscription.
+- **`--queue-timeout-ms`** (serve and MCP HTTP): replaces three hard-coded lease timeouts
+  (2000 / 5000 / 5000 ms) with one backpressure knob.
+- Key suggestions now also match on **group**: `log.audit` (renamed) previously matched nothing
+  and dumped the whole table; it now answers `did you mean log.sink log.level`. Edit distance
+  cannot bridge a rename, group membership can.
+
 ### Changed
 
 - **`facerec_requests_total` / `facerec_request_errors_total` are gone**; both were wrong in a way

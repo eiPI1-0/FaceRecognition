@@ -51,6 +51,9 @@ public:
     ~Lease() { if (p_) pool_.release(p_); }
     Lease(const Lease&) = delete;
     Lease& operator=(const Lease&) = delete;
+    // 移动是为了能把"借出 + 计时 + 满了发事件"抽成一个函数返回（见 server.cpp 的
+    // acquire_logged）；复制一直是禁止的，双 release 会比编译错误更糟。
+    Lease(Lease&& o) noexcept : pool_(o.pool_), p_(o.p_) { o.p_ = nullptr; }
     Pipeline* get() const { return p_; }
     explicit operator bool() const { return p_ != nullptr; }
 
