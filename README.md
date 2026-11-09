@@ -121,6 +121,8 @@ commands are for scripting, services and LLM tool use.
 ./main serve    [--host H] [--port P] [--workers N]    # HTTP service
 ./main demo     <source> [cpu|cuda|openvino] [batch|nobatch]
 ./main mcp    [--transport stdio|http] [--port P]    # MCP tools for LLM clients
+./main compare  <img-a> <img-b>                      # cosine between two images' faces
+./main verify   <img> --name <person>                # is this image this person?
 ```
 
 `./main <source>` without a command is still treated as `./main demo <source>`, so older
@@ -150,6 +152,42 @@ itself was wrong (bad path, unreadable image, invalid config).
 
 `bbox` and `landmarks` are in **original-image pixels**, not in the detector's 160×120
 space — the letterbox mapping is inverted for you.
+
+### compare / verify — the same check without a server
+
+```sh
+./main compare data/BruceLi/photo.jpg data/IvanYang/photo.jpg   # {"cosine":0.022648,...}
+./main verify  data/BruceLi/photo.jpg --name BruceLi            # {"verified":true,...}
+```
+
+Both use the same `Pipeline::embed_image` + cosine as HTTP `/v1/compare` and MCP
+`compare_faces`, so the three interfaces return bit-identical numbers (verified: 0.022648
+on all three for the same pair).
+
+The face each image contributes is its **most confident** detection — `identify`'s
+`faces[0]`, which NMS orders by score, **not** the largest box. Keeping that one ordering
+everywhere is what makes "the face compare compares" and "identify's first face" the same
+face; describing it as the largest face (as an earlier tool description did) is a lie the
+model would repeat to the user.
+
+`verify` **exits non-zero when the answer is no**:
+
+| exit | meaning |
+|---|---|
+| 0 | verified — best match is the named person at or above `recognize.thresh` |
+| 1 | **not** verified (a valid answer: below threshold, or matches someone else) |
+| 2 | cannot answer — unreadable image, or no face found |
+| 3 | pipeline error |
+
+The JSON verdict (`verified`, `cosine`, `matched`, `threshold`) is printed for every exit
+code. The non-zero-on-"no" is deliberate and differs from `identify`, which exits 0 even
+when no face is found: `identify` reports a measurement, while `verify` is an
+authentication-style decision, and a check that always exits 0 turns every script that
+forgets to parse the JSON into a silent pass.
+
+```sh
+if ./main verify suspect.jpg --name BruceLi > /dev/null; then echo present; else echo absent; fi
+```
 
 ### serve — HTTP service
 
@@ -348,7 +386,7 @@ Four read-only tools, each with a JSON Schema:
 | Tool | Arguments | Returns |
 |---|---|---|
 | `identify_faces` | `image_b64`, `top_k`, `min_score`, `include_landmarks` | per-face bbox (original pixels), `matched` or `null`, ranked candidates |
-| `compare_faces` | `image_a_b64`, `image_b_b64` | cosine of the largest face in each |
+| `compare_faces` | `image_a_b64`, `image_b_b64` | cosine of the most confident face in each (identify's `faces[0]`) |
 | `list_people` | — | enrolled person ids (never embeddings or photos) |
 | `get_face_crop` | `image_b64`, `face_index` | aligned 112×112 PNG as `image` content |
 

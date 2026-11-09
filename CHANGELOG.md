@@ -44,6 +44,26 @@ than a strict versioning scheme.
 - Key suggestions now also match on **group**: `log.audit` (renamed) previously matched nothing
   and dumped the whole table; it now answers `did you mean log.sink log.level`. Edit distance
   cannot bridge a rename, group membership can.
+- **CLI `compare <img-a> <img-b>` and `verify <img> --name <person>`** — the same comparison
+  the HTTP `/v1/compare` and MCP `compare_faces` paths expose, without needing a server.
+  Both print JSON on stdout and share `Pipeline::embed_image` + the cosine formula, so the
+  three interfaces cannot drift apart.
+  `verify` exits **non-zero when the answer is "no"** (0 verified, 1 not verified, 2 cannot
+  answer — unreadable image or no face, 3 pipeline error): an authentication-style decision
+  that always exits 0 turns every script that forgets to parse the JSON into a silent pass,
+  and a silent pass is the worst failure an auth check has. The verdict and the reason are
+  always in the JSON (`verified`, `cosine`, `matched`, `threshold`) regardless of exit code.
+- **Fixed a description that was a lie to the model**: `compare_faces` told the LLM it compared
+  "the largest face in two images". NMS sorts by **score**, so index 0 is the most confident
+  face, which is not always the largest. Kept the code and fixed the wording, because score order
+  *is* the order `identify` reports faces in — so "the face compare compares" and "identify's
+  `faces[0]`" are provably the same face. Switching to area order would have made two interfaces
+  silently compare different faces, which is the cross-interface drift this project keeps hitting.
+- **`facerec_queue_wait_ms` histogram** — time a request spent in the HTTP task queue before
+  a worker picked it up (`enqueue → execute`), complementing `request_ms` (handler-internal
+  only). A new `src/timed_queue.hpp` wraps httplib's `ThreadPool` and records the delta on
+  every request, so operators can finally tell "the client waited 800 ms" from "the model took
+  800 ms" instead of guessing from `request_ms` alone.
 
 ### Changed
 

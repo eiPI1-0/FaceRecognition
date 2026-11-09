@@ -25,6 +25,7 @@
 #include "metrics.hpp"
 #include "result_cache.hpp"
 #include "sha256.hpp"
+#include "timed_queue.hpp"
 
 // httplib 对 `Content-Type: application/x-www-form-urlencoded` 的请求体有一道**独立于**
 // set_payload_max_length 的 8192 字节硬上限（httplib.h:6160），超了直接 413。图像请求体
@@ -293,7 +294,11 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     // 见 ServerOptions::http_threads：默认与 workers 相等（不超订），调高才让 PipelinePool
     // 变成准入点。
     const int http_threads = opt.http_threads > 0 ? opt.http_threads : workers;
-    svr.new_task_queue = [http_threads] { return new httplib::ThreadPool(http_threads); };
+    svr.new_task_queue = [http_threads, &metrics] {
+        return new facerec::TimedTaskQueue(
+            http_threads,
+            [&metrics](double wait_ms) { metrics.queue_wait_ms.observe(wait_ms); });
+    };
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
     svr.set_read_timeout(10, 0);
     svr.set_write_timeout(30, 0);

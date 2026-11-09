@@ -22,6 +22,7 @@
 #include "result_cache.hpp"
 #include "server.hpp"
 #include "sha256.hpp"
+#include "timed_queue.hpp"
 
 namespace facerec {
 
@@ -124,7 +125,8 @@ const ToolDef kTools[] = {
      "error. Read-only; never enrolls or stores anything.",
      kIdentifySchema},
     {"compare_faces",
-     "Compare the largest face in two images by cosine similarity of their embeddings "
+     "Compare the most confident face in each image by cosine similarity of their "
+     "embeddings "
      "(1.0 = same identity, ~0 = unrelated). Returns the cosine and both matched persons "
      "when they are known. Read-only.",
      kCompareSchema},
@@ -254,7 +256,8 @@ std::string handle_compare(Pipeline& pipeline, const std::string& args, int max_
     const double cos = (na > 0 && nb > 0) ? dot / (na * nb) : 0.0;
 
     std::ostringstream summary;
-    summary << "Cosine similarity between the largest face in each image: "
+    summary << "Cosine similarity between the most confident face in each image "
+            << "(the same face identify_faces reports first): "
             << format_float(cos, 4)
             << " (1.0 = same identity, around 0 = unrelated).";
     std::ostringstream body;
@@ -463,7 +466,9 @@ int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
     // 与 serve 同一条规则：之前没设，跑在 httplib 默认线程池 max(8, cores-1) 上，
     // 于是 --workers 只约束 pipeline 数、不约束并发（两个外壳行为分叉）。
     const int http_threads = opt.http_threads > 0 ? opt.http_threads : pool.size();
-    svr.new_task_queue = [http_threads] { return new httplib::ThreadPool(http_threads); };
+    svr.new_task_queue = [http_threads] {
+        return new facerec::TimedTaskQueue(http_threads, /*wait_cb=*/nullptr);
+    };
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
 
     // 与 serve 同一套：/healthz 免鉴权，其余要 bearer；审计行不含 person_id（PLAN.md D1/D3）。

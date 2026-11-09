@@ -107,6 +107,7 @@ std::string Metrics::to_prometheus() const {
     detect_ms.write_prometheus(out, none);
     embed_ms.write_prometheus(out, none);
     request_ms.write_prometheus(out, none);
+    queue_wait_ms.write_prometheus(out, none);
     match_score.write_prometheus(out, none);
     return out;
 }

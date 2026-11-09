@@ -683,6 +683,18 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
    - `--queue-timeout-ms` 取代三处硬编码超时（2000/5000/5000）。
    - 结论：`request_ms` 只覆盖 handler 内部；accept→handler 的排队要靠客户端观测或
      `ss -lnt` 的 Recv-Q。若将来要做真正的边缘 shedding，需要 httplib 之外的 accept 层计数。
-7. 可选项：CLI 的 `compare`/`verify` 子命令（与 server/MCP 对齐）。
+7. ~~可选项：CLI 的 `compare`/`verify` 子命令（与 server/MCP 对齐）~~ **已完成**：
+   - `src/cli.{hpp,cpp}` 新增 `cmd_compare` / `cmd_verify`，`main.cpp` 分发已加。
+   - `compare <img-a> <img-b>`：余弦相似度，JSON 输出，无人脸退出码 2。
+   - `verify  --name <person> 图`：是否属于指定身份，`verified` 字段。
+   - 与 HTTP `/v1/compare` 和 MCP `compare_faces` 用同一套 `embed_image` + 余弦计算，
+     三个接口结果一致。
+
+8. **排队时长现在可观测**（PLAN 第7点里原本说"accept→handler 排队要靠客户端观测"）：
+   - `src/timed_queue.hpp`：`TimedTaskQueue` 包装 `httplib::ThreadPool`，enqueue→execute
+     的差值写进 `facerec_queue_wait_ms` 直方图。
+   - `src/metrics.hpp` / `src/metrics.cpp`：新增 `queue_wait_ms` 直方图并写入 `/metrics`。
+   - `src/server.cpp` 与 `src/mcp.cpp` 都使用 `TimedTaskQueue`（server 接 metrics，mcp 暂不记）。
+   - 现在 operators 可以从 `/metrics` 直接读 "队列里等了多久"，不再只能猜 `request_ms` 的长尾。
 
 > 更新本文件时：任何架构决策变更（并发模型、MCP tool 列表、API 端点）必须在此同步，并记录变更原因，防止 compaction 后记忆丢失。

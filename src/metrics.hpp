@@ -136,6 +136,11 @@ public:
                        detail::kLatencyMsBounds, detail::kLatencyMsCount};
     Histogram request_ms{"request_ms", "Total time per identify request (ms)",
                          detail::kLatencyMsBounds, detail::kLatencyMsCount};
+    // cpp-httplib 的任务队列等待时长（enqueue→worker 执行），即 accept→handler 入口之间
+    // 服务端此前看不见的排队段。request_ms 只覆盖 handler 内部；这条覆盖排队段。
+    Histogram queue_wait_ms{"queue_wait_ms", "Time a request spent in the HTTP task queue "
+                       "before a worker picked it up (ms)",
+                            detail::kLatencyMsBounds, detail::kLatencyMsCount};
 
     // 分数分布（cosine，[0,1]）：能看出"最近匹配变差了"
     Histogram match_score{"match_score", "Best cosine per detected face",
