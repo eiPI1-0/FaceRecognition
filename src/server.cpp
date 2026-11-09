@@ -2,6 +2,7 @@
 
 #include "auth.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -17,6 +18,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include "admission.hpp"  // 队列段已等时长 → 池段预算
 #include "api.hpp"
 #include "encoding.hpp"
 #include "json_util.hpp"
@@ -105,6 +107,14 @@ void observe_result(Metrics& m, const IdentifyResult& r, double decode_ms,
 void set_json(httplib::Response& res, int status, const std::string& body) {
     res.status = status;
     res.set_content(body, "application/json; charset=utf-8");
+}
+
+// 容量类 503 的统一形状。两个准入点（任务队列 / pipeline 池）的 code 不同，客户端要能
+// 分辨；但**两者都带 Retry-After**：不带它的 503 会让客户端立即重试，把刚 shed 掉的
+// 负载重新推进来 —— 拒流自己变成流量源。
+void set_busy(httplib::Response& res, const char* code, const std::string& msg) {
+    res.set_header("Retry-After", "1");
+    set_json(res, 503, error_to_json(msg, code));
 }
 
 IdentifyOptions options_from_json(const std::string& body) {
@@ -197,19 +207,32 @@ constexpr long long kLeaseWarnMs = 100;
 // 排队时长只有这里知道：指标给的是 {path,status} 的计数，看不出是池子满了还是这张图特别贵。
 Lease acquire_logged(PipelinePool& pool, const ServerOptions& opt, const Log& log,
                      const char* route, long long& wait_ms) {
+    // 池段预算 = 端到端上限 − 队列段已经等掉的。否则同一份"等容量"会被两段各给一次，
+    // 客户端最坏等到 2×timeout（而队列段以前干脆无上限）。
+    // pre_routing 的 shed 已经拦掉"等过 deadline"的请求，所以这里为 0 只可能是
+    // 两个检查之间的竞态：立即拿不到就回 pool_busy，不众等。
+    const double queued_ms = admission::request_wait_ms();
+    const long long budget_ms = admission::pool_budget_ms(opt.queue_timeout_ms, queued_ms);
     const auto t0 = std::chrono::steady_clock::now();
-    Lease lease(pool, std::chrono::milliseconds(opt.queue_timeout_ms));
+    Lease lease(pool, std::chrono::milliseconds(budget_ms));
     wait_ms = static_cast<long long>(
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    // queued_ms 与 waited_ms 分开记：同为排队，队列段与池段是两个不同的拥塞点，
+    // 混成一个数就看不出该调 deadline 还是该加 pipeline。
     const std::string ctx = std::string("\"route\":\"") + route + "\",\"workers\":" +
                             std::to_string(pool.size()) + ",\"waited_ms\":" +
-                            std::to_string(wait_ms) + ",\"caller\":\"" +
-                            json_escape(current_caller()) + '"';
+                            std::to_string(wait_ms) + ",\"queued_ms\":" +
+                            std::to_string(static_cast<long long>(queued_ms)) +
+                            ",\"caller\":\"" + json_escape(current_caller()) + '"';
     if (!lease) {
         // 503 在加这段之前是完全不可见的：只回一个响应体，服务端既无日志也无处可查
         // "满了多久、当时几个 worker"。warn：对应一个真实的客户端失败，量受 503 率约束。
+        // 两段等待各自可见（ctx 里带 queued_ms，这里带 budget/deadline）：同样是 503，
+        // "在队列里就把预算用完了" 与 "队列没等、池子当场拿不到" 是两个不同的原因，
+        // 修法也不同（前者调 deadline/容量，后者才看 pipeline 够不够）。
         log.event(LogLevel::Warn, "pool_busy",
-                  ctx + ",\"timeout_ms\":" + std::to_string(opt.queue_timeout_ms));
+                  ctx + ",\"budget_ms\":" + std::to_string(budget_ms) +
+                      ",\"deadline_ms\":" + std::to_string(opt.queue_timeout_ms));
     } else if (wait_ms >= kLeaseWarnMs) {
         // info 而不是 warn：一淘并发就能压出几十行（实测 48 并发 → 87 行），默认级别不该
         // 为"排队前兆"刷屏。事故时把 log.level 调到 info，饱和趋势立刻可见。
@@ -294,10 +317,13 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     // 见 ServerOptions::http_threads：默认与 workers 相等（不超订），调高才让 PipelinePool
     // 变成准入点。
     const int http_threads = opt.http_threads > 0 ? opt.http_threads : workers;
-    svr.new_task_queue = [http_threads, &metrics] {
+    svr.new_task_queue = [http_threads, &opt, &metrics] {
         return new facerec::TimedTaskQueue(
-            http_threads,
-            [&metrics](double wait_ms) { metrics.queue_wait_ms.observe(wait_ms); });
+            http_threads, static_cast<size_t>(opt.queue_max_pending),
+            [&metrics](double wait_ms) { metrics.queue_wait_ms.observe(wait_ms); },
+            // 触顶时 httplib 自己**不计数也不记日志**（与当年 backlog=5 同构：拒绝在服务端
+            // 完全隐形）。默认 0 = 不限，所以这个计数只在显式调过那个旋钮时才会动。
+            [&metrics] { metrics.queue_dropped_total.inc(); });
     };
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
     svr.set_read_timeout(10, 0);
@@ -306,7 +332,8 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
 
     // 鉴权 + 结构化审计（PLAN.md D1/D3）：探针免鉴权，其余全要 bearer；
     // 401 永远记审计，成功行受 --quiet 影响。
-    install_access_control(svr, auth, opt.quiet, log, /*is_mcp=*/false, &metrics);
+    install_access_control(svr, auth, opt.quiet, log, /*is_mcp=*/false, &metrics,
+                           opt.queue_timeout_ms);
 
     // ---- 指标 ----
     svr.Get("/metrics", [&metrics, &cache](const httplib::Request&, httplib::Response& res) {
@@ -343,7 +370,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         long long wait_ms = 0;
         Lease lease = acquire_logged(pool, opt, log, "/v1/people", wait_ms);
         if (!lease) {
-            set_json(res, 503, error_to_json("server busy", "unavailable"));
+            set_busy(res, "unavailable", "server busy");
             return;
         }
         set_json(res, 200, people_to_json(*lease.get()));
@@ -394,7 +421,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         long long wait_ms = 0;
         Lease lease = acquire_logged(pool, opt, log, ROUTE, wait_ms);
         if (!lease) {
-            set_json(res, 503, error_to_json("server busy", "unavailable"));
+            set_busy(res, "unavailable", "server busy");
             return;
         }
         try {
@@ -434,7 +461,7 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
         long long wait_ms = 0;
         Lease lease = acquire_logged(pool, opt, log, ROUTE, wait_ms);
         if (!lease) {
-            set_json(res, 503, error_to_json("server busy", "unavailable"));
+            set_busy(res, "unavailable", "server busy");
             return;
         }
         try {
@@ -499,7 +526,15 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     // ---- 启动 ----
     std::cout << "Listening on http://" << opt.host << ":" << opt.port
               << "  (workers=" << workers << ", http-threads=" << http_threads
-              << ", queue-timeout=" << opt.queue_timeout_ms << "ms"
+              // 启动行把两个准入参数写开：-1 与 0 在数字上只差一个符号，含义却是
+              // "不 shed" 与 "零容忍" 两个极端，日志里不能让人误读。
+              << ", admission-deadline="
+              << (opt.queue_timeout_ms < 0
+                      ? std::string("off")
+                      : std::to_string(opt.queue_timeout_ms) + "ms")
+              << (opt.queue_max_pending > 0
+                      ? ", max-pending=" + std::to_string(opt.queue_max_pending)
+                      : std::string(", max-pending=off"))
               << ", log=" << log_level_name(log.level())
               << (opt.reuseport ? ", SO_REUSEPORT" : "") << ")" << std::endl;
     {

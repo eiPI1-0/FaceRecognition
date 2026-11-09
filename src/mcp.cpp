@@ -14,6 +14,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#include "admission.hpp"  // 队列段已等时长 → 池段预算
 #include "api.hpp"
 #include "encoding.hpp"
 #include "httplib.h"
@@ -402,16 +403,23 @@ std::string handle_message(PipelinePool& pool, const std::string& msg, int max_p
 
         // 与 serve 同一个策略：排队有上限，满了要说得出"满了多久、当时几个 worker"，
         // 而不是只回一句 "server busy, try again"。
+        // 与 serve 同一个预算规则：端到端上限 − 队列段已等掉的。stdio 传输根本不进
+        // 任务队列，request_wait_ms() 恒为 0，预算不变 —— 不需要传输层分支。
+        const double queued_ms = admission::request_wait_ms();
+        const long long budget_ms = admission::pool_budget_ms(queue_timeout_ms, queued_ms);
         const auto t0 = std::chrono::steady_clock::now();
-        Lease lease(pool, std::chrono::milliseconds(queue_timeout_ms));
+        Lease lease(pool, std::chrono::milliseconds(budget_ms));
         const long long wait_ms = static_cast<long long>(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
                 .count());
         if (!lease) {
             log.event(LogLevel::Warn, "pool_busy",
                       std::string("\"tool\":\"") + json_escape(name) +
-                          "\",\"waited_ms\":" + std::to_string(wait_ms) + ",\"timeout_ms\":" +
-                          std::to_string(queue_timeout_ms) + ",\"workers\":" +
+                          "\",\"waited_ms\":" + std::to_string(wait_ms) +
+                          ",\"budget_ms\":" + std::to_string(budget_ms) +
+                          ",\"queued_ms\":" + std::to_string(static_cast<long long>(queued_ms)) +
+                          ",\"deadline_ms\":" + std::to_string(queue_timeout_ms) +
+                          ",\"workers\":" +
                           std::to_string(pool.size()));
             return rpc_result(id, tool_err("server busy, try again"));
         }
@@ -466,15 +474,18 @@ int serve_http(PipelinePool& pool, const McpOptions& opt, ResultCache& cache,
     // 与 serve 同一条规则：之前没设，跑在 httplib 默认线程池 max(8, cores-1) 上，
     // 于是 --workers 只约束 pipeline 数、不约束并发（两个外壳行为分叉）。
     const int http_threads = opt.http_threads > 0 ? opt.http_threads : pool.size();
-    svr.new_task_queue = [http_threads] {
-        return new facerec::TimedTaskQueue(http_threads, /*wait_cb=*/nullptr);
+    svr.new_task_queue = [http_threads, &opt] {
+        return new facerec::TimedTaskQueue(http_threads,
+                                          static_cast<size_t>(opt.queue_max_pending));
     };
     svr.set_payload_max_length(static_cast<size_t>(opt.max_request_mb) * 1024 * 1024);
 
     // 与 serve 同一套：/healthz 免鉴权，其余要 bearer；审计行不含 person_id（PLAN.md D1/D3）。
     // MCP 传输层不暴露 /metrics，也就没有 Metrics 实例（见 auth.hpp 的参数说明）。
+    // 同一个 admission deadline：MCP 客户端（LLM host）超时通常比人类短得多，
+    // 而传输层没有 /metrics，所以 503 本身就是它唯一能看到的饱和信号（带 Retry-After）。
     install_access_control(svr, access.tokens, opt.quiet, access.log, /*is_mcp=*/true,
-                           /*metrics=*/nullptr);
+                           /*metrics=*/nullptr, opt.queue_timeout_ms);
 
     svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json; charset=utf-8");

@@ -9,8 +9,10 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <atomic>
 #include <sstream>
 
+#include "admission.hpp"  // 本请求已为"等容量"等了多久（队列段与池段共用）
 #include "api.hpp"      // json_escape（api 层已经是所有外壳的共同依赖）
 #include "metrics.hpp"    // 请求计数：唯一计数点在本文件的访问日志钩子
 #include "sha256.hpp"
@@ -63,6 +65,13 @@ std::string bearer(const httplib::Request& req) {
 }
 
 bool is_probe_path(const std::string& path) { return path == "/healthz" || path == "/readyz"; }
+
+// 不 shed 的路径：探针 + 指标。两者都不借 pipeline， shed 它们不会减轻任何负载；
+// 而饱和时杀掉探针会把一次过载变成一次重启（k8s 看到的是 pod 挂，不是服 503），
+// 杀掉 /metrics 则恰好抹掉诊断过载所需的数据。
+bool sheddable_path(const std::string& path) {
+    return !is_probe_path(path) && path != "/metrics";
+}
 
 // 把一次请求折成稳定基数的标签对。**不能**把 req.path 原样当标签：任何客户端循环打
 // /random-N 都能给 map 加一条永久记录，把 /metrics 变成内存与磁盘的双重炸弹。
@@ -155,14 +164,51 @@ bool TokenTable::authenticate(const std::string& token, std::string& caller) con
     return true;
 }
 
+// 本次请求是否被 shed：只用来让下面的 logger 跳过审计行（见那里的理由）。
+// 指标计数不受它影响 —— 计数在 logger 的第一行，早于任何提前返回。
+thread_local bool tl_shed = false;
+
 void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool quiet,
-                            const Log& log, bool is_mcp, Metrics* metrics) {
+                            const Log& log, bool is_mcp, Metrics* metrics,
+                            long long queue_deadline_ms) {
     const char* svc = is_mcp ? "mcp" : "http";
 
-    svr.set_pre_routing_handler([&tokens, svc](const httplib::Request& req,
-                                                httplib::Response& res) {
+    svr.set_pre_routing_handler([&tokens, svc, queue_deadline_ms, &log, metrics](
+                                    const httplib::Request& req,
+                                    httplib::Response& res) {
         tl_caller.clear();
+        tl_shed = false;
         tl_request_start = std::chrono::steady_clock::now();
+        // 先把连接被 worker 取走时的排队时长结算给本请求（keep-alive 的第 2+ 条拿到 0，
+        // 它从未在 accept 队列里排过队，见 admission.hpp）。
+        admission::begin_request();
+
+        // ---- 边缘 shedding：在任何每请求开销之前 ----
+        // 已经等过 deadline 的请求，再花 15ms 推理大概率是在为一个已经离开的客户端烧 CPU，
+        // 而那些 CPU 正是让别人不再排队所需的东西 —— 不 shed 就是死亡螺旋。
+        // 放在鉴权之前：shed 的决定必须不依赖任何请求内容，也不能自己变成新的成本来源。
+        if (queue_deadline_ms > 0 && sheddable_path(req.path) &&
+            admission::request_wait_ms() > static_cast<double>(queue_deadline_ms)) {
+            tl_shed = true;
+            if (metrics) metrics->queue_expired_total.inc();
+            res.status = 503;
+            // 不带 Retry-After 的 503 会让客户端立即重试，把刚 shed 掉的负载重新推进来。
+            res.set_header("Retry-After", "1");
+            res.set_content("{\"status\":\"error\",\"error\":\"server busy: admission "
+                            "deadline exceeded before serving\",\"code\":\"queue_expired\"}",
+                            "application/json");
+            // 饱和这个**事实**要出声，但只出一次：每请求一行就是 P1 那次事故本身
+            //（日志把服务压垮）。真相在 counter 与直方图里，不在日志行数里。
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                log.event(LogLevel::Warn, "queue_shed_start",
+                          std::string("\"svc\":\"") + svc + "\",\"deadline_ms\":" +
+                              std::to_string(queue_deadline_ms) +
+                              ",\"note\":\"subsequent sheds are counted in "
+                              "facerec_queue_expired_total, not logged\"");
+            }
+            return httplib::Server::HandlerResponse::Handled;
+        }
         if (tokens.empty() || is_probe_path(req.path)) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -186,6 +232,10 @@ void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool
         if (metrics) {
             metrics->http_requests.inc(metric_labels(req.path, res.status));
         }
+        // shed 不写审计行。容量事件与安全事件不同：401 必出是因为它是安全事件，
+        // 而一淘并发下的 503 每请求一行会把服务自己压垮（P1 的根因就是日志）。
+        // 可观测性由 counter + 直方图 + 上面那条一次性 warn 承担，不是靠日志行数。
+        if (tl_shed) return;
         // 探针成功不记（k8s 每 10s 打一次会把日志淹没），探针失败要记。
         if (is_probe_path(req.path) && res.status < 400) return;
         if (quiet && res.status < 400) return;

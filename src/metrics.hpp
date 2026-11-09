@@ -138,9 +138,20 @@ public:
                          detail::kLatencyMsBounds, detail::kLatencyMsCount};
     // cpp-httplib 的任务队列等待时长（enqueue→worker 执行），即 accept→handler 入口之间
     // 服务端此前看不见的排队段。request_ms 只覆盖 handler 内部；这条覆盖排队段。
-    Histogram queue_wait_ms{"queue_wait_ms", "Time a request spent in the HTTP task queue "
-                       "before a worker picked it up (ms)",
+    // **粒度是连接而不是请求**：httplib 一个任务包一个连接，keep-alive 的第 2+ 条请求不再
+    // 进队（实测 12 请求/1 连接 → count +1）。所以 count 是“被排过的连接数”。
+    Histogram queue_wait_ms{"queue_wait_ms", "Time a connection spent in the HTTP task queue "
+                       "before a worker picked it up (ms, per connection)",
                             detail::kLatencyMsBounds, detail::kLatencyMsCount};
+    // 两个 shed 路径，分属两个准入点（见 admission.hpp / timed_queue.hpp）：
+    //   expired = 正经 503（请求已解析，在 pre_routing 里回，带 Retry-After）；
+    //   dropped = 队列触顶，httplib 直接关 socket（无 HTTP 应答）。
+    Counter queue_expired_total{"queue_expired_total",
+                                "Requests shed with 503 because they had already waited past "
+                                "the admission deadline"};
+    Counter queue_dropped_total{"queue_dropped_total",
+                                "Connections closed because the task queue hit its bound "
+                                "(no HTTP response is possible at that point)"};
 
     // 分数分布（cosine，[0,1]）：能看出"最近匹配变差了"
     Histogram match_score{"match_score", "Best cosine per detected face",

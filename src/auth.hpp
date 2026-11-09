@@ -63,8 +63,13 @@ bool is_loopback_host(const std::string& host);
 // "加路由忘了计数" 与 "某个分支漏了错误码" 结构上不可能发生。
 // 审计行经 log.audit() 写出（不受 log.level 影响；查询行不含 person_id / 名字 /
 // embedding / 图像字节，见 PLAN.md D1 的理由）。
+// queue_deadline_ms = 端到端等容量上限（与 handler 借 pipeline 用的是同一个值，见
+// ServerOptions::queue_timeout_ms）。>0 时，已在任务队列里等过它的连接在进入 handler 前
+// 就被 shed：回 503 + Retry-After，不碰 pipeline。探针与 /metrics **不 shed** ——
+// 它们不花 pipeline，而在饱和时杀掉探针会把一次过载变成一次重启。
 void install_access_control(httplib::Server& svr, const TokenTable& tokens, bool quiet,
-                            const Log& log, bool is_mcp, Metrics* metrics);
+                            const Log& log, bool is_mcp, Metrics* metrics,
+                            long long queue_deadline_ms = 0);
 
 // 生成一个新 token（32 字节 CSPRNG 的十六进制）与它在该文件里应有的那一行。
 // 分两步给调用方：token 只显示一次，文件里只存 sha256。

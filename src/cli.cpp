@@ -109,6 +109,58 @@ bool parse_set_arg(const std::string& arg, int& i, int argc, char* argv[],
     return true;
 }
 
+// 拥塞控制的三个旗标：serve 与 mcp **共用一份解析**。它们调的是同一个机制（任务队列 +
+// pipeline 池），分两处写已经让 --http-threads 分叉过一次（mcp.cpp 里记着：一边设了一边没设，
+// 两个外壳的并发语义就不一样了）。模板而不是重载：两个 Options 结构不同但字段同名，
+// 谁漏了字段就是编译错误，而不是又一次静默分叉。
+// 返回：0 = 不是这里的旗标；1 = 已消费；-1 = 用法错（已打印，调用方直接 return -1）。
+template <class Opt>
+int parse_queue_arg(const std::string& arg, int& i, int argc, char* argv[], Opt& opt) {
+    auto value_of = [&](const char* name) -> std::string {
+        const std::string eq = std::string(name) + "=";
+        if (arg.rfind(eq, 0) == 0) return arg.substr(eq.size());
+        return (i + 1 < argc) ? argv[++i] : std::string();
+    };
+    auto integer = [&](const char* name, int* out) -> bool {
+        try {
+            *out = std::stoi(value_of(name));
+        } catch (...) {
+            std::cerr << name << " expects an integer" << std::endl;
+            return false;
+        }
+        return true;
+    };
+    if (arg == "--http-threads" || arg.rfind("--http-threads=", 0) == 0) {
+        if (!integer("--http-threads", &opt.http_threads)) return -1;
+        if (opt.http_threads < 1) {
+            std::cerr << "--http-threads must be >= 1 (default = same as --workers)" << std::endl;
+            return -1;
+        }
+        return 1;
+    }
+    if (arg == "--queue-timeout-ms" || arg.rfind("--queue-timeout-ms=", 0) == 0) {
+        if (!integer("--queue-timeout-ms", &opt.queue_timeout_ms)) return -1;
+        if (opt.queue_timeout_ms < -1) {
+            // 0 的含义与以前一致：**零**等待容忍（当场拿不到就 503），不是"关闭"。
+            // 把"关闭"藏在 0 里会静默翻转一个已有取值的含义（那是最坏的改法），
+            // 所以用显式的 -1。
+            std::cerr << "--queue-timeout-ms must be >= -1 "
+                         "(-1 = never shed, 0 = no waiting at all)" << std::endl;
+            return -1;
+        }
+        return 1;
+    }
+    if (arg == "--queue-max-pending" || arg.rfind("--queue-max-pending=", 0) == 0) {
+        if (!integer("--queue-max-pending", &opt.queue_max_pending)) return -1;
+        if (opt.queue_max_pending < 0) {
+            std::cerr << "--queue-max-pending must be >= 0 (0 = unbounded)" << std::endl;
+            return -1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 // --config path / --config=path
 bool parse_config_arg(const std::string& arg, int& i, int argc, char* argv[],
                       ConfigArgs& out) {
@@ -578,26 +630,8 @@ int cmd_serve(int argc, char* argv[]) {
                 std::cerr << "--cache-entries expects an integer" << std::endl;
                 return -1;
             }
-        } else if (arg == "--http-threads" || arg.rfind("--http-threads=", 0) == 0) {
-            try { opt.http_threads = std::stoi(value_of("--http-threads")); } catch (...) {
-                std::cerr << "--http-threads expects an integer" << std::endl;
-                return -1;
-            }
-            if (opt.http_threads < 1) {
-                std::cerr << "--http-threads must be >= 1 (default = same as --workers)"
-                          << std::endl;
-                return -1;
-            }
-        } else if (arg == "--queue-timeout-ms" || arg.rfind("--queue-timeout-ms=", 0) == 0) {
-            try { opt.queue_timeout_ms = std::stoi(value_of("--queue-timeout-ms")); } catch (...) {
-                std::cerr << "--queue-timeout-ms expects an integer" << std::endl;
-                return -1;
-            }
-            if (opt.queue_timeout_ms < 0) {
-                std::cerr << "--queue-timeout-ms must be >= 0 (0 = fail immediately when busy)"
-                          << std::endl;
-                return -1;
-            }
+        } else if (int q = parse_queue_arg(arg, i, argc, argv, opt); q != 0) {
+            if (q < 0) return -1;
         } else if (arg == "--reuseport") {
             opt.reuseport = true;
         } else if (arg == "--quiet") {
@@ -618,12 +652,19 @@ int cmd_serve(int argc, char* argv[]) {
         std::cout << "Usage: facerec serve [--host 127.0.0.1] [--port 8080] [--workers N]\n"
                   << "                     [--cv-threads 1] [--max-request-mb 32] [--cache-entries 256]\n"
                   << "                     [--reuseport] [--quiet] [--queue-timeout-ms 5000]\n"
-                  << "                     [--http-threads N]\n"
+                  << "                     [--http-threads N] [--queue-max-pending 0]\n"
                   << "                     [--config <path>] [--set key=value]\n"
                   << "  --workers     pipeline instances / concurrent requests (default: CPU count)\n"
                   << "  --cv-threads  OpenCV internal thread pool per worker (default: 1)\n"
                   << "  --reuseport   SO_REUSEPORT: run N processes on one port (kernel load-balances)\n"
-                  << "  --queue-timeout-ms  how long to wait for a free pipeline before 503\n"
+                  << "  --queue-timeout-ms  end-to-end budget for WAITING FOR CAPACITY (queue stage\n"
+                  << "                  + pool stage together); past it a request gets 503 instead of\n"
+                  << "                  being served for a caller that has already given up\n"
+                  << "                  (-1 = never shed, 0 = no waiting at all)\n"
+                  << "  --http-threads  HTTP worker threads (default = --workers)\n"
+                  << "  --queue-max-pending   hard cap on connections queued in front of the workers\n"
+                  << "                  (0 = unbounded). Backstop only: hitting it closes the socket\n"
+                  << "                  instead of answering 503, so prefer --queue-timeout-ms\n"
                   << "Endpoints: POST /v1/identify /v1/embed /v1/compare, GET /v1/people,\n"
                   << "           GET /healthz, GET /readyz\n";
         return 0;
@@ -678,26 +719,8 @@ int cmd_mcp(int argc, char* argv[]) {
                 std::cerr << "--max-request-mb expects an integer" << std::endl;
                 return -1;
             }
-        } else if (arg == "--http-threads" || arg.rfind("--http-threads=", 0) == 0) {
-            try { opt.http_threads = std::stoi(value_of("--http-threads")); } catch (...) {
-                std::cerr << "--http-threads expects an integer" << std::endl;
-                return -1;
-            }
-            if (opt.http_threads < 1) {
-                std::cerr << "--http-threads must be >= 1 (default = same as --workers)"
-                          << std::endl;
-                return -1;
-            }
-        } else if (arg == "--queue-timeout-ms" || arg.rfind("--queue-timeout-ms=", 0) == 0) {
-            try { opt.queue_timeout_ms = std::stoi(value_of("--queue-timeout-ms")); } catch (...) {
-                std::cerr << "--queue-timeout-ms expects an integer" << std::endl;
-                return -1;
-            }
-            if (opt.queue_timeout_ms < 0) {
-                std::cerr << "--queue-timeout-ms must be >= 0 (0 = fail immediately when busy)"
-                          << std::endl;
-                return -1;
-            }
+        } else if (int q = parse_queue_arg(arg, i, argc, argv, opt); q != 0) {
+            if (q < 0) return -1;
         } else if (arg == "--quiet") {
             opt.quiet = true;
         } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
@@ -716,6 +739,7 @@ int cmd_mcp(int argc, char* argv[]) {
         std::cout << "Usage: facerec mcp [--transport stdio|http] [--host H] [--port P]\n"
                   << "                   [--workers N] [--max-request-mb 32] [--quiet]\n"
                   << "                   [--queue-timeout-ms 5000] [--http-threads N]\n"
+                  << "                   [--queue-max-pending 0]\n"
                   << "                   [--config <path>] [--set key=value]\n"
                   << "\nTools (read-only): identify_faces, compare_faces, list_people, get_face_crop\n"
                   << "Enrollment is deliberately NOT exposed as a tool.\n"

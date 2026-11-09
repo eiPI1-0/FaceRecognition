@@ -24,10 +24,27 @@ struct ServerOptions {
     // 但 4/8 worker 下吞吐 +32%/+26%、p99 更低 —— 每个 worker 再开 16 线程只会互相抢核。
     // 单 worker + 大 batch 或 GPU 后端时才值得调大。
     int cv_threads = 1;
-    // 拿不到 pipeline 时的排队上限：超时回 503，而不是无限排队。它决定背压落在这里还是
-    // 落到客户端，所以是运维旋钮而不是实现细节；配套的可观测信号是 `pool_busy` 事件与
-    // http_requests_total{status="503"}。三个用 pipeline 的路由共用它。
+    // **端到端**的"等容量"上限：从连接进入 HTTP 任务队列那一刻起算，到借到 pipeline 为止。
+    // 超了就回 503，而不是无限排队。它决定背压落在这里还是落到客户端，所以是运维旋钮
+    // 而不是实现细节。
+    //
+    // 它同时管两个准入点，且**连续**生效（见 admission.hpp）：
+    //   队列段  已等超过它 → pre_routing 直接 503 `queue_expired`，不碰 pipeline；
+    //   池  段  预算 = 它 − 队列段已等掉的（不会两段各等 5s）。
+    // 早期版本只在池段用它，队列段无上限 —— 最坏情况因此是"队列 ∞ + 池 5s"，p50 30ms 的
+    // 服务能让客户端等 60s。现在一个数界定端到端。
+    // 取值：N>0 = 端到端上限；**0 = 零容忍**（当场拿不到就 503，含义与以前一致）；
+    // -1 = 不限（关闭 shedding，宁排队也不拒）。0 不能代指"关闭"，因为那是静默翻转一个
+    // 已有取值。
+    // 可观测信号：queue_expired_total / queue_dropped_total / queue_wait_ms 直方图 /
+    // `pool_busy` 事件 / http_requests_total{status="503"}。
     int queue_timeout_ms = 5000;
+    // 任务队列的**连接**数硬上限（httplib 按连接排队，不按请求，见 timed_queue.hpp）。
+    // 0 = 不设上限（默认）。这是兜底而不是主控制：主控制是上面那个 deadline（回正经 503）。
+    // 触顶时 httplib 直接关 socket —— 请求还没被解析，无法按 HTTP 应答，客户端看到的是
+    // 连接被关（curl: (52)）而不是 503，所以只在"护住 fd/内存"时才调它，并配合
+    // queue_dropped_total 观察。0 默认意味着：宁可排队后拿 503，也不要无应答。
+    int queue_max_pending = 0;
     // HTTP 层线程数。0 = 等于 workers（默认，也是最保守的正确值：解码与推理都不超订，
     // 内存上限就是 workers 张解码后的图）。此时 handler 永远拿得到 pipeline，
     // PipelinePool 不构成准入点，503 与 pool_busy 都不会出现 —— 排队发生在 httplib 的

@@ -8,6 +8,37 @@ than a strict versioning scheme.
 
 ### Added
 
+- **Admission control (edge shedding) with one capacity-wait budget across both admission
+  points.** Waiting for capacity happens twice — in cpp-httplib's task queue (accept thread →
+  worker) and in `PipelinePool` (handler → pipeline) — and only the second one had a bound, so the
+  worst case was *queue ∞ + pool 5 s*. `src/admission.hpp` carries the wait as one transmittable
+  quantity (per worker thread, no locks): the task-queue wrapper stamps it when a worker picks up a
+  connection, the pre-routing hook settles it onto the request, and the pool gets
+  `deadline − already_waited`. Past the deadline a request is refused before any pipeline is
+  touched: 503 with `code:"queue_expired"` and `Retry-After: 1` (a 503 without `Retry-After` makes
+  the client re-push the load it just shed; the pool-stage 503 now carries it too).
+  Measured on an open-loop flood — 140 req/s against 2 workers (capacity ≈ 98 req/s), 6 s:
+  without shedding p50 grows **linearly** 232 → 2338 ms while nothing is refused; with a 150 ms
+  deadline p50 stays **flat at ~161 ms** (max 173), and throughput is unchanged at 98.7/s — the
+  excess gets fast refusals instead of unbounded latency. Continuity verified per request:
+  `queued_ms + waited_ms` equals the deadline (48+52, 30+70, 66+34).
+- **`--queue-max-pending`** (default 0 = unbounded): hard cap on connections waiting in front of
+  the workers, using cpp-httplib's own `ThreadPool(n, max_queued_requests)` rather than a new queue
+  (measured: `--workers 2 --queue-max-pending 4`, 30 simultaneous arrivals → 6 served, 24
+  connections closed, `facerec_queue_dropped_total 24`). It answers no HTTP status because the drop
+  happens before the request is parsed, and it also drops probes (measured 5/5 `/healthz` dropped
+  in that configuration) — so it is a resource backstop, off by default.
+- **Probes and `/metrics` are exempt from shedding** (verified 200 during the flood): killing a
+  probe turns an overload into a restart, and killing `/metrics` removes the data needed to see it.
+- `facerec_queue_expired_total` / `facerec_queue_dropped_total` (the two shed paths), and the
+  `pool_busy` event now reports `queued_ms` / `budget_ms` / `deadline_ms` so "used the budget in the
+  queue" and "queue instant, pool empty" are distinguishable. One-time `queue_shed_start` warn
+  marks the onset; subsequent sheds are counters, not log lines.
+- `tests/admission.cpp` (3rd ctest): the budget arithmetic, the keep-alive accounting rule (second
+  request on a connection waits 0 — httplib queues **connections**, measured 12 requests/1
+  connection → `queue_wait_count` +1), and that every declared metric actually appears in
+  `to_prometheus()` (that list is hand-written and forgetting a line fails silently). Verified to go
+  red when the floor or a metric line is removed.
 - **`deploy/` — three deployment artifacts, each with one job.**
   - `deploy/Dockerfile`: multi-stage build (openSUSE Leap 16). The build stage carries
     `opencv-devel`; the runtime stage carries only `libopencv413` plus the binary, runs as a
@@ -67,6 +98,11 @@ than a strict versioning scheme.
 
 ### Changed
 
+- **`--queue-timeout-ms` changed meaning: it is now the end-to-end budget for waiting for
+  capacity, not the pipeline-wait timeout.** Any value `N > 0` behaves tighter than before (the
+  queue stage used to be unbounded); `0` keeps its historical meaning of *zero tolerance*, and
+  `-1` is the new explicit "never shed". The 0 → "off" shortcut was rejected on purpose: silently
+  flipping the meaning of an existing value is worse than adding a sentinel.
 - **`facerec_requests_total` / `facerec_request_errors_total` are gone**; both were wrong in a way
   that mattered. Their HELP text claimed "HTTP/MCP requests served", but they were incremented at
   three points inside `/v1/identify` only: `400 bad_request` and `503 server busy` were invisible,

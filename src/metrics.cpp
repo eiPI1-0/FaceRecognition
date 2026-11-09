@@ -108,6 +108,11 @@ std::string Metrics::to_prometheus() const {
     embed_ms.write_prometheus(out, none);
     request_ms.write_prometheus(out, none);
     queue_wait_ms.write_prometheus(out, none);
+    // 这个列表是手写的，漏一行不会报错：指标存在但 /metrics 里看不见（与本仓库
+    // "各 handler 手工 inc() 必然漏" 是同一类 bug）。tests/test_admission.cpp 用
+    // 名字逐个断言，所以忘了这里会编译过但测试红（tests/admission.cpp）。
+    queue_expired_total.write_prometheus(out, none);
+    queue_dropped_total.write_prometheus(out, none);
     match_score.write_prometheus(out, none);
     return out;
 }

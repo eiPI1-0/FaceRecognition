@@ -74,6 +74,13 @@ if(FACEREC_BUILD_TESTS)
     target_link_libraries(tracker_scenarios ${OpenCV_LIBS})
     add_test(NAME tracker_scenarios COMMAND tracker_scenarios)
 
+    # 准入控制：端到端"等容量"预算在两个准入点之间的连续性、以及 httplib 按连接而不是
+    # 按请求排队带来的记账语义。不需要模型与网络（metrics.cpp 是纯计数器）。
+    add_executable(admission tests/admission.cpp src/metrics.cpp)
+    target_include_directories(admission PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(admission Threads::Threads)
+    add_test(NAME admission COMMAND admission)
+
     # augmentation A/B：同一套 warp 种子下，对比不同检测器的 within/between margin。
     add_executable(augmentation_ab tests/augmentation_ab.cpp src/engine.cpp
         priorbox.cpp detector_head.cpp utils.cpp face_tracker.cpp)

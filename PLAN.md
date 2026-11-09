@@ -565,6 +565,46 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
 - **验收**：`tests/augmentation_ab.cpp` 报告 fused margin > per-level margin；24 路并发 identify 同一张图
   只有一种结果（已在 P5 回归中覆盖）。
 
+### D9 容量等待是**一个**端到端预算，在两个准入点连续执行 —— **已实现**（2026-11-09）
+
+问题不是"没有背压"，是**同一种等待被两段各自管理、而其中一段没有上限**：
+任务队列（accept 线程 → worker）无界，`PipelinePool`（handler → pipeline）有 5s。最坏 = ∞。
+
+**决策**：一个数（`--queue-timeout-ms`，默认 5000）界定"等容量"的总时长，两段连续：
+- 队列段已等超它 → pre_routing 里 shed（503 + `code:"queue_expired"` + `Retry-After: 1`），**不碰 pipeline**；
+- 池段预算 = 它 − 队列段已等掉的。实测每条 503 的 `queued_ms + waited_ms` 恰等于 deadline。
+
+**为什么这样最优雅**：不新增旋钮（复用已有旋钮并**收紧其含义**）；不需要自己写队列（httplib
+的 `ThreadPool(n, mqr)` 已有界）；两个外壳共用同一个 pre_routing 钩子，所以 serve/mcp 不可能分叉。
+
+**实测（开环 140 req/s vs 容量 98 req/s，2 worker，无缓存）**：不 shed 时 p50 每秒线性增长
+232→644→1061→1489→1909→2338ms 且**从不拒绝**；deadline=150ms 时 p50 稳定 ~161ms、max 173ms。
+**吞吐不降**（592/6s = 98.7/s = 容量上限）—— shed 换来的是有界延迟与不再为已离开的调用方烧 CPU。
+
+**否掉的方案**：
+- *0 代指"关闭"*：会静默翻转一个已有取值（0 历史上 = 零容忍）。改用显式 `-1`。
+- *按面积/按连接数拍一个阈值做主控制*：队列长度不是病因，**等待时长**才是；deadline 自愈，
+  不需要运维猜一个与到达率相关的魔法数字。
+- *Hungarian / 每请求配额 / 自己写 accept 层*：前者用不上（配对问题不存在），后者不必要（见上）。
+- *把 max_pending 当主控制*：见下面的结构性缺陷。
+
+**两个必须记住的结构性事实**：
+1. **httplib 按连接排队，不按请求**。一个任务 = 一个连接，连续服务最多 `keep_alive_max_count`
+   条请求，期间**占住一个 worker**（阻塞在下一次 read，上限 `read_timeout`=10s）。
+   实测：12 请求/1 连接 → `queue_wait_count` +1；12 请求/12 连接 → +12。
+   所以 `--http-threads` 要按**并发连接数**而不是 QPS 定容；keep-alive 客户端多于线程数时
+   是按连接队头阻塞。
+2. **路径豁免只能在 HTTP 层存在**。`--queue-max-pending` 触顶时请求**尚未被解析**，httplib 直接
+   关 socket：客户端看到 broken pipe 而不是 503，且**探针也会被丢**（实测该配置下 5/5 `/healthz`
+   被丢）。所以它是资源兜底、默认 0（关）；要在线级保护探针必须换独立 listener，不是调大 cap。
+
+**不 shed 的东西**：`/healthz`、`/readyz`、`/metrics`（实测饱和中全 200）。杀掉探针会把过载变成
+重启，杀掉 /metrics 会抹掉诊断过载所需的数据。
+
+**日志纪律**：shed 不写每请求审计行（那正是 P1 事故的根因：日志把服务压垮）；只出一条一次性
+`queue_shed_start` warn，真相在 counter 里。指标计数在 logger 钩子的第一行，早于任何提前返回，
+所以 503 一定计入 `http_requests_total{status="503"}`。
+
 ### D8 API 契约只增不减；破坏性变更走 `/v2`
 
 - **决策**：`/v1/*` 响应字段只增不改语义；新增字段永远可选；MCP tool 的 JSON Schema 同样只增。
@@ -681,8 +721,9 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
    - MCP HTTP 传输此前**没设** task queue，跑在 httplib 默认 `max(8, cores-1)` 上 → `--workers`
      只约束 pipeline 数不约束并发，两个外壳行为分叉；现已统一为同一规则。
    - `--queue-timeout-ms` 取代三处硬编码超时（2000/5000/5000）。
-   - 结论：`request_ms` 只覆盖 handler 内部；accept→handler 的排队要靠客户端观测或
-     `ss -lnt` 的 Recv-Q。若将来要做真正的边缘 shedding，需要 httplib 之外的 accept 层计数。
+   - 结论（**已被 D9 推翻**）："真正的边缘 shedding 需要 httplib 之外的 accept 层计数"。
+     错：`Server::new_task_queue` 是**公开**扩展点，且 httplib 自己的 `ThreadPool(n, mqr)`
+     已经实现了有界队列与拒收。不需要换服务器，也不需要自己写 accept 层。
 7. ~~可选项：CLI 的 `compare`/`verify` 子命令（与 server/MCP 对齐）~~ **已完成**：
    - `src/cli.{hpp,cpp}` 新增 `cmd_compare` / `cmd_verify`，`main.cpp` 分发已加。
    - `compare <img-a> <img-b>`：余弦相似度，JSON 输出，无人脸退出码 2。
@@ -696,5 +737,15 @@ strace 里 body segment 被扣住 41.5 ms。修复：`src/server.cpp` 里 `svr.s
    - `src/metrics.hpp` / `src/metrics.cpp`：新增 `queue_wait_ms` 直方图并写入 `/metrics`。
    - `src/server.cpp` 与 `src/mcp.cpp` 都使用 `TimedTaskQueue`（server 接 metrics，mcp 暂不记）。
    - 现在 operators 可以从 `/metrics` 直接读 "队列里等了多久"，不再只能猜 `request_ms` 的长尾。
+
+9. ~~真正的边缘 shedding~~ **已完成**（见 D9）：
+   - `src/admission.hpp`（新）：每个 worker 线程的"已等容量"账本；`pool_budget_ms()` 是两段共用的
+     换算函数（两个外壳不能各写一遇，否则 deadline 语义分叉）。
+   - `src/timed_queue.hpp`：转传 `max_pending` 给 httplib 自己的 `ThreadPool(n, mqr)`（**不**自写队列），
+     并在 worker 取走连接时把等待写入 admission；`enqueue` 被拒时**自己计数**（httplib 不计数不记日志）。
+   - `src/auth.cpp`：pre_routing 里做 shed，位置在**鉴权与日志之前**；探针/`/metrics` 豁免；
+     shed 不写审计行，只写 counter + 一次性 warn。旗标解析合并为 `parse_queue_arg`（模板，
+     两个 Options 字段同名 → 漏字段是编译错误而不是又一次静默分叉）。
+   - 测试：`tests/admission.cpp`（ctest 3/3）。已做变异验证：去掉预算 floor 或删一行指标输出 → 测试变红。
 
 > 更新本文件时：任何架构决策变更（并发模型、MCP tool 列表、API 端点）必须在此同步，并记录变更原因，防止 compaction 后记忆丢失。

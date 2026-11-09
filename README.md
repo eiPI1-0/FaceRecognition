@@ -298,27 +298,63 @@ wrote), because writing a template is the irreversible act.
   before or after the index rebuild" does not require correlating two files. Measured: with
   `log.level: off` a 401 still produces its audit line (with peer address and whether a token was
   presented) while every event line disappears.
-  Events: `pool_busy` (warn — a 503 the client actually received, with `waited_ms`, `workers`,
-  `timeout_ms`), `lease_wait` (info — saturation precursor; 48 concurrent requests produce ~87 of
+  Events: `pool_busy` (warn — a 503 the client actually received, with `waited_ms`, `queued_ms`,
+  `budget_ms`, `deadline_ms`, `workers`), `queue_shed_start` (warn — **emitted once** when admission
+  shedding begins; subsequent sheds are counters, not log lines, because a line per shed is the P1
+  outage re-imported), `lease_wait` (info — saturation precursor; 48 concurrent requests produce ~87 of
   these, which is why it is not warn), `pipeline_error` (error — the exception text otherwise
   only ever reaches the response body), `unknown_tool` (MCP: the trace a prompt-injection probe
   for `enroll_person` leaves server-side).
-- **Backpressure has two shapes, and only one of them is visible by default.**
-  `new_task_queue` is set to `--http-threads` (default: equal to `--workers`). With them equal —
-  the default — at most `workers` handlers run, so a pipeline is always free when a handler asks:
-  `PipelinePool` never blocks, and **neither the 503 nor `pool_busy` can fire**; queuing happens
-  inside httplib's task queue, where the server cannot see it, so the only symptom is growing
-  client-side latency. Setting `--http-threads` above `--workers` makes `PipelinePool` the real
-  admission point, and then the valve works: measured with `--workers 2 --http-threads 16
-  --queue-timeout-ms 1`, 32 concurrent requests gave **30×503 + 30 `pool_busy` lines**. The cost
-  of raising it is real: `http_threads` images may be decoded concurrently (each bounded by
-  `--max-image-pixels`) and CPU is oversubscribed, so raise it only when you want the 503 to mean
-  something or want decode to overlap inference. The MCP HTTP transport previously ran on
-  httplib's own default pool (`max(8, cores-1)`), so `--workers` bounded pipelines but not
-  concurrency there — it now follows the same rule.
-- `--queue-timeout-ms` (default 5000) is how long a request waits for a free pipeline before it
-  gets 503; it applies to all three pipeline-using routes (`/v1/identify`, `/v1/embed`,
-  `/v1/people`), replacing three hard-coded numbers (2000/5000/5000).
+- **The unit of concurrency is the connection, not the request.** httplib queues one task per
+  accepted connection, and that task serves up to `keep_alive_max_count` requests — while holding
+  a worker thread, blocked in `read` for up to `read_timeout` (10 s) between them. Measured: 12
+  requests over **one** keep-alive connection raise `facerec_queue_wait_ms_count` by **1**; the
+  same 12 over 12 connections raise it by **12**. So `--http-threads` should be sized against
+  expected concurrent *connections*: `N` persistent clients and fewer threads than that means
+  head-of-line blocking by connection, not by request.
+- **One capacity-wait budget, enforced at both admission points.** Waiting for capacity happens
+  twice: in httplib's task queue (accept thread → worker), then in `PipelinePool` (handler →
+  pipeline). Giving each stage its own ceiling was wrong — the worst case was *queue ∞ + pool 5 s*.
+  `--queue-timeout-ms` (default 5000) is now the **end-to-end** budget: a connection that has
+  already waited past it is shed in the pre-routing hook (503, `code:"queue_expired"`,
+  `Retry-After: 1`) without touching a pipeline, and whatever is left is the pool's budget.
+  Measured continuity (`--workers 2 --http-threads 12 --queue-timeout-ms 100`): every refused
+  request's `queued_ms + waited_ms` equals the deadline — 48+52, 30+70, 66+34.
+  Values: `N>0` = the budget; **`0` = zero tolerance** (fail if capacity isn't free right now, the
+  historical meaning); **`-1` = never shed**. `0` deliberately does not mean "off" — redefining an
+  existing value silently would be the worst way to make this change.
+- **What shedding actually buys, measured.** Open-loop flood at 140 req/s against 2 workers
+  (capacity ≈ 98 req/s, cache off, 1.3 MB JPEG), 6 s:
+
+  | setting | p50 over the run | p99 | outcome |
+  |---|---|---|---|
+  | `--queue-timeout-ms -1` (no shed) | 232 → 644 → 1061 → 1489 → 1909 → **2338 ms** | 2526 ms | 840/840 "served" |
+  | `--queue-timeout-ms 150` | **~161 ms, flat** | 171 ms | 592 served + 248 fast 503 |
+
+  Without shedding, latency grows **linearly forever** and nothing is refused: a 20 ms job makes
+  the client wait 2.3 s, and the CPU spent on callers who already left is exactly what the queued
+  requests need — that is the death spiral. With it, every client gets an answer in ≤ 173 ms.
+  **Throughput does not drop**: 592/6 s = 98.7/s is the capacity, which the no-shed run also
+  could not exceed. The "100% served" column is not a win — those callers waited seconds, and any
+  real client with a 1 s timeout would have failed anyway, after the work was already burned.
+- **Probes and `/metrics` are never shed** (verified 200 while the flood was running). Shedding a
+  probe turns an overload into a pod restart, and shedding `/metrics` removes exactly the data
+  needed to diagnose it. This exemption is **path-based, so it only exists at the HTTP layer**.
+- `--queue-max-pending` (default 0 = unbounded) is the resource backstop: a hard cap on
+  connections waiting in front of the workers. Measured with `--workers 2 --queue-max-pending 4`
+  and 30 simultaneous arrivals: **6 served, 24 connections closed, `facerec_queue_dropped_total 24`**.
+  The client sees a broken pipe, **not** a 503 — at that point the request has not been parsed, so
+  no HTTP answer is possible. **Measured hazard:** in that same run, 5 concurrent `/healthz`
+  requests were **all dropped** (0×200). A connection-level drop cannot honour the path exemption,
+  so turning this on puts liveness probes at risk; that is why the default is off and why the
+  deadline is the primary control. Protecting probes at the connection level would need a separate
+  listener, not a bigger cap.
+- `facerec_queue_wait_ms` is a **histogram over connections**; `facerec_queue_expired_total` and
+  `facerec_queue_dropped_total` are the two shed paths at the two admission points. `pool_busy`
+  events now carry `queued_ms`, `budget_ms` and `deadline_ms`, because "used the whole budget in
+  the queue" and "queue was instant, pool was empty" are different faults with different fixes.
+- The MCP HTTP transport follows the same rules (same hook, same budget); stdio never enters a
+  queue, so its budget is the full deadline.
 - SIGINT/SIGTERM stops accepting new connections and lets in-flight handlers finish.
 - The listen backlog is set to 1024 (`CPPHTTPLIB_LISTEN_BACKLOG`, see `CMakeLists.txt`);
   cpp-httplib's default of 5 makes the kernel drop SYNs past 5 simultaneous connects, which
