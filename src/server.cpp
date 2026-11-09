@@ -31,7 +31,9 @@
 // 经常是几 MB：客户端只要没显式写 image/*（curl --data-binary 的默认 Content-Type 就是
 // form-urlencoded），就会收到一个与图片大小毫无关系的 413。真正的上限是运行时设置的
 // set_payload_max_length，所以这里把编译期那道抬到不可能触发。
+#ifndef CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH
 #define CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH (64 * 1024 * 1024)
+#endif
 #include "httplib.h"
 
 namespace facerec {
