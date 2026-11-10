@@ -3,7 +3,7 @@
 
 // 各子命令共用的参数装配：内置默认 < 配置文件 < CLI 覆盖。四个外壳共用同一份，
 // 不在每个 cmd_* 里重写一遍（历史上 --http-threads 就分叉过一次）。
-// 头文件里不写 using namespace：这里全是限定名。
+// 头文件里不写 using namespace：这里全是限定名（`facerec::PipelineConfig`）。
 
 #include <iostream>   // parse_queue_arg 的模板定义在这里，报错要能打印
 #include <string>
@@ -26,7 +26,7 @@ std::string sanitize_person_name(const std::string& raw, std::string* reason);
 
 // 依次应用：内置默认 < 配置文件 < CLI 覆盖，然后解析资产路径并校验。
 // 失败时把错误写到 stderr 并返回 false（调用方统一 return -1）。
-bool load_pipeline_config(const ConfigArgs& args, PipelineConfig& cfg);
+bool load_pipeline_config(const ConfigArgs& args, facerec::PipelineConfig& cfg);
 
 // --set key=value / --set=key=value。解析失败时返回 false。
 bool parse_set_arg(const std::string& arg, int& i, int argc, char* argv[],
@@ -89,7 +89,7 @@ bool parse_config_arg(const std::string& arg, int& i, int argc, char* argv[],
                       ConfigArgs& out);
 
 // 模型文件不在场时，报错要指名是哪个 knob 指错了（而不是 OpenCV importer 的原话）。
-bool check_assets(const PipelineConfig& cfg);
+bool check_assets(const facerec::PipelineConfig& cfg);
 
 }  // namespace cli
 

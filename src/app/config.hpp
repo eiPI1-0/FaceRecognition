@@ -9,6 +9,10 @@
 
 #include <opencv2/core.hpp>
 
+// 配置也在 `facerec::` 里：它是库里最后一个待在全局作用域的公开头。
+// （层序不变：`app/config.hpp` 谁都能 include，方向仍是向下的。）
+namespace facerec {
+
 // 流水线的全部可调项，main.cpp 的唯一来源。
 // 库层（engine.hpp / gallery.hpp）绝不包含本头：把 app 层概念漏进库头 = 每次调参全量重编。
 struct PipelineConfig {
@@ -138,4 +142,6 @@ bool check_model_files(const PipelineConfig& cfg, std::string& err,
 // 把当前配置写成 flat 点分 key 的 YAML 风格文本（可读、可 grep、与 --set 同构）。
 void dump_config(std::ostream& os, const PipelineConfig& cfg);
 
+
+}  // namespace facerec
 #endif  // CONFIG_HPP

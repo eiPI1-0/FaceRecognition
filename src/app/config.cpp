@@ -13,6 +13,10 @@
 
 #include "common/log.hpp"   // parse_log_level：把枚举校验放在配置层（file:line 报错）
 
+// 配置也在 `facerec::` 里：它是库里最后一个待在全局作用域的公开头。
+// （层序不变：`app/config.hpp` 谁都能 include，方向仍是向下的。）
+namespace facerec {
+
 namespace {
 
 // 极小编辑距离，用于 "recog_thresh" 这类拼错的提示
@@ -571,3 +575,5 @@ void dump_config(std::ostream& os, const PipelineConfig& cfg) {
         }
     }
 }
+
+}  // namespace facerec

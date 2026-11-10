@@ -9,6 +9,9 @@
 
 #include "app/config.hpp"
 
+// args.cpp 现在需要 facerec（`PipelineConfig` / `Knob` / `knobs()` 都在里面）。
+using namespace facerec;
+
 
 namespace cli {
 
