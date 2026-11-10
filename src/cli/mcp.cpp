@@ -5,7 +5,6 @@
 #include "app/config.hpp"
 #include "serve/mcp.hpp"
 #include "serve/server.hpp"
-#include <httplib.h>
 
 #include <iostream>
 #include <string>
