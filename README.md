@@ -25,7 +25,7 @@ CMake target — the build graph is the architecture, not a description of it.
 
 | Property | Enforced by |
 |---|---|
-| A `matched` answer is a statement about **your** gallery, not a bare cosine. At startup, `serve`/`mcp` compute what the configured threshold does to *the gallery they loaded* and log a warning when it is too loose; `/readyz` answers the same numbers. | `check_recognize_threshold` (`src/app/api.cpp`) → startup audit line + `/readyz` (`self_far_1n`, `far_1n_resolution`) |
+| A `matched` answer is a statement about **your** gallery, not a bare cosine. At startup, `serve`/`mcp` compute what the configured threshold does to *the gallery they loaded* and log a warning when it is too loose; `/readyz` answers the same numbers. | `check_recognize_threshold` (`src/app/api.cpp`) → startup audit line + `/readyz` (`far_1n_estimate`, `far_1n_resolution`) |
 | Accuracy claims come from photos the gallery never saw. | `./main evaluate <dataset>` (first N photos enrolled, next M held out); the report's own figures are asserted in `tests/evaluation.cpp` |
 | A `nan` score or a phantom box cannot reach a client, even though the pinned YuNet export computes 6 of its 1076 anchors unreliably. | two load-bearing gates in `PriorBox::decode` (a score gate written so NaN *fails* it; a geometry gate, because `iou_score` is clamped and garbage confidence can forge 0.99) — mutation-tested in `tests/decode_gates.cpp` |
 | Overload returns `503 + Retry-After` inside **one** end-to-end budget; it never queues without bound, and health probes are never shed. | one admission budget applied at both waiting points (`src/serve/admission.hpp`, `timed_queue.hpp`), accounting asserted in `tests/admission.cpp` |
@@ -34,7 +34,7 @@ CMake target — the build graph is the architecture, not a description of it.
 | A prompt-injectable caller cannot enroll a biometric template. | MCP exposes four read-only tools; `tools/call enroll_person` answers `-32602 unknown tool` (`src/serve/mcp.cpp`) |
 | Credentials on disk are useless to anyone who reads them. | tokens stored only as SHA-256, compared in constant time, issued from a 32-byte CSPRNG; binding to a non-loopback address with an empty token table **refuses to start** (`src/serve/auth.{hpp,cpp}`, `./main token`) |
 | The audit trail never contains biometrics. | request audit lines carry `method`/`path`/`status`/`ms`/`caller`/`bytes` — never image bytes, embeddings or names — and a `401` is audited even under `--quiet`, with peer and whether a token was presented |
-| Every tunable is declared exactly once. | the `knobs()` table (`src/app/config.cpp`) generates the file parser, `--set`, range validation, `--dump-config` and `config.example.yml`; an unknown key is a hard stop with a nearest-name suggestion |
+| Every tunable is declared exactly once. | the `knobs()` table (`src/app/config.cpp`) generates the file parser, `--set`, range validation, `--dump-config` and `config.example.yml`. A key it does not recognize is reported with a nearest-name suggestion — silently ignored in a config file, a hard stop from `--set` |
 
 ---
 
