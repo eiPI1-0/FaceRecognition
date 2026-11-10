@@ -334,6 +334,14 @@ Serving throughput (this machine, 16 cores, **Release**, `--cache-entries 0`, on
 | 8 | 100 ms | 136 ms | 150 ms | ≈193 | 147 MB |
 | 16 (64 clients, oversubscribed) | 185 ms | 271 ms | 307 ms | ≈187 | 217 MB |
 
+Re-measured on the current build with `scripts/stress.py` (keep-alive clients, one 48 KB JPEG,
+`--cache-entries 0`): **158 req/s** at 4 workers (p50 25 ms) and **222 req/s** at 8 (p50 34 ms);
+with the result cache on and the same image repeated, 3.8–5.1k req/s. The table above is the
+stricter case — a 1.3 MB image and a fresh connection per request — so the headline figures are
+the conservative pair. One caveat that bites people running their own numbers: with keep-alive and
+more clients than workers, a worker holds its connection for `keep_alive_max_count` requests, so
+the extra clients wait at the **connection** level and p99 jumps to seconds while p50 stays flat.
+
 Beyond ~8 workers the CPU is saturated; scale out with several processes behind a
 reverse proxy rather than by adding workers.
 
