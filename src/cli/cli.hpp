@@ -4,6 +4,10 @@
 #include <string>
 #include <vector>
 
+// 顶层 usage 文本由入口 src/main.cpp 提供（命令名单就是那里的分发表）；
+// demo 的坏参数路径需要它，所以声明在这里。
+void print_usage(const char* argv0);
+
 // 子命令入口（P1: identify / enroll；serve/mcp 留 P2/P3 打桩）。
 int cmd_identify(int argc, char* argv[]);
 int cmd_enroll(int argc, char* argv[]);

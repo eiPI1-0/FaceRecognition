@@ -792,10 +792,10 @@ git revert --no-commit <P3 的 commit>     # 只退命名空间
 | P1.4 | `scripts/check_layers.py` + ctest `layers`（§4.6） | ✅ 21 sources ok；三类负例已实测会失败 | `acc6903` |
 | P1.5 | 文档同步（README/AGENTS/PLAN/CHANGELOG，§4.7） | ✅ README 分层表 + AGENTS 新增 Layout 节 + PLAN §7/§14 + CHANGELOG 一条 | `acc6903` |
 | P1.6 | 验证 §7 → commit | ✅ ctest 5/5 0.73 s；clean build 30.10 s（基线 32.86 s）；identify 1.000/0.0226；blank→`faces:[]` rc0；`./main 1` rc255；dump==example；serve 200×3 + 日志行全 parse；mcp stdio 4 工具 | `acc6903` |
-| P2.1 | 抽 `cli/args.{hpp,cpp}`（§5.2） | ⬜ | |
-| P2.2 | 8 个子命令一文件 + usage/`is_image_path` 归位（§5.1） | ⬜ | |
-| P2.3 | `Recognizer`/`recognize_frame`/`make_dnn_config`/`run_pipeline`/`run_demo` → `cli/demo.{hpp,cpp}`；`main.cpp` 只剩 `print_usage` + 分发（§5.3） | ⬜ | |
-| P2.4 | 验证 §7 → commit | ⬜ | |
+| P2.1 | 抽 `cli/args.{hpp,cpp}`（§5.2） | ✅ `ConfigArgs` + 6 个 helper；`parse_queue_arg` 是模板，**定义必须留在 .hpp** | 本次提交 |
+| P2.2 | 8 个子命令一文件 + usage/`is_image_path` 归位（§5.1） | ✅ 八个命令文件 + `args.cpp` + `demo.cpp`；每个命令保留自己的 `*_usage()`，`is_image_path` 归 identify | 本次提交 |
+| P2.3 | 同上 | ✅ 全部搬过去（main.cpp 445 → **97 行**）。**偏离 §5.3**：`print_usage` 留在入口，理由写进 main.cpp 与 cli.hpp——命令名单就是入口的 `if/else`，拆到 `cli/` 必有一个说谎。`sanitize_person_name` 从 compare 块挪到 `args.cpp`（它是 enroll 的输入校验，不是比较逻辑） | 本次提交 |
+| P2.4 | 验证 §7 → commit | ✅ ctest 5/5 0.73 s；八个 `--help` 的 diff 只有 include 块；identify 1.000 / blank `faces:[]`；enroll dry-run；token；compare+verify rc0；demo rc255 + Xvfb 下窗口停住（rc124）；dump==example；serve 三探针 200 + 日志行全 parse；mcp stdio 4 工具；clean build 29.83 s | 本次提交 |
 | P3.1 | `core` 进 `namespace facerec` + 消费方限定（§6.1） | ⬜ | |
 | P3.2 | `auth.hpp` 前向声明 / `auth.cpp` 自己 include（§6.2） | ⬜ | |
 | P3.3 | 验证 + 编译耗时对比（§6.3/§7.6） → commit | ⬜ | |
@@ -813,6 +813,17 @@ grep -q 'include <httplib.h>' src/serve/auth.hpp && echo "P3.2 未做"
 
 然后从台账里**第一个 ⬜** 继续；动手前先跑一次 §7.1 确认当前状态是绿的
 （半截状态会编译失败，这本身也是定位信息）。
+
+**P2 的实测与发现（2026-08-22）**
+- cli 层单 TU：11.55 → **8.67 s**（serve.cpp）；改一个命令的重编：**1.4-1.9 s**。
+- cli 层总编译 CPU：11.55 → **37.2 s**（10 个 TU 各自解析 header）；clean build：32.86 → **29.83 s**（-j16）。
+- **重 TU 贵在 codegen，不在 header 解析**：token.cpp front-end 1.68 s / -O0 3.59 s / -O3 7.92 s；
+  `#include <httplib.h>` 单独 `-fsyntax-only` 只要 **1.33 s**。⇒ §6.3（P3.2 让 `auth.hpp` 不 include
+  httplib）按**层正确性**做，不要按性能做；原先写成性能修是猜的。
+- `token.cpp` 也必须 include `cli/args.hpp`（它用 `ConfigArgs` / `parse_config_arg` / `parse_set_arg`）：
+  拆 cli 时最容易漏的一个 include。
+- `evaluate.cpp` 的标准库 include 有几个原本被别的命令顺手带进来，拆出来必须显式补：
+  `<atomic> <charconv> <fstream> <random> <thread>` + `serve/pipeline_pool.hpp`。
 
 **执行中发现的新情况记在这里**（一行一条，带日期）：
 

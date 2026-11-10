@@ -83,9 +83,21 @@ target_include_directories(facerec_serve PUBLIC ${FACEREC_ROOT}/src)
 target_link_libraries(facerec_serve PUBLIC facerec_app facerec_common facerec_httplib)
 
 # ---- 层 cli + 入口 ----
+# 一个子命令一个文件：cmd_* 的名字与签名声明在 src/cli/cli.hpp，所以入口的分发表不随
+# 拆分变化。逐个列出是故意的——scripts/check_layers.py 会断言每个 src/**/*.cpp 都出现在
+# 这里，漏一个就是 ctest 失败（而不是"编过了但没跑"）。
 add_executable(main
     src/main.cpp
-    src/cli/cli.cpp
+    src/cli/args.cpp
+    src/cli/demo.cpp
+    src/cli/identify.cpp
+    src/cli/enroll.cpp
+    src/cli/token.cpp
+    src/cli/serve.cpp
+    src/cli/mcp.cpp
+    src/cli/compare.cpp
+    src/cli/verify.cpp
+    src/cli/evaluate.cpp
 )
 target_link_libraries(main PRIVATE facerec_serve)
 

@@ -869,11 +869,22 @@ common(0) < core(1) < app(2) < serve(3) < cli(4) < src/main.cpp(5)
   `face_tracker.cpp` / `metrics.cpp` / `evaluation.cpp` 在 CMake 里各列 3 遍）；ctest 5/5（0.74 s），`identify` 自匹配 1.0 / 交叉 0.0226，`serve` 的 `/healthz`+`/readyz`+`/metrics`
   全 200 且 stderr 每行 `json.loads` 通过，`mcp --transport stdio` 四个工具在，
   `--dump-config` 与 `config.example.yml` 逐字节一致。
-- **P2（待做，一个 commit）**：`src/cli/cli.cpp`（1266 行，单 TU `-O3` 编译 11.55 s）按 RFPLAN §5.1 的表拆成
-  `cli/args.{hpp,cpp}` + 每个子命令一个文件 + `cli/demo.{hpp,cpp}`；`src/main.cpp` 从 442 行降到 ~90 行。
-  `cmd_*` 的名字与签名不变，所以分发表不动。
+- **P2（已落地，一个 commit）**：`src/cli/cli.cpp`（**635** 行，单 TU `-O3` 编译 11.55 s）按 RFPLAN §5.1
+  拆成 `cli/args.{hpp,cpp}` + 每个子命令一个文件 + `cli/demo.{hpp,cpp}`；`src/main.cpp` 442 → **97 行**。
+  `cmd_*` 的名字与签名不变，所以分发表不动。`run_pipeline` / `recognize_frame` / `Recognizer` /
+  `FrameOut` / `make_dnn_config` 一起搬进 `demo.cpp`（全仓库唯一的 `cv::imshow` 在那里）。
+  **偏离 §3.4 的一处**：`print_usage` 留在 `src/main.cpp`，因为命令名单就是入口的 `if/else`——拆到
+  `cli/` 就会有一个说谎（声明放 `cli/cli.hpp`，供 demo 的坏参数路径调用）。
+  实测：cli 层最大 TU **11.55 → 8.67 s**；改一个命令的重编 **11.55 → 1.4-1.9 s**；cli 层总编译 CPU
+  **11.55 → 37.2 s**（每 TU 各自解析 header，这是拆分的代价，被并行隐藏）；clean build **32.86 → 29.83 s**。
+  行为逐字节不变：八个 `--help` 的 diff 只有 include 块增删；`identify` 1.00 / blank `faces=[]` /
+  demo `rc=255` / `--dump-config` 往返 / `serve` 三探针 200 + stderr 每行可 `json.loads` /
+  `mcp` 四工具 / Xvfb 下 demo 窗口停住（`rc=124`）。
 - **P3（待做，两个独立小 commit）**：`core` 进 `namespace facerec`；`auth.hpp` 停止 include
   `<httplib.h>`（把传输类型从鉴权接口里赶出去）。两条各自可验证，见 RFPLAN §6。
+  **P2 的实测给 P3.2 降了温**：重 TU 贵在 codegen 不在 parse（token.cpp：front-end 1.68 s /
+  -O0 3.59 s / -O3 7.92 s；`#include <httplib.h>` 单独 `-fsyntax-only` 1.33 s）。所以 P3.2 按
+  **层正确性**做（serve 不该依赖 cli），不要按性能做。
 
 **守卫的语义**（防止后人"简化"）：`layers` 只保证**编译期** include 方向与 CMake 覆盖，不保证运行时
 依赖；边界靠"`src/` 目录名 ↔ `facerec_*` target 名"对齐来表达，不设第二份真相（没有 boundary.yaml

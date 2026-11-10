@@ -72,6 +72,19 @@ than a strict versioning scheme.
   and every stderr line still parses as JSON, `mcp --transport stdio` lists the same four tools, and
   `--dump-config` is byte-identical to `config.example.yml`.
 
+- **`cli` is now one file per subcommand.** `src/cli/cli.cpp` (635 lines, one 11.55 s translation
+  unit) is replaced by `src/cli/args.{hpp,cpp}` (the config plumbing every command shares) and one
+  file per command — `identify` `enroll` `token` `serve` `mcp` `compare` `verify` `evaluate` — plus
+  `src/cli/demo.{hpp,cpp}` for the live window loop, which also absorbed `run_pipeline` and
+  `recognize_frame` from `src/main.cpp` (that file is now 97 lines: usage + dispatch). The `cmd_*`
+  names and signatures still live in `src/cli/cli.hpp`, so the dispatch table did not change, and no
+  command behaviour did: every `--help` is byte-identical apart from include-block changes. Measured:
+  recompiling after editing one command 11.55 s → **1.4-1.9 s**, largest cli translation unit 8.67 s,
+  clean build 32.9 → **29.8 s** (`-j16`); the cli layer's total compile CPU rises to 37.2 s because
+  each file parses its own headers, which parallelism hides. `print_usage` deliberately stays in
+  `src/main.cpp`: the command list *is* the dispatch table there, and splitting them guarantees one
+  of the two eventually lies.
+
 ### Fixed
 
 - The `recognize.thresh` knob comment asserted the old default "is not a per-pair number… pick
