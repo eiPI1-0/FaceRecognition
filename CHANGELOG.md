@@ -54,6 +54,24 @@ than a strict versioning scheme.
   has the full table. If 0.2 was set deliberately, set it explicitly — the self-check now says
   out loud what it costs.
 
+- **Source layout: one source root, layers instead of a pile.** `src/` is now the only root (CMake
+  adds exactly one include directory), every project include names the layer it reaches into
+  (`#include "core/engine.hpp"`), and the order `common → core → app → serve → cli`
+  (`src/main.cpp` on top) is **asserted** by a new `ctest` target (`scripts/check_layers.py`): it
+  fails on an upward include, on an unqualified project include, and on a `src/**/*.cpp` that is not
+  listed in `CMakeLists.txt`. That last failure used to be silent — the source list was written out
+  four times (the executable plus three tests, each with its own copy), so a file missing from a
+  test's list compiled and simply never linked. The repo root now holds no code: `FaceRecognition.h`,
+  the forwarding header left over from an earlier split, is deleted, and `main.cpp` moved to
+  `src/main.cpp`. The build is four layer libraries (`facerec_common` / `_core` / `_app` / `_serve`)
+  plus a `facerec_httplib` INTERFACE target that carries both httplib macros, so a new target can no
+  longer forget one and silently run with a different limit; the tests link the libraries instead of
+  repeating file lists. No behaviour change: clean build 32.9 s → 30.1 s on the same machine, 26
+  objects with no source compiled twice (four files used to be listed three times each), `ctest` 5/5, `identify`
+  self-match 1.000 / cross-identity 0.0226, `serve` answers `/healthz` `/readyz` `/metrics` with 200
+  and every stderr line still parses as JSON, `mcp --transport stdio` lists the same four tools, and
+  `--dump-config` is byte-identical to `config.example.yml`.
+
 ### Fixed
 
 - The `recognize.thresh` knob comment asserted the old default "is not a per-pair number… pick

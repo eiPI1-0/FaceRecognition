@@ -18,8 +18,8 @@
 
 #include <opencv2/core.hpp>
 
-#include "face_def.hpp"
-#include "face_tracker.hpp"
+#include "core/face_def.hpp"
+#include "core/face_tracker.hpp"
 
 namespace {
 

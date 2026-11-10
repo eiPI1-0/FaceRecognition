@@ -1,0 +1,573 @@
+#include "app/config.hpp"
+
+
+#include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <filesystem>
+#include <unistd.h>
+#include <fstream>
+
+#include "common/log.hpp"   // parse_log_level：把枚举校验放在配置层（file:line 报错）
+
+namespace {
+
+// 极小编辑距离，用于 "recog_thresh" 这类拼错的提示
+int edit_distance(const std::string& a, const std::string& b) {
+    std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); ++j) prev[j] = static_cast<int>(j);
+    for (size_t i = 1; i <= a.size(); ++i) {
+        cur[0] = static_cast<int>(i);
+        for (size_t j = 1; j <= b.size(); ++j) {
+            const int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+        }
+        prev = cur;
+    }
+    return prev[b.size()];
+}
+
+// 去掉分隔符，让 `recogn_thresh` 与 `recognize.thresh` 在拼写纠错时等价
+std::string trim(const std::string& s) {
+    const size_t b = s.find_first_not_of(" \t\r");
+    if (b == std::string::npos) return std::string();
+    const size_t e = s.find_last_not_of(" \t\r");
+    return s.substr(b, e - b + 1);
+}
+
+std::string normalize_key(const std::string& key) {
+    std::string out;
+    out.reserve(key.size());
+    for (char c : key) {
+        if (c != '.' && c != '_') out.push_back(c);
+    }
+    return out;
+}
+
+std::string last_segment(const std::string& key) {
+    const size_t dot = key.rfind('.');
+    return dot == std::string::npos ? key : key.substr(dot + 1);
+}
+
+// 组前缀（`log.audit` → `log`）。空串表示这个 key 没有组，不参与同组提示。
+std::string head_segment(const std::string& key) {
+    const size_t dot = key.find('.');
+    return dot == std::string::npos ? std::string() : key.substr(0, dot);
+}
+
+// 读 knob 当前值（数值类型统一成 double；string 返回 false）
+bool knob_as_double(const Knob& k, const PipelineConfig& cfg, double* out) {
+    if (const auto* p = std::get_if<IntMember>(&k.member)) {
+        *out = static_cast<double>(cfg.*(*p));
+        return true;
+    }
+    if (const auto* p = std::get_if<FloatMember>(&k.member)) {
+        *out = static_cast<double>(cfg.*(*p));
+        return true;
+    }
+    return false;
+}
+
+std::string knob_as_string(const Knob& k, const PipelineConfig& cfg) {
+    if (const auto* p = std::get_if<StrMember>(&k.member)) {
+        return cfg.*(*p);
+    }
+    return std::string();
+}
+
+std::string format_range(const Knob& k) {
+    const bool has_lo = std::isfinite(k.lo);
+    const bool has_hi = std::isfinite(k.hi);
+    if (has_lo && has_hi) {
+        return std::string("[") + std::to_string(k.lo) + ", " + std::to_string(k.hi) + "]";
+    }
+    if (has_lo) return "> " + std::to_string(k.lo);
+    if (has_hi) return "< " + std::to_string(k.hi);
+    return "any";
+}
+
+}  // namespace
+
+const std::vector<Knob>& knobs() {
+    // key 命名 = 配置文件里的 key = --set 的 key = dump 的 key，三者同一字符串。
+    // 表顺序 = dump 顺序；group 变化处打印一行分节标题，comment 写在该 key 上方。
+    static const std::vector<Knob> table = {
+        {"paths.root", &PipelineConfig::asset_root,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "paths", "relative asset paths below resolve against this. Default: the working "
+                  "directory. `paths.root: .` inside a config file anchors the assets next "
+                  "to that file, which lets the binary run from any cwd."},
+        {"paths.detector_model", &PipelineConfig::detector_model,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "paths", "relative paths resolve against paths.root (default: cwd)"},
+        {"paths.embedder_model", &PipelineConfig::embedder_model,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "paths", ""},
+        {"paths.gallery_index", &PipelineConfig::gallery_index,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "paths", "on-disk enrollment index. Built once (detect+embed per photo), then read "
+                  "by every worker instead of recomputing; also feeds the result-cache "
+                  "fingerprint. Empty string disables persistence.",
+         true},
+        {"auth.tokens_file", &PipelineConfig::auth_tokens_file,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "auth",
+         "bearer token table (line format `name:sha256:<64 hex>`). Empty = no auth, which is "
+         "only allowed while the server binds a loopback address; a non-loopback `--host` "
+         "without this file refuses to start",
+         true},
+        {"log.sink", &PipelineConfig::log_sink,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "logging",
+         "structured log destination: stderr | off | a file path (relative to cwd). One JSON "
+         "object per line, shared by audit lines and operational lines so they interleave in "
+         "time order; query lines carry no person id, name, embedding or image bytes"},
+        {"log.level", &PipelineConfig::log_level,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "logging",
+         "operational log level: off | error | warn | info | debug (audit lines ignore it - "
+         "only log.sink=off can silence those)"},
+
+        {"paths.data_dir", &PipelineConfig::data_dir,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "paths", "one subfolder per enrolled person"},
+
+        {"detector.input_w", &PipelineConfig::detector_input_w, 32, 1024,
+         "model contract", "MODEL CONTRACT: only change together with the model file."},
+        {"detector.input_h", &PipelineConfig::detector_input_h, 32, 1024,
+         "model contract", "the prior grid (strides 8/16/32/64) is derived from these; if the "
+                           "model's anchor count disagrees, PriorBox::decode stops with a message"},
+        {"embedder.input_w", &PipelineConfig::embedder_input_w, 32, 512,
+         "model contract", "the aligned crop is warped to exactly this size (ArcFace reference "
+                           "template scaled to it), so the model must be trained on that crop"},
+        {"embedder.input_h", &PipelineConfig::embedder_input_h, 32, 512,
+         "model contract", ""},
+
+        {"detector.conf_thresh", &PipelineConfig::conf_thresh, 0.0, 1.0,
+         "detection", "face is kept above this detector confidence"},
+        {"detector.nms_thresh", &PipelineConfig::nms_thresh, 0.0, 1.0,
+         "detection", ""},
+        {"detector.keep_top_k", &PipelineConfig::keep_top_k, 1, 10000,
+         "detection", ""},
+
+        {"detector.out_loc", &PipelineConfig::out_loc,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "model contract", "fused head only: box+landmark tensor, 14 floats per anchor ('loc')"},
+        {"detector.out_conf", &PipelineConfig::out_conf,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "model contract", "2-class score tensor ('conf')"},
+        {"detector.out_iou", &PipelineConfig::out_iou,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "model contract", "fused head only: objectness tensor ('iou'). A per-level head "
+                           "(cls_8/obj_8/bbox_8/kps_8...) is detected from the model's own layer "
+                           "names and decoded automatically - these three keys do not apply to it"},
+
+        {"recognize.thresh", &PipelineConfig::recogn_thresh, 0.0, 1.0,
+         "recognition", "cosine above which a match is reported. It is NOT a per-pair "
+                        "number: identify takes a max over the whole gallery, so the "
+                        "false-accept rate grows with gallery size (measured on LFW: "
+                        "per-pair FAR 1.3% at 0.20, but ~100% against a 610-person "
+                        "gallery). Pick it with './main evaluate <dataset>' on your own "
+                        "population; serve/mcp log the estimate at startup"},
+        {"recognize.self_far_warn", &PipelineConfig::self_far_warn, 0.0, 1.0,
+         "recognition", "warn at startup when the gallery's own cross-match estimate of "
+                        "the 1:N false-accept rate reaches this (0 = always warn)"},
+        {"display.rfactor", &PipelineConfig::rfactor, 1, 16,
+         "display", "display frame = detector input x rfactor; letterbox canvas, and the "
+                    "scale draw()/putText() map detection coords by"},
+
+        {"tracker.iou", &PipelineConfig::tracker_iou, 0.0, 1.0,
+         "tracking", "one of two association gates: IoU above which a detection is the same "
+                     "track. The other gate is tracker.dist_ratio - a face at the frame edge "
+                     "alternates between whole-face and visible-part boxes, measured adjacent-"
+                     "frame IoU 0.37, so IoU alone splits one face into parallel tracks"},
+        {"tracker.dist_ratio", &PipelineConfig::tracker_dist, 0.0, 3.0,
+         "tracking", "second association gate: a detection whose center moved less than this "
+                     "times the mean box size is the same track (the budget also widens with "
+                     "0.5 x speed x frames-since-last-detection, since prediction error grows). "
+                     "Measured: 0.6 keeps adjacent faces 1 face-width apart separate"},
+        {"tracker.detect_every", &PipelineConfig::detect_every, 1, 30,
+         "tracking", "measured: detection 0.93 ms vs embedding 4.47 ms/face, so raising this "
+                     "saves little (max box error 5.9px at 1, ~18px at 5)"},
+        {"tracker.max_lost", &PipelineConfig::max_lost, 0, 1000,
+         "tracking", "frames a confirmed track is carried (predicted geometry, cached label) "
+                     "without a matching detection; tracks outside the frame are dropped at "
+                     "once. 15 used to mean a stale box plus a random name for half a second"},
+        {"tracker.min_hits", &PipelineConfig::min_hits, 1, 100,
+         "tracking", "detections a track must accumulate before it is shown or recognized: 2 "
+                     "makes single-frame false positives structurally invisible (costs one "
+                     "frame of latency for a new face)"},
+
+        {"align.border", &PipelineConfig::align_border,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "alignment", "a face at the frame edge makes the square alignment window stick out of "
+                      "the image; how to fill the part outside: constant (black, default) | "
+                      "reflect | replicate. The warp comes from the landmarks, so the fill does "
+                      "not change geometry, only what the missing pixels are. Measured over 312 "
+                      "edge-clipped cases (mean cosine to the unclipped reference embedding): "
+                      "constant 0.507, reflect 0.509, replicate 0.489 - default stays black"},
+        {"dnn.backend", &PipelineConfig::backend,
+         -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         "backend", "cpu | cuda | openvino (cuda/openvino need an OpenCV build with them)"},
+        {"dnn.batch_mode", &PipelineConfig::batch_mode, -1, 1,
+         "backend", "0 = auto by backend (batch is a regression on the OpenCV CPU backend), "
+                    "1 = force batch, -1 = force one-at-a-time"},
+    };
+    return table;
+}
+
+bool find_knob(const std::string& key, const Knob** knob, std::vector<std::string>* candidates) {
+    for (const auto& k : knobs()) {
+        if (key == k.key) {
+            if (knob) *knob = &k;
+            return true;
+        }
+    }
+    if (knob) *knob = nullptr;
+    if (!candidates) return false;
+    // 相近 key 提示：去掉分隔符后比编辑距离（`recogn_thresh` → `recognize.thresh` 只差 3），
+    // 或末段相同（拼错末段的常见情形）。
+    const std::string want = normalize_key(key);
+    const std::string head = head_segment(key);
+    for (const auto& k : knobs()) {
+        const bool near = edit_distance(want, normalize_key(k.key)) <= 3;
+        // 末段相同也能命中：用户漏掉组前缀时（`thresh` → `recognize.thresh`）
+        const bool same_tail = last_segment(key) == last_segment(k.key);
+        // 同组也命中：编辑距离对**改名**无能为力（`log.audit` 与 `log.sink` 差 5），
+        // 而改名后旧配置文件里那一行正是最常见的事故。列出同组全部键，用户自己就能挑对。
+        const bool same_group = !head.empty() && head == head_segment(k.key);
+        if (near || same_tail || same_group) candidates->push_back(k.key);
+    }
+    return false;
+}
+
+bool set_knob(const Knob& knob, const std::string& value, PipelineConfig& cfg, std::string& err) {
+    if (auto* p = std::get_if<StrMember>(&knob.member)) {
+        if (value.empty() && !knob.allow_empty) {
+            err = std::string(knob.key) + ": empty value";
+            return false;
+        }
+        cfg.*(*p) = value;
+        return true;
+    }
+
+    // 严格解析：整串必须是数字，拒绝 "0.5x" 这类尾巴
+    const char* begin = value.c_str();
+    const char* end = begin + value.size();
+
+    if (auto* p = std::get_if<IntMember>(&knob.member)) {
+        int parsed = 0;
+        const auto res = std::from_chars(begin, end, parsed);
+        if (res.ec != std::errc() || res.ptr != end) {
+            err = std::string(knob.key) + ": '" + value + "' is not an integer (expected " +
+                  format_range(knob) + ")";
+            return false;
+        }
+        if (parsed < knob.lo || parsed > knob.hi) {
+            err = std::string(knob.key) + ": " + value + " is out of range " +
+                  format_range(knob);
+            return false;
+        }
+        cfg.*(*p) = parsed;
+        return true;
+    }
+
+    if (auto* p = std::get_if<FloatMember>(&knob.member)) {
+        char* stop = nullptr;
+        const double parsed = std::strtod(begin, &stop);
+        if (stop != end || stop == begin) {
+            err = std::string(knob.key) + ": '" + value + "' is not a number (expected " +
+                  format_range(knob) + ")";
+            return false;
+        }
+        if (parsed < knob.lo || parsed > knob.hi) {
+            err = std::string(knob.key) + ": " + value + " is out of range " +
+                  format_range(knob);
+            return false;
+        }
+        cfg.*(*p) = static_cast<float>(parsed);
+        return true;
+    }
+
+    err = std::string(knob.key) + ": unsupported knob type";
+    return false;
+}
+
+bool load_config(const std::string& path, PipelineConfig& cfg,
+                 std::string& err, std::vector<std::string>& warnings) {
+    // 手写 flat 解析器，而不是 cv::FileStorage：后者要求文件以 `%YAML:1.0` 签名开头
+    // （只按内容嗅探、不看 .yml 扩展名），否则抛异常 —— 对一个人手编辑的配置文件是
+    // 多余的怪癖。且这样 parse + 区间校验与 --set 完全共用一份实现。
+    std::ifstream in(path);
+    if (!in) {
+        err = "cannot open config file: " + path;
+        return false;
+    }
+
+    int line_no = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        ++line_no;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        line = trim(line);
+        if (line.empty()) continue;
+
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            err = path + ":" + std::to_string(line_no) + ": expected 'key: value', got '" + line + "'";
+            return false;
+        }
+        const std::string key = trim(line.substr(0, colon));
+        std::string value = trim(line.substr(colon + 1));
+        if (value.size() >= 2 && value.front() == value.back() &&
+            (value.front() == '"' || value.front() == '\'')) {
+            value = value.substr(1, value.size() - 2);   // 允许 YAML 式引号
+        }
+
+        const Knob* knob = nullptr;
+        std::vector<std::string> candidates;
+        if (!find_knob(key, &knob, &candidates)) {
+            std::string msg = path + ":" + std::to_string(line_no) + ": unknown key '" + key + "'";
+            if (!candidates.empty()) {
+                msg += "; did you mean";
+                for (const auto& c : candidates) msg += " '" + c + "'";
+            }
+            warnings.push_back(msg + " (ignored)");
+            continue;
+        }
+        if (!set_knob(*knob, value, cfg, err)) {
+            err = path + ":" + std::to_string(line_no) + ": " + err;
+            return false;
+        }
+    }
+
+    // paths.root 写在配置文件里时，它自己相对该文件解析；命令行上的相对 root 相对 cwd。
+    // 其余相对资产路径一律相对最终 root 解析（见 resolve_asset_paths）。
+    if (!cfg.asset_root.empty()) {
+        std::filesystem::path root(cfg.asset_root);
+        if (root.is_relative()) {
+            const std::filesystem::path file_dir = std::filesystem::path(path).parent_path();
+            root = file_dir.empty() ? root : (file_dir / root);
+            cfg.asset_root = root.lexically_normal().string();
+        }
+    }
+    return true;
+}
+
+void resolve_asset_paths(PipelineConfig& cfg, const std::string& default_root) {
+    namespace fs = std::filesystem;
+    const std::string root_str = cfg.asset_root.empty() ? default_root : cfg.asset_root;
+    const fs::path root = root_str.empty() ? fs::path(".") : fs::path(root_str);
+    cfg.asset_root = root.lexically_normal().string();
+
+    // 成员指针常量不能靠 auto 推导，显式写类型
+    const StrMember paths[] = {&PipelineConfig::detector_model, &PipelineConfig::embedder_model,
+                               &PipelineConfig::data_dir, &PipelineConfig::gallery_index,
+                               &PipelineConfig::auth_tokens_file};
+    for (StrMember member : paths) {
+        std::string& value = cfg.*member;
+        if (value.empty()) continue;   // 空串是"关闭"的显式取值，不能解析成 root
+        const fs::path p(value);
+        if (!p.is_absolute()) {
+            value = (root / p).lexically_normal().string();
+        }
+    }
+    // data_dir 是拼接前缀用，保证结尾有分隔符
+    if (!cfg.data_dir.empty() && cfg.data_dir.back() != '/') {
+        cfg.data_dir.push_back('/');
+    }
+}
+
+bool validate_config(const PipelineConfig& cfg, std::string& err,
+                     std::vector<std::string>& warnings) {
+    for (const auto& k : knobs()) {
+        double value = 0.0;
+        if (!knob_as_double(k, cfg, &value)) continue;
+        if (value < k.lo || value > k.hi) {
+            err = std::string(k.key) + ": " + std::to_string(value) + " is out of range " +
+                  format_range(k);
+            return false;
+        }
+    }
+
+    {
+        facerec::LogLevel lvl = facerec::LogLevel::Warn;
+        if (!facerec::parse_log_level(cfg.log_level, lvl)) {
+            err = "log.level: '" + cfg.log_level +
+                  "' must be one of off, error, warn, info, debug";
+            return false;
+        }
+    }
+
+    if (cfg.align_border != "replicate" && cfg.align_border != "reflect" &&
+        cfg.align_border != "constant") {
+        err = "align.border: '" + cfg.align_border +
+              "' must be one of replicate, reflect, constant";
+        return false;
+    }
+
+    if (cfg.backend != "cpu" && cfg.backend != "cuda" && cfg.backend != "openvino") {
+        err = "dnn.backend: '" + cfg.backend + "' must be one of cpu, cuda, openvino";
+        return false;
+    }
+
+    // display_shape = detector_input * rfactor 是 draw()/putText() 坐标映射的前提，
+    // 只校验派生量的合理性。
+    const cv::Size disp = cfg.display_shape();
+    if (disp.width < 160 || disp.height < 120) {
+        err = "display.rfactor: " + std::to_string(cfg.rfactor) +
+              " gives a display frame smaller than the detector input";
+        return false;
+    }
+
+    // 资产不存在时不静默跑成 0 人 —— 这是配置项最容易犯的错。
+    std::error_code ec;
+    if (!std::filesystem::exists(cfg.data_dir, ec)) {
+        warnings.push_back("data dir does not exist: " + cfg.data_dir +
+                           " (no one will be recognized)");
+    }
+
+    // 模型契约警告：用默认模型文件名却给了别的输入尺寸，几乎一定是接错。
+    if (cfg.detector_model == "./models/yunet_120x160.onnx" &&
+        (cfg.detector_input_w != 160 || cfg.detector_input_h != 120)) {
+        warnings.push_back("detector.input_w/input_h (" + std::to_string(cfg.detector_input_w) +
+                           "x" + std::to_string(cfg.detector_input_h) +
+                           ") do not match the default YuNet 120x160 model; "
+                           "PriorBox::decode assumes that layout");
+    }
+    if (cfg.embedder_model == "./models/mobilefacenet.onnx" &&
+        (cfg.embedder_input_w != 112 || cfg.embedder_input_h != 112)) {
+        warnings.push_back("embedder.input_w/input_h do not match the default MobileFaceNet "
+                           "112x112 model; align_face() targets the same 112x112 template");
+    }
+    if (cfg.detect_every > 1) {
+        warnings.push_back("tracker.detect_every > 1 trades ~0.75 ms/frame for box lag "
+                           "(measured: max box error 5.9px at 1, ~18px at 5)");
+    }
+    return true;
+}
+
+namespace {
+
+// 三种"文件在但读不出模型"的形态，都会在 OpenCV 的 ONNX importer 里变成一句天书：
+// 下载失败留下的 0 字节文件、git-lfs 没 pull 时权重位置上的 131 字节指针、
+// 以及截断/HTML 错误页。这里按字节嗅一下，报出成因与出路。
+bool sniff_model_file(const std::string& path, std::string& problem) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::uintmax_t size = fs::file_size(path, ec);
+    if (ec) {
+        problem = "cannot be read (" + ec.message() + ")";
+        return false;
+    }
+    if (size == 0) {
+        problem = "is empty (0 bytes) - a failed download usually leaves this";
+        return false;
+    }
+    if (size < 1024) {
+        std::ifstream in(path, std::ios::binary);
+        std::string head(64, '\0');
+        in.read(&head[0], static_cast<std::streamsize>(head.size()));
+        const auto n = static_cast<size_t>(in.gcount());
+        head.resize(n);
+        if (head.rfind("version https://git-lfs", 0) == 0) {
+            problem = "is a Git LFS pointer (" + std::to_string(size) +
+                      " bytes), not weights - run `git lfs pull`, or download through "
+                      "github.com/<repo>/raw/<commit>/<path>, which serves the content";
+            return false;
+        }
+        problem = "is only " + std::to_string(size) + " bytes, too small to be an ONNX model";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+namespace {
+// paths.* 相对 paths.root 解析，而 root 默认就是 cwd —— 所以从仓库根跑 ./build/main
+// 必然找不到权重。这里只做诊断，不改解析规则（自动锚定会让"只调阈值"的配置文件
+// 悄悄把资产挪走，那种意外比"必须从 build/ 运行"难查得多），但把可用的命令写出来。
+std::string asset_hint(const std::string& knob, const std::string& missing) {
+    char buf[4096];
+    const std::string cwd = ::getcwd(buf, sizeof buf) ? buf : "(unknown)";
+    std::string out = "\n  cwd: " + cwd +
+                      "  (paths.* resolve against paths.root, default = cwd)";
+    for (const std::string& root : {std::string("build"), std::string("../build"),
+                                    std::string(".")}) {
+        const std::string cand = (root == ".") ? missing : root + "/" + missing;
+        std::error_code ec;
+        if (std::filesystem::exists(cand, ec) && !std::filesystem::is_directory(cand, ec)) {
+            out += "\n  found " + cand + "  ->  run from " +
+                   (root == "." ? cwd : cwd + "/" + root) +
+                   ", or add:  --set paths.root=" + root;
+            return out;
+        }
+    }
+    out += "\n  or point the knob straight at a file:  --set " + knob + "=/abs/path/to/model.onnx";
+    return out;
+}
+}  // namespace
+
+bool check_model_files(const PipelineConfig& cfg, std::string& err, std::string* hint) {
+    const struct { const char* key; const std::string* path; } models[] = {
+        {"paths.detector_model", &cfg.detector_model},
+        {"paths.embedder_model", &cfg.embedder_model},
+    };
+    for (const auto& m : models) {
+        std::string problem;
+        if (!sniff_model_file(*m.path, problem)) {
+            err = std::string(m.key) + ": model file " + *m.path + " " + problem;
+            if (hint) *hint = asset_hint(m.key, *m.path);
+            return false;
+        }
+    }
+    return true;
+}
+
+void dump_config(std::ostream& os, const PipelineConfig& cfg) {
+    // flat 点分 key：与配置文件、--set 完全同构，可 grep、可 diff。
+    // 注释由表里的 group/comment 生成 —— 示例配置永远和代码里的默认值一致。
+    os << "# FaceRecognition configuration -- generated by `main --dump-config`\n"
+       << "# Load with `--config <path>`, override with `--set key=value`.\n"
+       << "# Unknown keys are rejected with the nearest valid ones.\n";
+
+    const char* group = "";
+    for (const auto& k : knobs()) {
+        if (std::strcmp(group, k.group) != 0) {
+            group = k.group;
+            os << "\n# --- " << group << " ---\n";
+        }
+        if (*k.comment) {
+            for (const char* line = k.comment; line;) {
+                os << "# ";
+                const char* nl = std::strchr(line, '\n');
+                if (nl) { os.write(line, nl - line) << "\n"; line = nl + 1; }
+                else { os << line << "\n"; line = nullptr; }
+            }
+        }
+        // paths.root 未锚定时不写出来：写了 `.` 会在别处加载这份 dump 时把资产锚到
+        // 该文件目录，round-trip 就变了。省略 = 保持"未指定"状态。
+        if (k.key == std::string("paths.root") &&
+            (knob_as_string(k, cfg).empty() || knob_as_string(k, cfg) == ".")) {
+            continue;
+        }
+        os << k.key << ": ";
+        if (const auto* p = std::get_if<StrMember>(&k.member)) {
+            os << cfg.*(*p) << "\n";
+            continue;
+        }
+        double v = 0.0;
+        knob_as_double(k, cfg, &v);
+        if (std::get_if<IntMember>(&k.member)) {
+            os << static_cast<long>(std::lround(v)) << "\n";
+        } else {
+            os.precision(2);
+            os << std::showpoint << std::fixed << v << "\n";
+        }
+    }
+}

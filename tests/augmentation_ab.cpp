@@ -31,8 +31,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include "engine.hpp"
-#include "face_def.hpp"
+#include "core/engine.hpp"
+#include "core/face_def.hpp"
 
 namespace fs = std::filesystem;
 

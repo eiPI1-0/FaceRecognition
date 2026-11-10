@@ -15,7 +15,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "priorbox.hpp"
+#include "core/priorbox.hpp"
 
 namespace {
 

@@ -14,8 +14,8 @@
 #include <cstdio>
 #include <string>
 
-#include "admission.hpp"
-#include "metrics.hpp"
+#include "serve/admission.hpp"
+#include "common/metrics.hpp"
 
 namespace {
 

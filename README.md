@@ -292,7 +292,7 @@ wrote), because writing a template is the irreversible act.
   `facerec_cache_hits_total` / `..._misses_total` / `..._evictions_total`, and histograms
   `facerec_decode_ms`, `facerec_detect_ms`, `facerec_embed_ms`, `facerec_request_ms`,
   `facerec_match_score`.
-  Request counting happens in **one** place — the access-log hook in `src/auth.cpp` — so a new
+  Request counting happens in **one** place — the access-log hook in `src/serve/auth.cpp` — so a new
   route can never be under-counted and an early-return branch can never be missed.
   Note: counters are **per process**; with `--reuseport` a scrape lands on one arbitrary
   instance, so aggregate across instances (see `deploy/`) instead of trusting a single scrape.
@@ -500,7 +500,7 @@ program.
 
 ## Configuration
 
-Every tunable is one entry in a single table (`knobs()` in `config.cpp`) with a dotted key.
+Every tunable is one entry in a single table (`knobs()` in `src/app/config.cpp`) with a dotted key.
 The **same key** is used in the config file, in `--set`, and in `--dump-config` output —
 there is one list, generated from that table, so it cannot drift out of sync.
 
@@ -651,7 +651,7 @@ in the preprocessing convention needs no migration step, and a corrupt index jus
 
 ## Tuning
 
-Tunables are config keys (defaults in `config.hpp`, full list via `--dump-config`); the
+Tunables are config keys (defaults in `src/app/config.hpp`, full list via `--dump-config`); the
 ones worth knowing:
 
 | key | default | effect |
@@ -828,27 +828,28 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 
 ## Source layout
 
-| File | Role |
+`src/` is the only source root, and its subdirectories are layers. An include names the layer
+it reaches into — `#include "core/engine.hpp"` — and may only point at that layer or a lower
+one:
+
+```
+common  →  core  →  app  →  serve  →  cli          (src/main.cpp sits on top)
+```
+
+| Layer | Directory | Contents |
+|---|---|---|
+| 0 | `src/common/` | `log`, `json_util`, `encoding`, `sha256`, `metrics` — leaves: nothing in this repo depends on them |
+| 1 | `src/core/` | the recognition core: `face_def` (`BndBox_xyxy` / `BndBox_xywh`, `Landmarks_5`, `Face`), `priorbox` (YuNet prior-box generation + raw-output decoding), `detector_head` (fused vs per-level, inferred from layer names), `utils` (`nms()`, `draw()`, `letterbox()`), `engine` (`DNNConfig`, `Detector`, `FeatureExtractor`, `Similarity`, header-only `FeatureDatabase<T>`, `align_face`/`align_detection`, `extract_face_feature(s)`, `list_person_dirs`), `face_tracker` (`FaceTracker` — constant-velocity prediction, two-gate association, dedup, lifecycle; emits `{face, id, measured}`). OpenCV only: no GUI, no config, no JSON, no network |
+| 2 | `src/app/` | `config` (`PipelineConfig` + the `knobs()` table — every tunable described once, driving file parsing, `--set`, validation and `--dump-config`), `evaluation` (held-out FAR/FRR/EER, the pair→1:N conversion), `gallery` (feature index + persistence), `api` (`Pipeline` = detector + extractor + gallery, `IdentifyResult`, JSON serialization). All three shells go through this layer, so they cannot disagree |
+| 3 | `src/serve/` | transports and capacity: `auth` (bearer tokens, audit, one access-log hook), `admission` (the single end-to-end capacity-wait budget), `timed_queue` (`TimedTaskQueue` around httplib's own `ThreadPool`), `pipeline_pool` (`PipelinePool` + `Lease` — the unit of concurrency and backpressure), `result_cache` (LRU keyed by image sha256 + params + fingerprint), `server` (cpp-httplib, `/v1/*`, `/healthz`, `/readyz`, `/metrics`), `mcp` (JSON-RPC 2.0, stdio + HTTP transports, four read-only tools) |
+| 4 | `src/cli/` | the subcommand shells: `identify`, `enroll`, `serve`, `mcp`, `token`, `compare`, `verify`, `evaluate`, `demo` |
+| 5 | `src/main.cpp` | argv → subcommand dispatch, usage text, exit codes |
+
+| Path | Role |
 |---|---|
-| `main.cpp` | subcommand dispatch; `run_demo()` is the original capture loop |
-| `src/engine.hpp` / `.cpp` | library layer: `DNNConfig`, `Detector`, `FeatureExtractor`, `Similarity`, header-only `FeatureDatabase<T>`; alignment (`align_face`, `align_detection`), `extract_face_feature(s)`, `list_person_dirs`. No GUI, no `config.hpp` |
-| `src/api.hpp` / `.cpp` | application layer: `Pipeline` (detector + extractor + gallery), `IdentifyResult`, JSON serialization — shared by CLI, HTTP and (future) MCP so the three shells cannot disagree |
-| `src/cli.hpp` / `.cpp` | `identify` / `enroll` / `serve` / `mcp` subcommands |
-| `src/server.hpp` / `.cpp` | cpp-httplib HTTP service: `/v1/*` endpoints, backpressure, graceful shutdown |
-| `src/mcp.hpp` / `.cpp` | MCP server: JSON-RPC 2.0, stdio + HTTP transports, four read-only tools |
-| `src/pipeline_pool.hpp` / `.cpp` | `PipelinePool` + `Lease` — one pipeline per worker, the unit of concurrency and backpressure for both server and MCP |
-| `src/json_util.hpp` / `.cpp` | tolerant JSON field readers (HTTP bodies and MCP arguments share one implementation) |
-| `src/encoding.hpp` / `.cpp` | base64 encode/decode (HTTP `image_b64`, MCP `image` content) |
-| `src/result_cache.hpp` / `.cpp` | LRU result cache keyed by image sha256 + params + model/gallery fingerprint |
-| `src/sha256.hpp` / `.cpp` | self-contained FIPS 180-4 digest (no OpenSSL dependency) |
-| `third_party/httplib.h` | vendored cpp-httplib v0.15.3 (header-only, pthread only) |
-| `FaceRecognition.h` | forwarding header → `src/engine.hpp` (kept so older includes still build) |
-| `config.hpp` / `config.cpp` | `PipelineConfig` + the `knobs()` table — every tunable described once, driving file parsing, `--set`, validation and `--dump-config` |
-| `face_tracker.hpp` / `.cpp` | `FaceTracker` — constant-velocity prediction + two-gate association (IoU / normalized centre distance, candidate pairs taken in global score order) + dedup + track lifecycle; emits `{face, id, measured}` |
-| `priorbox.hpp` / `.cpp` | YuNet prior-box generation and raw-output decoding |
-| `detector_head.hpp` / `.cpp` | head strategy: fused (via `PriorBox`) vs per-level YuNet-G, inferred from the model's layer names |
-| `utils.hpp` / `.cpp` | `nms()`, `draw()`, `letterbox()` |
-| `face_def.hpp` | POD types: `BndBox_xyxy` / `BndBox_xywh`, `Landmarks_5`, `Face` |
+| `tests/` | `ctest` targets — `decode_gates`, `tracker_scenarios`, `admission`, `evaluation` — plus the `augmentation_ab` harness (needs `models/` and `data/`, so it is not in `ctest`) |
+| `scripts/check_layers.py` | the `layers` test: include direction above, and every `.cpp` under `src/` listed in `CMakeLists.txt` |
+| `third_party/httplib.h` | vendored cpp-httplib v0.15.3 (header-only, pthread only), reached through the `facerec_httplib` INTERFACE target so its two compile-time limits cannot drift per target |
 
 ### Contributor notes (the traps in this codebase)
 
@@ -867,7 +868,7 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
   they are available — the requested border type is ignored (verified on 4.13, even with
   `BORDER_CONSTANT`). `align_detection` passes the flag; any code cropping a `Mat` before
   aligning needs it too.
-- **Every input frame is letterboxed onto `display_shape`** (`letterbox()` in `utils.cpp`)
+- **Every input frame is letterboxed onto `display_shape`** (`letterbox()` in `src/core/utils.cpp`)
   before tracking and drawing, and registration goes through the same helper — the two
   paths must preprocess identically or the features are not comparable. The padding is
   centred and the canvas is exactly `input_shape × rfactor`, so `draw()`/`putText()`
@@ -906,11 +907,12 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
   8/16/32/64 over floor-halved feature maps matched this YuNet export at 160×120, 320×320,
   224², 200², 150², 128² and 640². A different export can use the same strides and still
   split its head per level — then only the decoder is wrong, not the config.
-- **`knobs()` in `config.cpp` is the only list of tunables.** File parsing, `--set`,
+- **`knobs()` in `src/app/config.cpp` is the only list of tunables.** File parsing, `--set`,
   range validation and `--dump-config` are all generated from it, so adding a tunable
   means adding a struct field *and* a table entry — never a bespoke parse branch.
-  `config.hpp` is app-level: it must not be pulled into `FaceRecognition.h`, because
-  `FeatureDatabase<T>` is a header-only template and every consumer would recompile.
+  `app/config.hpp` is app-level: no `core/` header may include it (the `layers` test enforces
+  this), because `FeatureDatabase<T>` is a header-only template and every consumer would
+  recompile.
 - **Relative `paths.*` values are resolved against `paths.root`** (default: the working
   directory; anchoring to the config file is opt-in via `paths.root: .` inside it), in one place, after defaults, file and
   `--set` have all been applied. Resolving earlier — or per source — produces the
@@ -918,15 +920,16 @@ either way (verified N=1…16). Override with `batch` / `nobatch` to A/B it your
 
 ### How changes are validated
 
-There is no test harness, so verification is: `make`, then `./main 1` (expect
-`Loaded N person(s)` followed by `Cannot open source: 1` and a non-zero exit), then a throwaway program in `build/` linked against
-`../FaceRecognition.cpp ../priorbox.cpp ../utils.cpp` that registers from `./data/` and
+`make && ctest` is the cheap gate (no weights, under a second). Beyond it, verification is:
+`./main 1` (expect `Loaded N person(s)` followed by `Cannot open source: 1` and a non-zero
+exit), then a throwaway program in `build/` linked against
+`../src/core/{engine,priorbox,detector_head,utils}.cpp` that registers from `./data/` and
 re-recognizes each registration photo (expect that photo's own person as top match); an
 `hconcat` of two people's photos exercises multi-face index mapping. For any
 alignment/embedding change, embed ~12 warped variants of each identity (±25° rotation,
 0.85–1.15 scale, small translations, brightness ±40) and compare mean **within-identity**
 vs **between-identity** true cosine (`a.dot(b)/(‖a‖‖b‖)`, *not* `CosSimilarity`).
-For tracking changes, compile `face_tracker.cpp` and the previous version (from git) against
+For tracking changes, compile `src/core/face_tracker.cpp` and the previous version (from git) against
 one synthetic harness: paste a real face onto a blurred frame at controlled positions,
 then compare *boxes drawn* (`tracker.tracks()`) against *detections returned*
 (`detector.faces()`) over scripted sequences — geometry alternating at the frame edge, two
@@ -976,10 +979,11 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
   in this frame), so they never surface in an API. The per-level export
   (`face_detection_yunet_2023mar.onnx`) showed 0/44 forwards affected, but has never been run
   through the augmentation harness, so it is not the default.
-- Four `ctest` targets cover config parsing/validation, the tracker harness, the decode gates and
-  the evaluation report — all without model weights, in ~0.3 s. There is still no CI runner and no
-  lint config, and the accuracy path is exercised only by `./main evaluate`, which needs a real
-  dataset and is therefore run by hand.
+- Five `ctest` targets cover the decode gates, the tracker harness, admission accounting, the
+  evaluation report, and the source layout itself (`layers`: include direction plus "every
+  `.cpp` is listed in `CMakeLists.txt`") — all without model weights, in ~0.3 s. There is still no
+  CI runner and no lint config, and the accuracy path is exercised only by `./main evaluate`,
+  which needs a real dataset and is therefore run by hand.
 
 ---
 

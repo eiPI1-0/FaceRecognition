@@ -187,27 +187,52 @@ gallery 索引（sqlite 或单文件 / 目录里的 .bin）
 
 ---
 
-## 7. 代码骨架（现状，P0–P2 已落地）
+## 7. 代码骨架（现状；2026-11-10 布局重构 P1 已落地，完整方案见 `RFPLAN.md`）
+
+层序 `common < core < app < serve < cli < main.cpp`，include 一律写成 `<层>/<文件>`；违反层方向、
+写未限定 include、或 `src/**/*.cpp` 没进 `CMakeLists.txt`，ctest 的 `layers` 直接失败。
+**本文其余小节（§8/§12/§13）里的路径是当时的路径，故意不同步**（改了就成伪造历史，理由见
+RFPLAN §3.2）；当前路径以本节与 README 的 "Source layout" 为准。
 
 ```
-src/
-  engine.{hpp,cpp}   ✅ 库层：Detector/FeatureExtractor/Similarity/align*/extract*/FeatureDatabase<T>
-                        detect(const Mat&) const 按值返回；无 GUI、无 config.hpp 依赖
-  api.{hpp,cpp}      ✅ 应用层：Pipeline（detector+extractor+gallery）+ IdentifyResult + JSON
-                        CLI / HTTP / MCP 三个外壳共用，输出不可能不一致
-  cli.{hpp,cpp}      ✅ identify / enroll / serve / mcp 子命令
-  server.{hpp,cpp}   ✅ HTTP：cpp-httplib + PipelinePool + 优雅停机 + 背压
-  mcp.{hpp,cpp}      ✅ JSON-RPC 2.0 + stdio/HTTP 两种传输 + 4 个只读工具
-  json_util.{hpp,cpp} ✅ 容错 JSON 取值（HTTP 与 MCP 共用，杜绝解析分叉）
-  encoding.{hpp,cpp}  ✅ base64 编解码（HTTP image_b64 / MCP image content 共用）
-  pipeline_pool.{hpp,cpp} ✅ PipelinePool + Lease（serve 与 mcp-http 共用）
-  result_cache.{hpp,cpp}  ✅ sha256 键 LRU 结果缓存（命中路径不解码）
-  sha256.{hpp,cpp}        ✅ 自包含 FIPS 180-4
-  gallery.{hpp,cpp}  ⬜ 只读索引持久化（当前 gallery 仍在 FeatureDatabase 构造里现算）
-  session.{hpp,cpp}  ⬜ 流式会话：tracker + label_of + max_lost（serve 的平面 B）
+src/                      唯一源码根（CMake 只加这一个 include 路径）
+  main.cpp                ✅ argv → 子命令分发、usage、退出码；run_demo() 是原 UI 循环
+  common/                 叶子层：不依赖本仓库任何东西
+    log.{hpp,cpp}         ✅ 单条 JSON-lines 日志流，整行一把锁
+    json_util.{hpp,cpp}   ✅ 容错 JSON 取值（HTTP 与 MCP 共用，杜绝解析分叉）
+    encoding.{hpp,cpp}    ✅ base64 编解码（HTTP image_b64 / MCP image content 共用）
+    sha256.{hpp,cpp}      ✅ 自包含 FIPS 180-4
+    metrics.{hpp,cpp}     ✅ 计数器/直方图 + 手写 to_prometheus()
+  core/                   识别内核：只依赖 OpenCV（无 GUI、无 JSON、无网络、无 config）
+    face_def.hpp          ✅ POD：BndBox_xyxy/BndBox_xywh、Landmarks_5、Face
+    priorbox.{hpp,cpp}    ✅ YuNet prior box 生成 + 原始输出解码（两道 gate 是承重的）
+    detector_head.{hpp,cpp} ✅ 头策略：fused（包 PriorBox）vs per-level，由层名推断，不是配置
+    utils.{hpp,cpp}       ✅ nms() / draw() / letterbox()
+    engine.{hpp,cpp}      ✅ Detector/FeatureExtractor/Similarity/align*/extract*/FeatureDatabase<T>
+                             detect(const Mat&) const 按值返回，不持有跨调用状态
+    face_tracker.{hpp,cpp} ✅ 匀速预测 + 双 gate 关联 + dedup + 生命周期，输出 {face,id,measured}
+  app/                    应用层：配置 + 库 + 阈值 + 三个外壳共用的结果格式
+    config.{hpp,cpp}      ✅ PipelineConfig + knobs() 表（文件/`--set`/`--dump-config` 同一来源）
+    evaluation.{hpp,cpp}  ✅ 留出集评测：1:1 与 1:N FAR/FRR/EER + pair→1:N 的唯一换算处
+    gallery.{hpp,cpp}     ✅ 只读索引持久化（gallery.idx）+ fingerprint()（结果缓存键的一部分）
+    api.{hpp,cpp}         ✅ Pipeline + IdentifyResult + JSON + check_recognize_threshold
+  serve/                  传输与容量
+    admission.hpp         ✅ 端到端"等容量"预算，serve 与 mcp 共用同一个换算函数
+    timed_queue.hpp       ✅ TimedTaskQueue（套 httplib 自己的 ThreadPool，量排队时长）
+    auth.{hpp,cpp}        ✅ bearer token + 唯一的 access-log/metrics 钩子 + shed 决策
+    pipeline_pool.{hpp,cpp} ✅ PipelinePool + Lease（serve 与 mcp-http 共用）
+    result_cache.{hpp,cpp}  ✅ sha256 键 LRU 结果缓存（命中路径不解码）
+    server.{hpp,cpp}      ✅ HTTP：/v1/*、/healthz、/readyz、/metrics、优雅停机、背压
+    mcp.{hpp,cpp}         ✅ JSON-RPC 2.0 + stdio/HTTP 两种传输 + 4 个只读工具
+    session.{hpp,cpp}     ⬜ 流式会话：tracker + label_of + max_lost（serve 的平面 B）
+  cli/
+    cli.{hpp,cpp}         ✅ identify/enroll/serve/mcp/token/compare/verify/evaluate/demo
+                             （P2：拆成每个子命令一个文件，见 RFPLAN.md §5）
 third_party/
-  httplib.h          ✅ vendor 的单头 HTTP 库 v0.15.3（sha256 记在 P2 小节）
-main.cpp             ✅ 子命令分发 + run_demo()（原 UI 循环原样保留）
+  httplib.h               ✅ vendor 的单头 HTTP 库 v0.15.3（两个宏由 facerec_httplib 承载）
+tests/                    ✅ ctest：decode_gates / tracker_scenarios / admission / evaluation
+                             （augmentation_ab 需要权重，不入 ctest）
+scripts/check_layers.py   ✅ 布局守卫：层方向 + 限定 include + 每个 .cpp 都在 CMakeLists.txt
 ```
 
 已完成的关键接口改造：`Detector::detect(const cv::Mat&) const -> std::vector<Face>`（按值返回，
@@ -820,3 +845,39 @@ augmentation 数字只证明 **1:1 可分性**，不能用来选 1:N 阈值；�
    - 测试：`tests/admission.cpp`（ctest 3/3）。已做变异验证：去掉预算 floor 或删一行指标输出 → 测试变红。
 
 > 更新本文件时：任何架构决策变更（并发模型、MCP tool 列表、API 端点）必须在此同步，并记录变更原因，防止 compaction 后记忆丢失。
+---
+
+## 14. 重构 D11：单一源码根 + 分层（2026-11-10，P1 已落地）
+
+**动机（不是审美）**：重构前有两个源码根（根目录 7 个文件 + `src/` 23 个）、三个 include 搜索路径
+（`src/`、仓库根、`third_party/`），`CMakeLists.txt` 里源文件清单出现 **四遍**（主程序 + 三个测试各
+一遍）——加一个 `.cpp` 要改 3–4 处，漏掉的那一遍**编译通过但根本不参与链接**（"编过了但没跑"）。
+`FaceRecognition.h` 转发头 ↔ `src/engine.hpp` 就是这种双真相留下的化石。
+
+**决定**：`src/` 为唯一根，按依赖方向分层，include 写 `<层>/<文件>`，构建图 = 结构图，层方向由
+ctest 的 `layers` 守卫**断言**：
+
+```
+common(0) < core(1) < app(2) < serve(3) < cli(4) < src/main.cpp(5)
+```
+
+- **P1（已落地，一个 commit）**：文件位置 + include 限定 + 四个层库（`facerec_common` / `_core` /
+  `_app` / `_serve`）+ `facerec_httplib`（INTERFACE，两个 httplib 宏不再按 target 漂移）+ 测试改为
+  link 库；删除 `FaceRecognition.h`；`main.cpp` → `src/main.cpp`；`src/cli.hpp` → `src/cli/cli.{hpp,cpp}`；
+  新增 `scripts/check_layers.py` 与 ctest 目标 `layers`。实测：clean build **32.86 s → 30.10 s**
+  （同机，`-j$(nproc)`），对象 26 个且**没有任何源文件被编两遍**（P1 前 `priorbox.cpp` /
+  `face_tracker.cpp` / `metrics.cpp` / `evaluation.cpp` 在 CMake 里各列 3 遍）；ctest 5/5（0.74 s），`identify` 自匹配 1.0 / 交叉 0.0226，`serve` 的 `/healthz`+`/readyz`+`/metrics`
+  全 200 且 stderr 每行 `json.loads` 通过，`mcp --transport stdio` 四个工具在，
+  `--dump-config` 与 `config.example.yml` 逐字节一致。
+- **P2（待做，一个 commit）**：`src/cli/cli.cpp`（1266 行，单 TU `-O3` 编译 11.55 s）按 RFPLAN §5.1 的表拆成
+  `cli/args.{hpp,cpp}` + 每个子命令一个文件 + `cli/demo.{hpp,cpp}`；`src/main.cpp` 从 442 行降到 ~90 行。
+  `cmd_*` 的名字与签名不变，所以分发表不动。
+- **P3（待做，两个独立小 commit）**：`core` 进 `namespace facerec`；`auth.hpp` 停止 include
+  `<httplib.h>`（把传输类型从鉴权接口里赶出去）。两条各自可验证，见 RFPLAN §6。
+
+**守卫的语义**（防止后人"简化"）：`layers` 只保证**编译期** include 方向与 CMake 覆盖，不保证运行时
+依赖；边界靠"`src/` 目录名 ↔ `facerec_*` target 名"对齐来表达，不设第二份真相（没有 boundary.yaml
+那类配置）。脚本对三类问题一律失败：未限定 include、指向不存在的层文件、`src/**/*.cpp` 未列入
+CMake（负例已实测：`#include "log.hpp"` 与 `"app/nope.hpp"` 都报错并给出行号）。
+
+完整计划、逐文件动作、验证配方在 **`RFPLAN.md`**；本节只留结论，不重复细节。

@@ -1,0 +1,1267 @@
+#include "cli/cli.hpp"
+
+#include "serve/auth.hpp"
+#include "common/sha256.hpp"
+
+#include <algorithm>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <opencv2/imgcodecs.hpp>
+
+#include "app/api.hpp"
+#include "app/config.hpp"
+#include "core/engine.hpp"
+#include "app/evaluation.hpp"
+#include "serve/mcp.hpp"
+#include "serve/pipeline_pool.hpp"
+#include "serve/server.hpp"
+
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <random>
+#include <thread>
+
+namespace {
+
+// data/<person>/ 的目录名同时就是索引里的 person_id，所以它必须是单个安全的路径分量：
+// 不能有 '/'、'\'、前导 '-'（会被当成选项），也不能是 '.'/'..'（能把注册写到库外）。
+// 空白归一为 '_'，与 gallery 索引自己的规则一致（行式格式里空白是注入）。
+std::string sanitize_person_name(const std::string& raw, std::string* reason) {
+    std::string out = raw;
+    for (char& c : out) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') c = '_';
+    }
+    if (out.empty() || out == "." || out == ".." || out.front() == '-' ||
+        out.find('/') != std::string::npos || out.find('\\') != std::string::npos) {
+        if (reason)
+            *reason =
+                "must be one path component (no '/', '\\', leading '-', and not '.' or '..')";
+        return {};
+    }
+    return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// 配置装配（identify / enroll / serve / mcp 共用，避免四个外壳各写一份）
+// ---------------------------------------------------------------------------
+
+struct ConfigArgs {
+    std::string config_path;
+    std::vector<std::pair<std::string, std::string>> overrides;
+};
+
+// 依次应用：内置默认 < 配置文件 < CLI 覆盖，然后解析资产路径并校验。
+// 失败时把错误写到 stderr 并返回 false（调用方统一 return -1）。
+bool load_pipeline_config(const ConfigArgs& args, PipelineConfig& cfg) {
+    std::string err;
+    std::vector<std::string> warnings;
+    if (!args.config_path.empty() &&
+        !load_config(args.config_path, cfg, err, warnings)) {
+        std::cerr << "Invalid config: " << err << std::endl;
+        return false;
+    }
+    for (const auto& ov : args.overrides) {
+        const Knob* knob = nullptr;
+        std::vector<std::string> candidates;
+        if (!find_knob(ov.first, &knob, &candidates)) {
+            std::cerr << "Unknown knob: " << ov.first << "; did you mean";
+            if (!candidates.empty()) {
+                for (const auto& c : candidates) std::cerr << " " << c;
+            } else {
+                std::cerr << " nothing close; valid keys:";
+                for (const auto& k : knobs()) std::cerr << " " << k.key;
+            }
+            std::cerr << std::endl;
+            return false;
+        }
+        if (!set_knob(*knob, ov.second, cfg, err)) {
+            std::cerr << "Invalid config: " << err << std::endl;
+            return false;
+        }
+    }
+    resolve_asset_paths(cfg, ".");
+    if (!validate_config(cfg, err, warnings)) {
+        std::cerr << "Invalid config: " << err << std::endl;
+        return false;
+    }
+    for (const auto& w : warnings) std::cerr << "config warning: " << w << std::endl;
+    return true;
+}
+
+// --set key=value / --set=key=value。解析失败时返回 false。
+bool parse_set_arg(const std::string& arg, int& i, int argc, char* argv[],
+                   ConfigArgs& out) {
+    std::string assignment;
+    if (arg == "--set") {
+        if (i + 1 >= argc) {
+            std::cerr << "--set expects key=value" << std::endl;
+            return false;
+        }
+        assignment = argv[++i];
+    } else {
+        assignment = arg.substr(std::string("--set=").size());
+    }
+    const size_t eq = assignment.find('=');
+    if (eq == std::string::npos) {
+        std::cerr << "--set expects key=value, got '" << assignment << "'" << std::endl;
+        return false;
+    }
+    out.overrides.emplace_back(assignment.substr(0, eq), assignment.substr(eq + 1));
+    return true;
+}
+
+// 拥塞控制的三个旗标：serve 与 mcp **共用一份解析**。它们调的是同一个机制（任务队列 +
+// pipeline 池），分两处写已经让 --http-threads 分叉过一次（mcp.cpp 里记着：一边设了一边没设，
+// 两个外壳的并发语义就不一样了）。模板而不是重载：两个 Options 结构不同但字段同名，
+// 谁漏了字段就是编译错误，而不是又一次静默分叉。
+// 返回：0 = 不是这里的旗标；1 = 已消费；-1 = 用法错（已打印，调用方直接 return -1）。
+template <class Opt>
+int parse_queue_arg(const std::string& arg, int& i, int argc, char* argv[], Opt& opt) {
+    auto value_of = [&](const char* name) -> std::string {
+        const std::string eq = std::string(name) + "=";
+        if (arg.rfind(eq, 0) == 0) return arg.substr(eq.size());
+        return (i + 1 < argc) ? argv[++i] : std::string();
+    };
+    auto integer = [&](const char* name, int* out) -> bool {
+        try {
+            *out = std::stoi(value_of(name));
+        } catch (...) {
+            std::cerr << name << " expects an integer" << std::endl;
+            return false;
+        }
+        return true;
+    };
+    if (arg == "--http-threads" || arg.rfind("--http-threads=", 0) == 0) {
+        if (!integer("--http-threads", &opt.http_threads)) return -1;
+        if (opt.http_threads < 1) {
+            std::cerr << "--http-threads must be >= 1 (default = same as --workers)" << std::endl;
+            return -1;
+        }
+        return 1;
+    }
+    if (arg == "--queue-timeout-ms" || arg.rfind("--queue-timeout-ms=", 0) == 0) {
+        if (!integer("--queue-timeout-ms", &opt.queue_timeout_ms)) return -1;
+        if (opt.queue_timeout_ms < -1) {
+            // 0 的含义与以前一致：**零**等待容忍（当场拿不到就 503），不是"关闭"。
+            // 把"关闭"藏在 0 里会静默翻转一个已有取值的含义（那是最坏的改法），
+            // 所以用显式的 -1。
+            std::cerr << "--queue-timeout-ms must be >= -1 "
+                         "(-1 = never shed, 0 = no waiting at all)" << std::endl;
+            return -1;
+        }
+        return 1;
+    }
+    if (arg == "--queue-max-pending" || arg.rfind("--queue-max-pending=", 0) == 0) {
+        if (!integer("--queue-max-pending", &opt.queue_max_pending)) return -1;
+        if (opt.queue_max_pending < 0) {
+            std::cerr << "--queue-max-pending must be >= 0 (0 = unbounded)" << std::endl;
+            return -1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// --config path / --config=path
+bool parse_config_arg(const std::string& arg, int& i, int argc, char* argv[],
+                      ConfigArgs& out) {
+    if (arg == "--config") {
+        if (i + 1 >= argc) {
+            std::cerr << "--config expects a path" << std::endl;
+            return false;
+        }
+        out.config_path = argv[++i];
+    } else {
+        out.config_path = arg.substr(std::string("--config=").size());
+    }
+    return true;
+}
+
+// 模型文件不在场时，报错要指名是哪个 knob 指错了（而不是 OpenCV importer 的原话）。
+bool check_assets(const PipelineConfig& cfg) {
+    std::string err;
+    std::string asset_hint;
+    if (!check_model_files(cfg, err, &asset_hint)) {
+        std::cerr << "Invalid config: " << err << asset_hint << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// identify
+// ---------------------------------------------------------------------------
+
+void identify_usage() {
+    std::cout
+        << "Usage: facerec identify --image <path> [options]\n"
+        << "\nOptions:\n"
+        << "  --image <path>            输入图片（必填）\n"
+        << "  --top-k <N>               返回前 N 名候选（默认 5）\n"
+        << "  --min-score <F>           候选/匹配的最低分（默认 0，用配置阈值决定 matched）\n"
+        << "  --include <what>          landmarks | crops | embedding，可重复\n"
+        << "  --detector-input <WxH>    请求级检测输入尺寸，如 640x480\n"
+        << "  --config <path>           配置文件\n"
+        << "  --set key=value           覆盖单个配置项，可重复\n"
+        << "  --dump-config             打印生效配置并退出\n"
+        << "Output: JSON to stdout; logs to stderr. Exit 0 even when no face is found.\n";
+}
+
+}  // namespace
+
+int cmd_identify(int argc, char* argv[]) {
+    facerec::IdentifyOptions opt;
+    ConfigArgs cfg_args;
+    std::string image_path;
+    bool dump_only = false;
+    bool show_help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--image" || arg.rfind("--image=", 0) == 0) {
+            image_path = (arg == "--image") ? ((i + 1 < argc) ? argv[++i] : std::string())
+                                            : arg.substr(8);
+        } else if (arg == "--top-k" || arg.rfind("--top-k=", 0) == 0) {
+            const std::string v = (arg == "--top-k") ? ((i + 1 < argc) ? argv[++i] : "")
+                                                     : arg.substr(8);
+            try { opt.top_k = std::stoi(v); } catch (...) {
+                std::cerr << "--top-k expects an integer, got '" << v << "'" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--min-score" || arg.rfind("--min-score=", 0) == 0) {
+            const std::string v = (arg == "--min-score") ? ((i + 1 < argc) ? argv[++i] : "")
+                                                         : arg.substr(12);
+            try { opt.min_score = std::stof(v); } catch (...) {
+                std::cerr << "--min-score expects a number, got '" << v << "'" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--include" || arg.rfind("--include=", 0) == 0) {
+            const std::string v = (arg == "--include") ? ((i + 1 < argc) ? argv[++i] : "")
+                                                       : arg.substr(10);
+            if (v == "landmarks") opt.include_landmarks = true;
+            else if (v == "crops") opt.include_crops = true;
+            else if (v == "embedding") opt.include_embedding = true;
+            else {
+                std::cerr << "--include expects landmarks|crops|embedding, got '" << v << "'"
+                          << std::endl;
+                return -1;
+            }
+        } else if (arg == "--detector-input" || arg.rfind("--detector-input=", 0) == 0) {
+            const std::string v = (arg == "--detector-input")
+                                      ? ((i + 1 < argc) ? argv[++i] : "")
+                                      : arg.substr(std::string("--detector-input=").size());
+            const size_t x = v.find('x');
+            if (x == std::string::npos) {
+                std::cerr << "--detector-input expects WxH, got '" << v << "'" << std::endl;
+                return -1;
+            }
+            try {
+                opt.detector_w = std::stoi(v.substr(0, x));
+                opt.detector_h = std::stoi(v.substr(x + 1));
+            } catch (...) {
+                std::cerr << "--detector-input expects WxH, got '" << v << "'" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--json") {
+            // JSON 是唯一输出格式，保留这个参数是为了让调用方显式表达意图
+        } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--dump-config") {
+            dump_only = true;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else if (arg.rfind("-", 0) != 0 && image_path.empty()) {
+            image_path = arg;   // 位置参数兼容：facerec identify photo.jpg
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) { identify_usage(); return 0; }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+
+    if (dump_only) {
+        dump_config(std::cout, cfg);
+        return 0;
+    }
+    {
+        std::string size_err;
+        if (!facerec::valid_detector_size(opt.detector_w, opt.detector_h, &size_err)) {
+            std::cerr << "--detector-input: " << size_err << std::endl;
+            return -1;
+        }
+    }
+    if (image_path.empty()) {
+        std::cerr << "identify requires --image <path>" << std::endl;
+        identify_usage();
+        return -1;
+    }
+    if (!check_assets(cfg)) return -1;
+
+    cv::Mat img = cv::imread(image_path, cv::IMREAD_COLOR);
+    if (img.empty()) {
+        std::cout << facerec::error_to_json("cannot read image: " + image_path, "bad_image")
+                  << std::endl;
+        return 2;
+    }
+
+    try {
+        facerec::Pipeline pipeline(cfg);
+        facerec::IdentifyResult result = pipeline.identify(img, opt, image_path);
+        std::cout << facerec::identify_to_json(result, opt) << std::endl;
+    } catch (const cv::Exception& e) {
+        std::cout << facerec::error_to_json(e.what(), "pipeline_error") << std::endl;
+        return 3;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// enroll
+// ---------------------------------------------------------------------------
+
+int cmd_enroll(int argc, char* argv[]) {
+    std::string name;
+    bool dry_run = true;
+    std::vector<std::string> photos;
+    ConfigArgs cfg_args;
+    bool show_help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--name" || arg.rfind("--name=", 0) == 0) {
+            name = (arg == "--name") ? ((i + 1 < argc) ? argv[++i] : std::string())
+                                     : arg.substr(7);
+        } else if (arg == "--dry-run") {
+            dry_run = true;
+        } else if (arg == "--yes") {
+            dry_run = false;
+        } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else if (arg.rfind("-", 0) != 0) {
+            photos.push_back(arg);
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) {
+        std::cout << "Usage: facerec enroll --name <person> [--dry-run|--yes] <photo> ...\n"
+                  << "  --dry-run (default) validate photos, print the plan, write nothing\n"
+                  << "  --yes              copy the photos that contain a usable face into\n"
+                  << "                     <data_dir>/<person>/ (the next run rebuilds the gallery index)\n";
+        return 0;
+    }
+    if (name.empty()) {
+        std::cerr << "enroll requires --name <person>" << std::endl;
+        return -1;
+    }
+    if (photos.empty()) {
+        std::cerr << "enroll requires at least one photo" << std::endl;
+        return -1;
+    }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+    if (!check_assets(cfg)) return -1;
+
+    // --yes 曾经只把 dry_run 改成 false 就报 ok：写入路径上静默什么也不做，
+    // 是注册接口最坏的错（调用者以为人已入库）。现在它真的复制照片，并且把
+    // 没有可用脸的排除在外。
+    try {
+        facerec::Pipeline pipeline(cfg);
+        std::vector<std::pair<std::string, bool>> checked;   // photo -> 是否含可用脸
+        int with_face = 0;
+        for (const auto& p : photos) {
+            cv::Mat img = cv::imread(p, cv::IMREAD_COLOR);
+            if (img.empty()) {
+                std::cerr << "enroll: cannot read " << p << std::endl;
+                checked.emplace_back(p, false);
+                continue;
+            }
+            facerec::IdentifyOptions opt;   // 只要检测/对齐，不需要候选
+            facerec::IdentifyResult r = pipeline.identify(img, opt, p);
+            const bool ok = std::any_of(r.faces.begin(), r.faces.end(),
+                                        [](const facerec::FaceResult& f) { return f.aligned; });
+            if (ok) ++with_face;
+            checked.emplace_back(p, ok);
+        }
+
+        std::string person = name;
+        std::vector<std::string> written, skipped;
+        for (const auto& c : checked) {
+            if (!c.second) skipped.push_back(c.first);
+        }
+        if (!dry_run) {
+            std::string why;
+            person = sanitize_person_name(name, &why);
+            if (person.empty()) {
+                std::cerr << "enroll: invalid --name '" << name << "': " << why << std::endl;
+                return -1;
+            }
+            if (person != name) {
+                std::cerr << "enroll: person name normalized to '" << person << "'" << std::endl;
+            }
+            const std::filesystem::path dir = std::filesystem::path(cfg.data_dir) / person;
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec) {
+                std::cerr << "enroll: cannot create " << dir.string() << ": " << ec.message()
+                          << std::endl;
+                return -1;
+            }
+            for (const auto& c : checked) {
+                if (!c.second) continue;
+                const std::filesystem::path src{c.first};
+                std::filesystem::path target = dir / src.filename();
+                for (int n = 1; std::filesystem::exists(target, ec); ++n) {
+                    target = dir / (src.stem().string() + "_" + std::to_string(n) +
+                                    src.extension().string());
+                }
+                std::filesystem::copy_file(c.first, target, std::filesystem::copy_options::none,
+                                           ec);
+                if (ec) {
+                    std::cerr << "enroll: cannot write " << target.string() << ": "
+                              << ec.message() << std::endl;
+                    return -1;
+                }
+                written.push_back(target.string());
+            }
+            if (written.empty()) {
+                std::cerr << "enroll: no photo contains a usable face; nothing written to "
+                          << dir.string() << std::endl;
+                return -1;
+            }
+        }
+
+        std::cout << "{\"status\":\"ok\",\"person\":\"" << facerec::json_escape(person)
+                  << "\",\"photos_total\":" << photos.size()
+                  << ",\"photos_with_face\":" << with_face
+                  << ",\"dry_run\":" << (dry_run ? "true" : "false")
+                  << ",\"gallery_size\":" << pipeline.gallery_size()
+                  << ",\"gallery_dir\":\"" << facerec::json_escape(cfg.data_dir + person) << "\""
+                  << ",\"written\":[";
+        for (size_t i = 0; i < written.size(); ++i) {
+            std::cout << (i ? "," : "") << "\"" << facerec::json_escape(written[i]) << "\"";
+        }
+        std::cout << "],\"skipped\":[";
+        for (size_t i = 0; i < skipped.size(); ++i) {
+            std::cout << (i ? "," : "") << "\"" << facerec::json_escape(skipped[i]) << "\"";
+        }
+        std::cout << "]";
+        if (dry_run) {
+            // dry-run 时把"真正执行会发生什么"写清楚，而不是只报计划名。
+            std::cout << ",\"would_write_to\":\"" << facerec::json_escape(cfg.data_dir + name)
+                      << "\"";
+        }
+        std::cout << ",\"reload\":\"a running server keeps its in-memory gallery; restart to "
+                     "load new photos\"}" << std::endl;
+    } catch (const cv::Exception& e) {
+        std::cout << facerec::error_to_json(e.what(), "pipeline_error") << std::endl;
+        return 3;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// token：生成 bearer 凭据
+// ---------------------------------------------------------------------------
+
+int cmd_token(int argc, char* argv[]) {
+    std::string name;
+    std::string tokens_file;
+    bool explicit_file = false;
+    bool show_help = false;
+    ConfigArgs cfg_args;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--name" || arg.rfind("--name=", 0) == 0) {
+            name = (arg == "--name") ? ((i + 1 < argc) ? argv[++i] : std::string())
+                                     : arg.substr(7);
+        } else if (arg == "--tokens-file" || arg.rfind("--tokens-file=", 0) == 0) {
+            tokens_file = (arg == "--tokens-file")
+                              ? ((i + 1 < argc) ? argv[++i] : std::string())
+                              : arg.substr(14);
+            explicit_file = true;
+        } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) {
+        std::cout << "Usage: facerec token --name <caller-id> [--tokens-file <path>]\n"
+                  << "  Generates a random bearer token and prints it once. With --tokens-file\n"
+                  << "  (or auth.tokens_file from the config) the `name:sha256:<hex>` line is\n"
+                  << "  appended to that file with mode 0600; the token itself is never stored.\n";
+        return 0;
+    }
+    if (name.empty()) {
+        std::cerr << "token requires --name <caller-id>" << std::endl;
+        return -1;
+    }
+    if (name.find_first_of(" \t:") != std::string::npos) {
+        std::cerr << "token: --name must not contain whitespace or ':'" << std::endl;
+        return -1;
+    }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+    if (!explicit_file) tokens_file = cfg.auth_tokens_file;
+
+    const std::string token = facerec::generate_token();
+    const std::string line = facerec::token_file_line(name, token);
+
+    if (tokens_file.empty()) {
+        std::cout << "token: " << token << '\n'
+                  << "line:  " << line << '\n'
+                  << "\nThis token is shown once. Append the line to your token table, or pass\n"
+                  << "--tokens-file to have this command write it (mode 0600)." << std::endl;
+        return 0;
+    }
+
+    // 追加一行。文件是凭据表：先确保 0600，再写。
+    namespace fs = std::filesystem;
+    {
+        std::error_code ec;
+        if (!fs::exists(tokens_file, ec)) {
+            std::ofstream create(tokens_file, std::ios::app);
+            if (!create) {
+                std::cerr << "token: cannot create " << tokens_file << std::endl;
+                return -1;
+            }
+        }
+        fs::permissions(tokens_file, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace, ec);
+        if (ec) {
+            std::cerr << "token: cannot set mode 0600 on " << tokens_file << ": " << ec.message()
+                      << std::endl;
+            return -1;
+        }
+    }
+    {
+        std::ofstream out(tokens_file, std::ios::app);
+        if (!out) {
+            std::cerr << "token: cannot append to " << tokens_file << std::endl;
+            return -1;
+        }
+        out << line << '\n';
+        if (!out) {
+            std::cerr << "token: write failed on " << tokens_file << std::endl;
+            return -1;
+        }
+    }
+    // 重新载入一次：确认这一行真的能被解析（打错的名字/重复名在这里就暴露，而不是等 401）。
+    {
+        facerec::TokenTable check;
+        std::string err;
+        if (!check.load(tokens_file, err)) {
+            std::cerr << "token: wrote the line but the table no longer parses: " << err
+                      << std::endl;
+            return -1;
+        }
+    }
+
+    std::cout << "token: " << token << '\n'
+              << "line:  " << line << '\n'
+              << "file:  " << tokens_file << " (mode 0600, " << '\'' << "name:sha256:" << '\''
+              << " lines; only the hash is stored)\n"
+              << "\nUse it as:  curl -H 'Authorization: Bearer " << token.substr(0, 8)
+              << "...' ..." << std::endl;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// serve / mcp
+// ---------------------------------------------------------------------------
+
+int cmd_serve(int argc, char* argv[]) {
+    ConfigArgs cfg_args;
+    facerec::ServerOptions opt;
+    bool show_help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto value_of = [&](const char* name) -> std::string {
+            const std::string eq = std::string(name) + "=";
+            if (arg.rfind(eq, 0) == 0) return arg.substr(eq.size());
+            return (i + 1 < argc) ? argv[++i] : std::string();
+        };
+        if (arg == "--host" || arg.rfind("--host=", 0) == 0) {
+            opt.host = value_of("--host");
+        } else if (arg == "--port" || arg.rfind("--port=", 0) == 0) {
+            try { opt.port = std::stoi(value_of("--port")); } catch (...) {
+                std::cerr << "--port expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--workers" || arg.rfind("--workers=", 0) == 0) {
+            try { opt.workers = std::stoi(value_of("--workers")); } catch (...) {
+                std::cerr << "--workers expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--max-request-mb" || arg.rfind("--max-request-mb=", 0) == 0) {
+            try { opt.max_request_mb = std::stoi(value_of("--max-request-mb")); } catch (...) {
+                std::cerr << "--max-request-mb expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--cv-threads" || arg.rfind("--cv-threads=", 0) == 0) {
+            try { opt.cv_threads = std::stoi(value_of("--cv-threads")); } catch (...) {
+                std::cerr << "--cv-threads expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--cache-entries" || arg.rfind("--cache-entries=", 0) == 0) {
+            try { opt.cache_entries = std::stoi(value_of("--cache-entries")); } catch (...) {
+                std::cerr << "--cache-entries expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (int q = parse_queue_arg(arg, i, argc, argv, opt); q != 0) {
+            if (q < 0) return -1;
+        } else if (arg == "--reuseport") {
+            opt.reuseport = true;
+        } else if (arg == "--quiet") {
+            opt.quiet = true;
+        } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) {
+        std::cout << "Usage: facerec serve [--host 127.0.0.1] [--port 8080] [--workers N]\n"
+                  << "                     [--cv-threads 1] [--max-request-mb 32] [--cache-entries 256]\n"
+                  << "                     [--reuseport] [--quiet] [--queue-timeout-ms 5000]\n"
+                  << "                     [--http-threads N] [--queue-max-pending 0]\n"
+                  << "                     [--config <path>] [--set key=value]\n"
+                  << "  --workers     pipeline instances / concurrent requests (default: CPU count)\n"
+                  << "  --cv-threads  OpenCV internal thread pool per worker (default: 1)\n"
+                  << "  --reuseport   SO_REUSEPORT: run N processes on one port (kernel load-balances)\n"
+                  << "  --queue-timeout-ms  end-to-end budget for WAITING FOR CAPACITY (queue stage\n"
+                  << "                  + pool stage together); past it a request gets 503 instead of\n"
+                  << "                  being served for a caller that has already given up\n"
+                  << "                  (-1 = never shed, 0 = no waiting at all)\n"
+                  << "  --http-threads  HTTP worker threads (default = --workers)\n"
+                  << "  --queue-max-pending   hard cap on connections queued in front of the workers\n"
+                  << "                  (0 = unbounded). Backstop only: hitting it closes the socket\n"
+                  << "                  instead of answering 503, so prefer --queue-timeout-ms\n"
+                  << "Endpoints: POST /v1/identify /v1/embed /v1/compare, GET /v1/people,\n"
+                  << "           GET /healthz, GET /readyz\n";
+        return 0;
+    }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+    if (!check_assets(cfg)) return -1;
+
+    try {
+        return facerec::run_server(cfg, opt);
+    } catch (const cv::Exception& e) {
+        std::cerr << "Fatal: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+int cmd_mcp(int argc, char* argv[]) {
+    ConfigArgs cfg_args;
+    facerec::McpOptions opt;
+    bool show_help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto value_of = [&](const char* name) -> std::string {
+            const std::string eq = std::string(name) + "=";
+            if (arg.rfind(eq, 0) == 0) return arg.substr(eq.size());
+            return (i + 1 < argc) ? argv[++i] : std::string();
+        };
+        if (arg == "--transport" || arg.rfind("--transport=", 0) == 0) {
+            const std::string v = value_of("--transport");
+            if (v == "stdio") opt.transport = facerec::McpTransport::Stdio;
+            else if (v == "http") opt.transport = facerec::McpTransport::Http;
+            else {
+                std::cerr << "--transport expects stdio|http, got '" << v << "'" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--host" || arg.rfind("--host=", 0) == 0) {
+            opt.host = value_of("--host");
+        } else if (arg == "--port" || arg.rfind("--port=", 0) == 0) {
+            try { opt.port = std::stoi(value_of("--port")); } catch (...) {
+                std::cerr << "--port expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--workers" || arg.rfind("--workers=", 0) == 0) {
+            try { opt.workers = std::stoi(value_of("--workers")); } catch (...) {
+                std::cerr << "--workers expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (arg == "--max-request-mb" || arg.rfind("--max-request-mb=", 0) == 0) {
+            try { opt.max_request_mb = std::stoi(value_of("--max-request-mb")); } catch (...) {
+                std::cerr << "--max-request-mb expects an integer" << std::endl;
+                return -1;
+            }
+        } else if (int q = parse_queue_arg(arg, i, argc, argv, opt); q != 0) {
+            if (q < 0) return -1;
+        } else if (arg == "--quiet") {
+            opt.quiet = true;
+        } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) {
+        std::cout << "Usage: facerec mcp [--transport stdio|http] [--host H] [--port P]\n"
+                  << "                   [--workers N] [--max-request-mb 32] [--quiet]\n"
+                  << "                   [--queue-timeout-ms 5000] [--http-threads N]\n"
+                  << "                   [--queue-max-pending 0]\n"
+                  << "                   [--config <path>] [--set key=value]\n"
+                  << "\nTools (read-only): identify_faces, compare_faces, list_people, get_face_crop\n"
+                  << "Enrollment is deliberately NOT exposed as a tool.\n"
+                  << "\nstdio: newline-delimited JSON-RPC on stdin/stdout (logs on stderr)\n"
+                  << "http:  POST /mcp\n";
+        return 0;
+    }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+    if (!check_assets(cfg)) return -1;
+
+    try {
+        return facerec::run_mcp(cfg, opt);
+    } catch (const cv::Exception& e) {
+        std::cerr << "Fatal: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compare <img-a> <img-b>：两张图最大人脸的余弦相似度
+// ---------------------------------------------------------------------------
+
+void compare_usage() {
+    std::cout
+        << "Usage: facerec compare <img-a> <img-b> [options]\n"
+        << "\nOptions:\n"
+        << "  --config <path>           配置文件\n"
+        << "  --set key=value           覆盖单个配置项，可重复\n"
+        << "  --dump-config             打印生效配置并退出\n"
+        << "Output: {\"status\":\"ok\",\"cosine\":0.95,...} to stdout.\n"
+        << "Exit 0 on success, 2 when a face is missing in either image.\n"
+        << "Each image contributes its most confident face (identify's faces[0]), not its\n"
+        << "largest one; cosine is 1.0 for the same face, around 0 for unrelated people.\n";
+}
+
+// ---------------------------------------------------------------------------
+// evaluate: 量出 recognize.thresh 该定多少，而不是猜。
+// ---------------------------------------------------------------------------
+
+void print_evaluate_usage() {
+    std::cout <<
+        "Usage: facerec evaluate <dataset-dir> [options]\n"
+        "  <dataset-dir> must contain one subdirectory per identity, each holding\n"
+        "  that person's photos (same layout as ./data/, but with held-out photos).\n"
+        "\n"
+        "  Per identity the sorted photo list is split: first --gallery-photos become\n"
+        "  the enrollment side, the next --probe-photos are held out and NEVER enrolled.\n"
+        "  Scores are produced by the production path (letterbox + YuNet + landmark\n"
+        "  align + the configured embedder), so the thresholds apply to the deployed\n"
+        "  pipeline, not to a reimplementation.\n"
+        "\n"
+        "  --gallery-photos N  photos enrolled per identity (default 2)\n"
+        "  --probe-photos N    held-out photos per identity (default 2)\n"
+        "  --limit N           evaluate at most N identities (0 = all, default 0)\n"
+        "  --seed N            seed for the --limit sample (default 12345)\n"
+        "  --workers N         pipelines in parallel (default 4)\n"
+        "  --csv <path>        also write the threshold table as CSV\n"
+        "  --config/--set      normal config plumbing (models, detector input, ...)\n"
+        "\n"
+        "Reports FAR/FRR for BOTH matcher semantics: 1:1 (= /v1/compare, one comparison)\n"
+        "and 1:N (= /v1/identify, max over the whole gallery). A threshold tuned for one\n"
+        "is wrong for the other, and 1:N gets worse as the gallery grows.\n";
+}
+
+namespace {
+
+// 图片后缀判定只写一次：照片挑选与作业表必须用同一个规则，否则"这一层过滤掉了
+// .jpeg，那一层又收进来"会让注册侧/留出侧的划分依赖于书写顺序。
+bool is_image_path(const std::string& p) {
+    std::string low = p;
+    std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+    for (const char* e : {".jpg", ".jpeg", ".png", ".bmp", ".pgm", ".pbm"}) {
+        const size_t n = std::strlen(e);
+        if (low.size() > n && low.compare(low.size() - n, n, e) == 0) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+int cmd_evaluate(int argc, char* argv[]) {
+    int gallery_photos = 2;
+    int probe_photos = 2;
+    int limit = 0;
+    int workers = 4;
+    unsigned seed = 12345;
+    std::string dataset, csv_path;
+    ConfigArgs cfg_args;
+    bool show_help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto take_int = [&](const std::string& prefix, int* out) -> bool {
+            // arg == prefix（值在下一个 argv）时 substr(prefix.size()+1) 会越界抛
+            // out_of_range：先判长度。
+            std::string v = (arg.size() > prefix.size() + 1) ? arg.substr(prefix.size() + 1)
+                                                             : std::string();
+            if (v.empty()) {
+                if (i + 1 >= argc) { std::cerr << prefix << " needs a value" << std::endl; return false; }
+                v = argv[++i];
+            }
+            const char* b = v.c_str();
+            const char* e = b + v.size();
+            const auto res = std::from_chars(b, e, *out);
+            if (res.ec != std::errc() || res.ptr != e) {
+                std::cerr << prefix << " needs an integer, got: " << v << std::endl;
+                return false;
+            }
+            return true;
+        };
+        bool is_prefixed = false;
+        for (const std::string p : {"--gallery-photos", "--probe-photos", "--limit", "--workers"}) {
+            if (arg == p || arg.rfind(p + "=", 0) == 0) {
+                is_prefixed = true;
+                int* tgt = (p == "--gallery-photos") ? &gallery_photos
+                         : (p == "--probe-photos") ? &probe_photos
+                         : (p == "--limit") ? &limit : &workers;
+                if (!take_int(p, tgt)) return -1;
+            }
+        }
+        if (is_prefixed) continue;
+        if (arg == "--seed" || arg.rfind("--seed=", 0) == 0) {
+            int s = 0;
+            if (!take_int("--seed", &s)) return -1;
+            seed = static_cast<unsigned>(s < 0 ? 0 : s);
+        } else if (arg == "--csv" || arg.rfind("--csv=", 0) == 0) {
+            csv_path = (arg == "--csv") ? ((i + 1 < argc) ? argv[++i] : std::string())
+                                        : arg.substr(6);
+        } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else if (arg.rfind("-", 0) != 0) {
+            dataset = arg;
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) { print_evaluate_usage(); return 0; }
+    if (dataset.empty()) {
+        std::cerr << "evaluate needs <dataset-dir> (see --help)" << std::endl;
+        return -1;
+    }
+    if (gallery_photos < 1 || probe_photos < 1 || workers < 1) {
+        std::cerr << "--gallery-photos, --probe-photos and --workers must be >= 1" << std::endl;
+        return -1;
+    }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+    if (!check_assets(cfg)) return -1;
+
+    // 评测的 gallery 是自己算的（注册侧/留出侧的划分正是被测对象），所以必须断开
+    // Pipeline 自带的 gallery：否则 (1) 每个 worker 都去注册一遍数据集，(2) 更糟的是
+    // 可能把 build/gallery.idx 覆写成空库 —— 那是线上缓存文件，评测进程不该碰它。
+    cfg.data_dir.clear();
+    cfg.gallery_index.clear();
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(dataset, ec)) {
+        std::cerr << "not a directory: " << dataset << std::endl;
+        return -1;
+    }
+    if (dataset.back() != '/') dataset += '/';
+
+    // 身份选择先于照片选择：--limit 抽样必须在**所有人**里做，否则只从字母表前段
+    // 取人会把样本偏置（LFW 前段是同一批名人）。
+    std::vector<std::string> ids = list_person_dirs(dataset);
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [&](const std::string& id) {
+        std::vector<cv::String> found;
+        cv::glob(dataset + id + "/*", found, false);   // glob 返回 void，只能拿输出参数
+        int photos = 0;
+        for (const auto& p : found)
+            if (is_image_path(std::string(p))) ++photos;
+        return photos < gallery_photos + probe_photos;
+    }), ids.end());
+    std::sort(ids.begin(), ids.end());
+
+    const size_t total_ids = ids.size();
+    if (limit > 0 && static_cast<size_t>(limit) < total_ids) {
+        std::mt19937 rng(seed);
+        std::shuffle(ids.begin(), ids.end(), rng);
+        ids.resize(static_cast<size_t>(limit));
+        std::sort(ids.begin(), ids.end());   // 抽样后再排序，照片切分仍按名字确定
+    }
+    if (ids.empty()) {
+        std::cerr << "no identity in " << dataset << " has " << gallery_photos
+                  << "+" << probe_photos << " readable photos" << std::endl;
+        return 1;
+    }
+
+    // 作业表：(identity index, photo path)。imread 的成本差异大，所以用共享原子游标
+    // 而不是静态切片；每个线程独占一个 Pipeline（cv::dnn::Net 不是线程安全的）。
+    struct Job { size_t who; std::string path; };
+    std::vector<Job> jobs;
+    for (size_t k = 0; k < ids.size(); ++k) {
+        std::vector<cv::String> found;
+        cv::glob(dataset + ids[k] + "/*", found, false);
+        for (const auto& p : found) {
+            std::string s = std::string(p);
+            if (is_image_path(s)) jobs.push_back({k, s});
+        }
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) {
+        if (a.who != b.who) return a.who < b.who;
+        return a.path < b.path;
+    });
+
+    std::vector<std::vector<float>> feats(jobs.size());
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> done{0}, usable{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::cerr << "embedding " << jobs.size() << " photos from " << ids.size()
+              << " identities (" << workers << " pipelines)..." << std::endl;
+
+    {
+        facerec::PipelinePool pool(cfg, workers);
+        const int nthreads = static_cast<int>(pool.size());
+        std::vector<std::thread> threads;
+        threads.reserve(nthreads);
+        for (int w = 0; w < nthreads; ++w) {
+            threads.emplace_back([&] {
+                // 一个 worker 全程只借一次：借两次会在两次之间让出 pipeline，白白多一次
+                // 排队，而且这里的超时语义应该是“永不放弃”。
+                facerec::Lease lease(pool, std::chrono::milliseconds(24 * 3600 * 1000));
+                if (!lease) return;
+                size_t j;
+                while ((j = next.fetch_add(1)) < jobs.size()) {
+                    cv::Mat img = cv::imread(jobs[j].path, cv::IMREAD_COLOR);
+                    if (!img.empty()) {
+                        // face_index 0 = 置信度最高的脸：与 /v1/compare 和 compare_faces
+                        // 完全同一个取脸规则，换规则就等于换评测。
+                        cv::Mat f = lease.get()->embed_image(img, 0);
+                        if (!f.empty() && !f.isContinuous()) f = f.clone();
+                        if (!f.empty()) {
+                            feats[j].assign(f.begin<float>(), f.end<float>());
+                            usable.fetch_add(1);
+                        }
+                    }
+                    const size_t d = done.fetch_add(1) + 1;
+                    if (d % 500 == 0) {
+                        const double s = std::chrono::duration<double>(
+                                             std::chrono::steady_clock::now() - t0).count();
+                        std::cerr << "  " << d << "/" << jobs.size() << "  "
+                                  << static_cast<long>(s) << "s" << std::endl;
+                    }
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+    }
+
+    // 按身份切分：只用**有可用脸**的照片，注册侧与留出侧不相交。
+    std::vector<facerec::EvalPerson> people(ids.size());
+    for (size_t k = 0; k < ids.size(); ++k) people[k].name = ids[k];
+    for (size_t j = 0; j < jobs.size(); ++j) {
+        if (feats[j].empty()) continue;
+        auto& p = people[jobs[j].who];
+        if (static_cast<int>(p.gallery.size()) < gallery_photos) p.gallery.push_back(feats[j]);
+        else if (static_cast<int>(p.probe.size()) < probe_photos) p.probe.push_back(feats[j]);
+    }
+    size_t dropped = 0;
+    for (auto& p : people) {
+        if (static_cast<int>(p.gallery.size()) < gallery_photos || p.probe.empty()) {
+            p.gallery.clear();
+            p.probe.clear();
+            ++dropped;
+        }
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    std::cerr << "embedded in " << std::chrono::duration<double>(t1 - t0).count()
+              << "s; usable faces " << usable.load() << "/" << jobs.size()
+              << ", identities dropped " << dropped << std::endl;
+
+    // 扫描点里带上当前默认阈值：运维要看得见“线上这个值落在表的哪一行”。
+    // float 0.45 转 double 是 0.449999988，与扫描点的 0.45 不是同一个数：不吸附就会在表
+    // 里并排出现两行同义阈值（CSV 里一行印成 0.44999999），读表的人会以为那是两个不同的
+    // 测量。吸附只在本就落在网格上时发生；0.375 这种默认值仍原样进表。
+    std::vector<double> ts;
+    for (int i = 1; i <= 19; ++i) ts.push_back(i * 0.05);   // 累加会漂，乘法不漂
+    const double t_grid = std::round(static_cast<double>(cfg.recogn_thresh) * 20.0) / 20.0;
+    ts.push_back(std::fabs(t_grid - cfg.recogn_thresh) < 1e-4 ? t_grid
+                                                              : static_cast<double>(cfg.recogn_thresh));
+    std::sort(ts.begin(), ts.end());
+    ts.erase(std::unique(ts.begin(), ts.end()), ts.end());
+
+    const facerec::EvalReport rep = facerec::evaluate_dataset(people, ts);
+    std::cout << rep.to_text(rep.persons);
+    std::cout << "\ncurrent default recognize.thresh = "
+              << facerec::format_float(cfg.recogn_thresh, 4) << "\n";
+    for (const auto& r : rep.rows) {
+        if (std::abs(r.thresh - cfg.recogn_thresh) < 1e-9) {
+            std::printf("  at that threshold: FAR 1:1=%.6f  FRR 1:1=%.6f  "
+                        "FAR 1:N=%.6f  FRR 1:N=%.6f\n",
+                        r.far_11, r.frr_11, r.far_1n, r.frr_1n);
+        }
+    }
+    if (total_ids > ids.size()) {
+        std::cout << "note: sampled " << ids.size() << " of " << total_ids
+                  << " eligible identities (seed " << seed << ")\n";
+    }
+    if (!csv_path.empty()) {
+        std::ofstream out(csv_path);
+        if (!out) { std::cerr << "cannot write csv: " << csv_path << std::endl; return 1; }
+        out << rep.to_csv(rep.persons);
+        std::cerr << "csv: " << csv_path << std::endl;
+    }
+    return 0;
+}
+
+int cmd_compare(int argc, char* argv[]) {
+    std::string img_a, img_b;
+    ConfigArgs cfg_args;
+    bool dump_only = false;
+    bool show_help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--dump-config") {
+            dump_only = true;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else if (arg.rfind("-", 0) != 0) {
+            if (img_a.empty()) img_a = arg;
+            else if (img_b.empty()) img_b = arg;
+            else {
+                std::cerr << "compare: unexpected extra argument: " << arg << std::endl;
+                return -1;
+            }
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) { compare_usage(); return 0; }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+
+    if (dump_only) {
+        dump_config(std::cout, cfg);
+        return 0;
+    }
+
+    if (img_a.empty() || img_b.empty()) {
+        std::cerr << "compare requires two image paths" << std::endl;
+        compare_usage();
+        return -1;
+    }
+
+    if (!check_assets(cfg)) return -1;
+
+    try {
+        facerec::Pipeline pipeline(cfg);
+        cv::Mat a = cv::imread(img_a, cv::IMREAD_COLOR);
+        cv::Mat b = cv::imread(img_b, cv::IMREAD_COLOR);
+        if (a.empty()) {
+            std::cout << facerec::error_to_json("cannot read image: " + img_a, "bad_image")
+                      << std::endl;
+            return 2;
+        }
+        if (b.empty()) {
+            std::cout << facerec::error_to_json("cannot read image: " + img_b, "bad_image")
+                      << std::endl;
+            return 2;
+        }
+
+        cv::Mat fa = pipeline.embed_image(a, 0);
+        cv::Mat fb = pipeline.embed_image(b, 0);
+        if (fa.empty() || fb.empty()) {
+            std::cout << facerec::error_to_json(
+                "no face detected in one of the images", "no_face") << std::endl;
+            return 2;
+        }
+
+        const double dot = fa.dot(fb);
+        const double na = cv::norm(fa);
+        const double nb = cv::norm(fb);
+        const double cos = (na > 0 && nb > 0) ? dot / (na * nb) : 0.0;
+
+        std::cout << "{\"status\":\"ok\",\"cosine\":" << facerec::format_float(cos, 6)
+                  << ",\"image_a\":\"" << facerec::json_escape(img_a) << "\","
+                  << "\"image_b\":\"" << facerec::json_escape(img_b) << "\"}"
+                  << std::endl;
+        return 0;
+    } catch (const cv::Exception& e) {
+        std::cout << facerec::error_to_json(e.what(), "pipeline_error") << std::endl;
+        return 3;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// verify <img> --name <person>：图中最优人脸是否属于指定身份
+// ---------------------------------------------------------------------------
+
+void verify_usage() {
+    std::cout
+        << "Usage: facerec verify <img> --name <person> [options]\n"
+        << "\nOptions:\n"
+        << "  --name <person>           要验证的身份（必填）\n"
+        << "  --config <path>           配置文件\n"
+        << "  --set key=value           覆盖单个配置项，可重复\n"
+        << "  --dump-config             打印生效配置并退出\n"
+        << "Output (always JSON, whatever the exit code):\n"
+        << "  {\"status\":\"ok\",\"verified\":true,\"cosine\":0.95,\"matched\":\"BruceLi\",\n"
+        << "   \"person\":\"BruceLi\",\"threshold\":0.20}\n"
+        << "Exit: 0 verified | 1 NOT verified (valid answer) | 2 cannot answer (no face /\n"
+        << "      unreadable) | 3 pipeline error. Non-zero on \"no\" is deliberate: an auth\n"
+        << "      check that always exits 0 makes every script that forgets to parse the\n"
+        << "      JSON pass silently.\n"
+        << "The face compared is the most confident one (identify's faces[0]), not the largest.\n";
+}
+
+int cmd_verify(int argc, char* argv[]) {
+    std::string img_path;
+    std::string person;
+    ConfigArgs cfg_args;
+    bool dump_only = false;
+    bool show_help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--name" || arg.rfind("--name=", 0) == 0) {
+            person = (arg == "--name") ? ((i + 1 < argc) ? argv[++i] : std::string())
+                                       : arg.substr(7);
+        } else if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+            if (!parse_config_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--set" || arg.rfind("--set=", 0) == 0) {
+            if (!parse_set_arg(arg, i, argc, argv, cfg_args)) return -1;
+        } else if (arg == "--dump-config") {
+            dump_only = true;
+        } else if (arg == "-h" || arg == "--help") {
+            show_help = true;
+        } else if (arg.rfind("-", 0) != 0) {
+            img_path = arg;
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return -1;
+        }
+    }
+
+    if (show_help) { verify_usage(); return 0; }
+
+    PipelineConfig cfg;
+    if (!load_pipeline_config(cfg_args, cfg)) return -1;
+
+    if (dump_only) {
+        dump_config(std::cout, cfg);
+        return 0;
+    }
+
+    if (img_path.empty()) {
+        std::cerr << "verify requires an image path" << std::endl;
+        verify_usage();
+        return -1;
+    }
+    if (person.empty()) {
+        std::cerr << "verify requires --name <person>" << std::endl;
+        verify_usage();
+        return -1;
+    }
+
+    if (!check_assets(cfg)) return -1;
+
+    try {
+        facerec::Pipeline pipeline(cfg);
+        cv::Mat img = cv::imread(img_path, cv::IMREAD_COLOR);
+        if (img.empty()) {
+            std::cout << facerec::error_to_json("cannot read image: " + img_path, "bad_image")
+                      << std::endl;
+            return 2;
+        }
+
+        cv::Mat feat = pipeline.embed_image(img, 0);
+        if (feat.empty()) {
+            std::cout << facerec::error_to_json("no face detected in the image", "no_face")
+                      << std::endl;
+            return 2;
+        }
+
+        float score = 0.0f;
+        std::string name;
+        // best_match 在低于阈值时返回 false，但 score/name 仍写最像的那位 ——
+        // “最像谁，但不够像”必须能解释，所以 threshold 一起输出。
+        const bool above_thresh =
+            pipeline.best_match(feat, cfg.recogn_thresh, score, name);
+
+        const bool verified = above_thresh && name == person;
+        std::cout << "{\"status\":\"ok\",\"verified\":" << (verified ? "true" : "false")
+                  << ",\"cosine\":" << facerec::format_float(score, 6)
+                  << ",\"matched\":\"" << facerec::json_escape(name) << "\","
+                  << "\"person\":\"" << facerec::json_escape(person) << "\","
+                  << "\"threshold\":" << facerec::format_float(cfg.recogn_thresh, 4) << ","
+                  << "\"image\":\"" << facerec::json_escape(img_path) << "\"}"
+                  << std::endl;
+        // “不”是一个合法答案，但退出码不能装作成功：见 verify_usage。
+        return verified ? 0 : 1;
+    } catch (const cv::Exception& e) {
+        std::cout << facerec::error_to_json(e.what(), "pipeline_error") << std::endl;
+        return 3;
+    }
+}
