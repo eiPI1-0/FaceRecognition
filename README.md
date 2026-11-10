@@ -1,10 +1,21 @@
-# FaceRecognition — real-time face detection + recognition in C++
+# FaceRecognition — a lightweight, high-concurrency face recognition server in C++
 
-**Face recognition you can audit.** One binary, one dependency (OpenCV 4's `dnn`), no dlib / ncnn
-/ TensorFlow / PyTorch runtime, no GPU required. What is unusual about it is not the accuracy —
-it is that every number in this file names the dataset, the gallery size and the threshold it was
-measured at, and most of the properties below are enforced by a build target, a startup check or
-an endpoint instead of by prose.
+**Lightweight. High concurrency. Accurate at a stated operating point. MCP-native.** All on CPU,
+with one dependency (OpenCV's `dnn`) — no dlib, no ncnn, no TensorFlow / PyTorch / ONNX Runtime.
+
+| | Measured on this machine (16-core x86_64, CPU only, OpenCV 4.13.0, `-O3`) |
+|---|---|
+| **Lightweight** | **1.3 MiB** of our own code, **8.1 MiB** of weights (YuNet 0.33 + MobileFaceNet 7.8), **5.7 ms** for one face in one frame (detect 0.93 + align/embed 4.47 + letterbox 0.27), **112 MB** RSS at 4 workers. No GPU, no model runtime, no Python at runtime. The *linked* closure is OpenCV's, not ours: 298 shared objects on this distro, almost all of them FFmpeg/GStreamer I/O that a `core`/`imgproc`/`dnn`-only OpenCV build does not pull in. |
+| **High concurrency** | p50 **74 ms** at 4 workers (≈135 req/s), ≈193 req/s at 8, and **1347 req/s** on repeated requests through the SHA-256 result cache. One pipeline per worker *is* the backpressure: overload answers `503 + Retry-After` inside a single end-to-end budget instead of queueing without bound. |
+| **Accurate, at an operating point you choose** | **1.3%** false accepts against a 610-person gallery at `recognize.thresh = 0.45` (at the previous default `0.2`: **99.7%** — the reason it changed), 3.0% at 1680 identities; 1:1 EER at threshold ≈ 0.18 / rate ≈ 4.1%. Held-out photos, the production code path. |
+| **MCP-native** | `./main mcp` serves JSON-RPC 2.0 tools over stdio or HTTP — four read-only tools with JSON Schemas, in-process so a tool call costs one forward pass rather than a cold model load. Enrollment is deliberately **not** exposed to a prompt-injectable caller. |
+
+The accuracy belongs to the models. What this repository adds is that the number is **real**:
+5-point similarity alignment onto the ArcFace template, letterboxed preprocessing shared by
+registration and inference, and a threshold picked from held-out photos rather than from a 1:1
+separability harness (the two differ by two orders of magnitude at 1:N). Every figure above names
+its dataset, its gallery size and its threshold, and every property below is backed by a build
+target, a startup check or an endpoint — not by prose.
 
 ```
 camera frame ──▶ YuNet detector ──▶ 5-point similarity alignment ──▶ MobileFaceNet
@@ -18,8 +29,6 @@ camera frame ──▶ YuNet detector ──▶ 5-point similarity alignment ─
 Prior-box decoding, NMS, alignment, the tracker, the matcher, the HTTP server and the MCP server
 are all written here: **55 files / 8.7k lines of C++17**, and every layer boundary is also a
 CMake target — the build graph is the architecture, not a description of it.
-
----
 
 ## Properties, and what enforces each one
 
