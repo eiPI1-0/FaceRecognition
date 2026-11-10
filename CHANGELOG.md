@@ -8,6 +8,15 @@ than a strict versioning scheme.
 
 ### Changed
 
+- **README is a front page again; the detail moved to `docs/`.** 1095 lines → **351**, and eight deep
+  dives (~1.0k lines): `interfaces` (flags + exit-code contracts), `serving` (endpoints, cache, the
+  capacity budget and the measured shedding comparison, auth/audit, `/metrics`, `deploy/`), `mcp`,
+  `models` (pins, hashes, what a swap can silently change), `configuration` (precedence, bad-input
+  behaviour, `paths.root`, registration and the gallery index, the knobs table), `evaluation` (the
+  1:1 vs 1:N arithmetic and both LFW runs), `architecture` (layers, traps, validation), `limitations`.
+  Moved **verbatim** — the only edits were 3 cross-file anchor rewrites and the drop of the old
+  Contents table; README gained a Documentation index and one-screen summaries of everything it no
+  longer carries.
 - **README leads with the four claims, then proves them.** A claim table —
   **lightweight** (1.3 MiB of our own code, 8.1 MiB of weights, 5.7 ms per face in a frame,
   112 MB RSS at 4 workers, and the honest note that the 298-library linked closure belongs to
