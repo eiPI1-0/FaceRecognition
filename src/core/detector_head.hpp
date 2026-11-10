@@ -10,6 +10,10 @@
 
 #include "opencv2/core.hpp"
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 // YuNet 家族的不同导出把检测结果放在不同的张量布局里，解码方式因此不同。
 // 头类型从模型自己的输出层名推断（见 make_detector_head），不需要用户配置；
 // 认不出来时抛异常并列出图的输出名，而不是静默返回 0 张脸。
@@ -38,5 +42,8 @@ public:
 std::unique_ptr<DetectorHead> make_detector_head(const std::vector<cv::String>& layer_names,
                                                  cv::Size input_shape,
                                                  const std::vector<cv::String>& fused_names);
+
+
+}  // namespace facerec
 
 #endif

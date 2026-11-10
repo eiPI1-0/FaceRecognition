@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 namespace {
 
 // 融合头：单个 loc/conf/iou，先验网格由 PriorBox 生成。
@@ -190,3 +194,6 @@ std::unique_ptr<DetectorHead> make_detector_head(const std::vector<cv::String>& 
              " " + fused_names[0] + "/" + fused_names[1] + "/" + fused_names[2] +
              ", or per-level cls_<s>/obj_<s>/bbox_<s>/kps_<s>; the model exposes:" + names);
 }
+
+}  // namespace facerec
+

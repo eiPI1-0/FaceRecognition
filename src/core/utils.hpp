@@ -7,6 +7,10 @@
 #include "core/face_def.hpp"
 #include "opencv2/opencv.hpp"
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 void nms(std::vector<Face>& dets,
          const float thresh = 0.3);
 
@@ -21,5 +25,8 @@ void draw(cv::Mat& img,
           const std::vector<Face>& faces,
 	  const int rfactor = 5,
           const std::vector<char>* measured = nullptr);
+
+
+}  // namespace facerec
 
 #endif

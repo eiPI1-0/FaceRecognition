@@ -5,6 +5,10 @@
 
 #include "opencv2/opencv.hpp"
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 // center: [x, y], width: w, height: h
 typedef struct BndBox_xywh {
     cv::Point2f center;
@@ -39,5 +43,8 @@ typedef struct Face {
     Landmarks_5 landmarks;
     float score;
 } Face;
+
+
+}  // namespace facerec
 
 #endif 

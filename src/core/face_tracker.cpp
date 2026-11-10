@@ -5,6 +5,10 @@
 #include <cstddef>
 #include <tuple>
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 FaceTracker::FaceTracker(const TrackerParams& params) : p_(params) {
     p_.detect_every = std::max(1, p_.detect_every);
     p_.max_lost     = std::max(1, p_.max_lost);
@@ -238,3 +242,6 @@ void FaceTracker::update(const cv::Size& frame, const std::vector<Face>& dets) {
     prune(frame);
     build_views();
 }
+
+}  // namespace facerec
+

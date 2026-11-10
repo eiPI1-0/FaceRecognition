@@ -12,6 +12,9 @@
 #include <string>
 #include <vector>
 
+// .cpp 里用 using-directive（头文件里绝不）：内核在 `facerec::`，见 RFPLAN §6.1。
+using namespace facerec;
+
 using namespace cli;   // 实现文件内引入，不污染任何头文件
 
 int cmd_serve(int argc, char* argv[]) {

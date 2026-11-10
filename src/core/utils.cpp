@@ -1,6 +1,10 @@
 #include "core/utils.hpp"
 #include <cmath>
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 void nms(std::vector<Face>& dets,
          const float thresh) {
     std::sort(dets.begin(), dets.end(), [](const Face& a, const Face& b) { return a.score > b.score; });
@@ -116,3 +120,6 @@ cv::Mat letterbox(const cv::Mat& img, const cv::Size& size, const cv::Scalar& bo
                        cv::BORDER_CONSTANT, border);
     return out;
 }
+
+}  // namespace facerec
+

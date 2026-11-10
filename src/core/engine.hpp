@@ -12,6 +12,10 @@
 
 #include "opencv2/opencv.hpp"
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 // ---------------------------------------------------------------------------
 // 库层推理内核（engine）。无 GUI、无 config.hpp 依赖、无跨请求可变状态。
 // 不同线程/进程应各自持有一份 Detector + FeatureExtractor 实例。
@@ -139,5 +143,8 @@ bool features_from_img(const cv::Mat& img, Detector& detector,
                        const cv::Size& display_shape, int rfactor);
 
 std::vector<std::string> list_person_dirs(const std::string& path);
+
+
+}  // namespace facerec
 
 #endif // FACERECOGNITION_ENGINE_HPP

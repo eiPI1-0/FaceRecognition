@@ -21,6 +21,9 @@
 #include "core/face_def.hpp"
 #include "core/face_tracker.hpp"
 
+// .cpp 里用 using-directive（头文件里绝不）：内核在 `facerec::`，见 RFPLAN §6.1。
+using namespace facerec;
+
 namespace {
 
 int g_failures = 0;

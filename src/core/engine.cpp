@@ -12,6 +12,10 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 // ---------------------------------------------------------------------------
 // Detector
 // ---------------------------------------------------------------------------
@@ -422,3 +426,6 @@ bool CosSimilarity::feature_fusion(std::vector<cv::Mat>& features, cv::Mat& feat
     cv::normalize(feature, feature);
     return true;
 }
+
+}  // namespace facerec
+

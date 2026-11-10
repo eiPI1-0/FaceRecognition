@@ -9,6 +9,7 @@
 
 #include "app/config.hpp"
 
+
 namespace cli {
 
 // data/<person>/ 的目录名同时就是索引里的 person_id，所以它必须是单个安全的路径分量：

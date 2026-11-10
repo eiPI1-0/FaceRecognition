@@ -7,6 +7,10 @@
 #include <algorithm>
 #include "core/face_def.hpp"
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 class PriorBox {
 private:
     const std::vector<std::vector<float>> min_sizes = {
@@ -34,5 +38,8 @@ public:
     // 只读 priors/尺寸，故为 const（策略层里 PriorBox 被 const 持有）。
     std::vector<Face> decode(const cv::Mat& loc, const cv::Mat& conf, const cv::Mat& iou, const float ignore_score=0.3) const;
 };
+
+
+}  // namespace facerec
 
 #endif

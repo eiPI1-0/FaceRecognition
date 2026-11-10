@@ -17,6 +17,9 @@
 #include "serve/admission.hpp"
 #include "common/metrics.hpp"
 
+// .cpp 里用 using-directive（头文件里绝不）：内核在 `facerec::`，见 RFPLAN §6.1。
+using namespace facerec;
+
 namespace {
 
 int g_failures = 0;

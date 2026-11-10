@@ -5,6 +5,10 @@
 #include "core/face_def.hpp"
 #include "opencv2/opencv.hpp"
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 // 跟踪器交给应用的一帧视图：几何 + 跨帧稳定 ID + 本帧是否有检测支撑。
 //
 // measured=false 表示这一帧没有匹配到任何检测，框和关键点都是按速度外推的。
@@ -84,5 +88,8 @@ private:
     int next_id_ = 0;
     int frame_count_ = 0;
 };
+
+
+}  // namespace facerec
 
 #endif // FACE_TRACKER_HPP

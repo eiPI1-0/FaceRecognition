@@ -2,6 +2,10 @@
 
 #include <string>
 
+// 整个内核在一个命名空间里：`facerec::` 以上是库的边界，
+// 也是 `api` 往上早就在用的那个名字（见 RFPLAN §6.1）。
+namespace facerec {
+
 PriorBox::PriorBox(const cv::Size& input_shape,
                    const cv::Size& output_shape) {
     // initialize
@@ -170,3 +174,5 @@ std::vector<Face> PriorBox::decode(const cv::Mat& loc,
 
     return dets;
 }
+
+}  // namespace facerec
