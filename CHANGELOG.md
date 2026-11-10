@@ -4,6 +4,23 @@ Notable changes to this repository. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses release tags rather
 than a strict versioning scheme.
 
+## Unreleased
+
+### Changed
+
+- **README leads with the contract, not the file tree.** A "Properties, and what enforces each
+  one" table (ten properties, each naming the test, startup check or endpoint behind it), a
+  Numbers section split into pipeline cost / HTTP / recognition quality / build-and-checks with
+  the dataset-and-gallery caveat on every accuracy figure, a "What this project deliberately does
+  not do" list (no TLS terminator, no CUDA promise, no encryption at rest for templates, no
+  enrollment over MCP, no accuracy claim beyond the measured corpora, no CI), and a Contents
+  table. All the existing detail is unchanged underneath. Two claims were corrected against the
+  code while writing it: `/readyz` answers `far_1n_estimate` / `far_1n_resolution` (not
+  `self_far_1n`), and an unknown config key is a *warning + nearest-name suggestion* in a file
+  but a *hard stop* from `--set`.
+
+---
+
 ## v1.3.0 — 2026-11-10 — measured thresholds, one source root, one namespace
 
 ### Added
