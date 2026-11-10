@@ -1,7 +1,10 @@
 # FaceRecognition — real-time face detection + recognition in C++
 
-Real-time face **detection and recognition** built on the **OpenCV DNN module only** —
-no dlib, no ncnn, no TensorFlow/PyTorch runtime. One dependency, one binary.
+**Face recognition you can audit.** One binary, one dependency (OpenCV 4's `dnn`), no dlib / ncnn
+/ TensorFlow / PyTorch runtime, no GPU required. What is unusual about it is not the accuracy —
+it is that every number in this file names the dataset, the gallery size and the threshold it was
+measured at, and most of the properties below are enforced by a build target, a startup check or
+an endpoint instead of by prose.
 
 ```
 camera frame ──▶ YuNet detector ──▶ 5-point similarity alignment ──▶ MobileFaceNet
@@ -12,9 +15,80 @@ camera frame ──▶ YuNet detector ──▶ 5-point similarity alignment ─
                                     cosine similarity vs. per-person fused feature
 ```
 
-Everything — including prior-box decoding, NMS and face alignment — is implemented in
-this repository, so the whole pipeline is inspectable and portable to any platform that
-builds OpenCV.
+Prior-box decoding, NMS, alignment, the tracker, the matcher, the HTTP server and the MCP server
+are all written here: **55 files / 8.7k lines of C++17**, and every layer boundary is also a
+CMake target — the build graph is the architecture, not a description of it.
+
+---
+
+## Properties, and what enforces each one
+
+| Property | Enforced by |
+|---|---|
+| A `matched` answer is a statement about **your** gallery, not a bare cosine. At startup, `serve`/`mcp` compute what the configured threshold does to *the gallery they loaded* and log a warning when it is too loose; `/readyz` answers the same numbers. | `check_recognize_threshold` (`src/app/api.cpp`) → startup audit line + `/readyz` (`self_far_1n`, `far_1n_resolution`) |
+| Accuracy claims come from photos the gallery never saw. | `./main evaluate <dataset>` (first N photos enrolled, next M held out); the report's own figures are asserted in `tests/evaluation.cpp` |
+| A `nan` score or a phantom box cannot reach a client, even though the pinned YuNet export computes 6 of its 1076 anchors unreliably. | two load-bearing gates in `PriorBox::decode` (a score gate written so NaN *fails* it; a geometry gate, because `iou_score` is clamped and garbage confidence can forge 0.99) — mutation-tested in `tests/decode_gates.cpp` |
+| Overload returns `503 + Retry-After` inside **one** end-to-end budget; it never queues without bound, and health probes are never shed. | one admission budget applied at both waiting points (`src/serve/admission.hpp`, `timed_queue.hpp`), accounting asserted in `tests/admission.cpp` |
+| Predicted boxes are drawn but never recognized: a face the detector did not see this frame cannot acquire a label from an embedding of a guess. | `TrackView::measured` contract; labels cached per track id and overwritten — including "no match" — on every measured frame |
+| The architecture cannot quietly rot back into a tangle. | the `layers` ctest target (`scripts/check_layers.py`) fails on an upward include, on an unqualified project include, or on a `src/**/*.cpp` missing from `CMakeLists.txt`, quoting the offending line |
+| A prompt-injectable caller cannot enroll a biometric template. | MCP exposes four read-only tools; `tools/call enroll_person` answers `-32602 unknown tool` (`src/serve/mcp.cpp`) |
+| Credentials on disk are useless to anyone who reads them. | tokens stored only as SHA-256, compared in constant time, issued from a 32-byte CSPRNG; binding to a non-loopback address with an empty token table **refuses to start** (`src/serve/auth.{hpp,cpp}`, `./main token`) |
+| The audit trail never contains biometrics. | request audit lines carry `method`/`path`/`status`/`ms`/`caller`/`bytes` — never image bytes, embeddings or names — and a `401` is audited even under `--quiet`, with peer and whether a token was presented |
+| Every tunable is declared exactly once. | the `knobs()` table (`src/app/config.cpp`) generates the file parser, `--set`, range validation, `--dump-config` and `config.example.yml`; an unknown key is a hard stop with a nearest-name suggestion |
+
+---
+
+## Numbers
+
+This machine: 16-core x86_64, CPU only, OpenCV 4.13.0, `-O3`. Every figure is reproducible with
+the commands in this file; none of them is a benchmark I ran once and forgot.
+
+| Pipeline cost (per frame / per face) | measured |
+|---|---|
+| detect (YuNet, 160×120) | **0.93 ms** |
+| embed, per face | **4.47 ms** |
+| letterbox onto 960×720 | 0.27 ms |
+
+| HTTP service (one 1.3 MB JPEG, fresh connection per request) | measured |
+|---|---|
+| 4 workers | p50 **74 ms**, ≈135 req/s |
+| 8 workers | p50 100 ms, ≈193 req/s — past here the CPU is the wall |
+| identical requests, result cache on | 205 → **1347 req/s** |
+
+| Recognition quality (LFW deepfunneled, through the production path, held-out photos) | measured |
+|---|---|
+| false accepts at the default `recognize.thresh = 0.45` | **1.3%** against 610 people, 3.0% against 1680 |
+| the same at the old default `0.2` | **99.7%** against 610 people — the reason 0.45 is the default |
+| 1:1 EER | threshold ≈ 0.18, rate ≈ 4.1% |
+
+| Build & checks | measured |
+|---|---|
+| clean build, `-j16` | **23 s** |
+| `ctest` (5 targets) | **0.7 s**, needs no model weights |
+| recompile after editing one subcommand | 1.4 – 1.9 s |
+
+---
+
+## What this project deliberately does not do
+
+- **No TLS and no reverse proxy inside the binary.** `serve` binds `127.0.0.1` by default; terminate TLS in front of it. A single-binary "HTTPS server" is how certificate handling quietly becomes someone's problem.
+- **No CUDA / OpenVINO promise.** The tokens exist and the code path is there, but they need an OpenCV build with those plugins; the OpenCV this project is developed against has neither. CPU is the tested default.
+- **No encryption at rest for templates.** `paths.gallery_index` is plaintext 512-d templates plus names, created `0600`; the mitigation is the file mode and the flag that turns the cache off, not a security claim. Stated in [Limitations](#limitations) rather than hidden.
+- **No enrollment over a network transport.** `enroll` is a local command; the MCP server omits it on purpose, because writing a biometric template is not retractable.
+- **No accuracy claim beyond what is measured here.** `data/` holds two identities — a regression signal, not a benchmark — and the augmentation harness measures 1:1 separability, so it is never used to pick a threshold that a 1:N shell applies.
+- **No CI runner, no linter, no formatter config.** Verification is `make && ctest` plus the hand-run recipes written out in this file, with their numbers, so a reviewer can repeat them instead of trusting them.
+
+---
+
+## Contents
+| Getting started | Reference |
+|---|---|
+| [Requirements](#requirements) | [Configuration](#configuration) — every key, and [model swapping](#swapping-models) |
+| [Build](#build) | [Registration](#registration) — how a person becomes a feature |
+| [Assets you must supply](#assets-you-must-supply-not-in-this-repository) | [Tuning](#tuning) — and [how to choose the threshold](#choosing-the-recognition-threshold-measured-not-chosen) |
+| [Run](#run) — `identify` · `compare` · `serve` · `mcp` · `demo` | [Performance](#performance-this-machine-cpu-single-face) |
+| [Deployment](#deployment) | [Source layout](#source-layout) — layers, traps, validation |
+| [Limitations](#limitations) | [Changes](#changes) · [License](#license) |
 
 ---
 
