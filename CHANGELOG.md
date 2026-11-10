@@ -8,6 +8,24 @@ than a strict versioning scheme.
 
 ### Changed
 
+- **README leads with the four claims, then proves them.** A claim table —
+  **lightweight** (1.3 MiB of our own code, 8.1 MiB of weights, 5.7 ms per face in a frame,
+  112 MB RSS at 4 workers, and the honest note that the 298-library linked closure belongs to
+  OpenCV's I/O backends, not to this code), **high concurrency** (p50 74 ms / ≈135 req/s at 4
+  workers, ≈193 at 8, 1347 req/s through the result cache, `503 + Retry-After` inside one budget),
+  **accurate at a stated operating point** (1.3% false accepts against 610 people at 0.45, 99.7%
+  at the old 0.2, 3.0% at 1680, 1:1 EER ≈ 0.18 / 4.1%, held-out photos on the production path),
+  **MCP-native** (four read-only JSON-Schema tools over stdio or HTTP, one forward pass per call,
+  enrollment withheld from prompt-injectable callers) — followed by a "Properties, and what
+  enforces each one" table, a Numbers section, a "What this project deliberately does not do"
+  list, and a Contents table. All the existing detail is unchanged underneath.
+- **The accuracy claim is scoped, not inflated.** The models supply the accuracy; this repository
+  supplies the operating point: ArcFace-template similarity alignment, letterbox preprocessing
+  shared by registration and inference, and a threshold chosen from held-out photos rather than
+  from a 1:1 separability harness.
+- Two claims were corrected against the code while writing it: `/readyz` answers
+  `far_1n_estimate` / `far_1n_resolution` (not `self_far_1n`), and an unknown config key is a
+  *warning + nearest-name suggestion* in a file but a *hard stop* from `--set`.
 - **README leads with the contract, not the file tree.** A "Properties, and what enforces each
   one" table (ten properties, each naming the test, startup check or endpoint behind it), a
   Numbers section split into pipeline cost / HTTP / recognition quality / build-and-checks with
