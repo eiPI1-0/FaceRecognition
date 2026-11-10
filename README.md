@@ -34,7 +34,7 @@ CMake target — the build graph is the architecture, not a description of it.
 
 | Property | Enforced by |
 |---|---|
-| A `matched` answer is a statement about **your** gallery, not a bare cosine. At startup, `serve`/`mcp` compute what the configured threshold does to *the gallery they loaded* and log a warning when it is too loose; `/readyz` answers the same numbers. | `check_recognize_threshold` (`src/app/api.cpp`) → startup audit line + `/readyz` (`far_1n_estimate`, `far_1n_resolution`) |
+| A `matched` answer is a statement about **your** gallery, not a bare cosine. At startup, `serve`/`mcp` compute what the configured threshold does to *the gallery they loaded* and log a warning when it is too loose; `/readyz` answers the same numbers. | `check_recognize_threshold` and **one** shared encoder (`recognize_audit_fields`, `src/app/api.cpp`) feeding the startup audit line and `/readyz` — where an unmeasurable tail is `null` with the gallery's certifiable floor next to it, never a bare `0` |
 | Accuracy claims come from photos the gallery never saw. | `./main evaluate <dataset>` (first N photos enrolled, next M held out); the report's own figures are asserted in `tests/evaluation.cpp` |
 | A `nan` score or a phantom box cannot reach a client, even though the pinned YuNet export computes 6 of its 1076 anchors unreliably. | two load-bearing gates in `PriorBox::decode` (a score gate written so NaN *fails* it; a geometry gate, because `iou_score` is clamped and garbage confidence can forge 0.99) — mutation-tested in `tests/decode_gates.cpp` |
 | Overload returns `503 + Retry-After` inside **one** end-to-end budget; it never queues without bound, and health probes are never shed. | one admission budget applied at both waiting points (`src/serve/admission.hpp`, `timed_queue.hpp`), accounting asserted in `tests/admission.cpp` |
@@ -287,7 +287,8 @@ false-accept rate is a property of the gallery, not of the pair: `1 − (1−p)^
 
 Measured on LFW (deepfunneled) through the production path on **held-out** photos, reproducible with
 `./main evaluate <dataset>`. `serve` and `mcp` recompute the estimate for *the gallery they loaded*
-at startup and answer it at `/readyz` (`far_1n_estimate`, `far_1n_resolution`) — because a false
+at startup and answer it at `/readyz` (`far_1n_estimate`, `far_1n_resolution`, `far_1n_above` /
+`far_1n_pairs`) — a tail this gallery cannot measure comes back as `null`, not `0.0` — because a false
 accept raises no error, returns no 503 and adds no latency spike: it looks exactly like success.
 The arithmetic, both LFW runs and why a 1:1 number (EER, the augmentation harness) must never be
 used to pick a threshold a 1:N shell applies: [docs/evaluation.md](docs/evaluation.md).

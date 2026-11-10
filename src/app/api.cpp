@@ -270,6 +270,7 @@ ThresholdCheck check_recognize_threshold(const Gallery& gallery, const PipelineC
     c.threshold = cfg.recogn_thresh;
     c.est = gallery.self_estimate(static_cast<double>(cfg.recogn_thresh));
     c.estimable = c.est.gallery >= 2 && c.est.pairs > 0;
+    c.certifiable = c.estimable && c.est.above > 0;
     if (c.est.pairs)
         // 与 est.far_1n 用同一个 n（=库大小），两个数才能直接比。
         c.far_1n_resolution = one_n_far_from_pair_rate(1.0 / static_cast<double>(c.est.pairs),
@@ -323,6 +324,21 @@ ThresholdCheck check_recognize_threshold(const Gallery& gallery, const PipelineC
     }
     c.human = buf;
     return c;
+}
+
+std::string recognize_audit_fields(const ThresholdCheck& c, const char* thresh_key) {
+    std::ostringstream os;
+    os << "\"" << thresh_key << "\":" << format_float(c.threshold, 4)
+       << ",\"gallery_persons\":" << c.est.gallery
+       // 不可证就不是 0。null + 分辨率 + 原始计数，读的人才能自己算上界；一个光溜的
+       // 0.000000 只能诱出一种误读（库里只有 2 人时尤其常见）。
+       << ",\"far_1n_estimate\":"
+       << (c.certifiable ? format_float(c.est.far_1n, 6) : std::string("null"))
+       << ",\"far_1n_resolution\":"
+       << (c.estimable ? format_float(c.far_1n_resolution, 6) : std::string("null"))
+       << ",\"far_1n_above\":" << c.est.above << ",\"far_1n_pairs\":" << c.est.pairs
+       << ",\"far_1n_certifiable\":" << (c.certifiable ? "true" : "false");
+    return os.str();
 }
 
 // ---------------------------------------------------------------------------

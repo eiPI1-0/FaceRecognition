@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "app/api.hpp"
 #include "app/evaluation.hpp"
 
 // .cpp 里用 using-directive（头文件里绝不）：内核在 `facerec::`，见 RFPLAN §6.1。
@@ -227,6 +228,48 @@ void check_pair_rate_to_one_n() {
     check(facerec::one_n_far_from_pair_rate(1.0, 5) == 1.0, "pair rate 1 -> 1:N rate 1");
 }
 
+// /readyz 与两个 startup 审计行共用的那组字段。为什么值得锁：库里没有一个跨人配对超过
+// 阈值时 est.far_1n 是 0——那不是"测出 0"，是"pairs 个配对里没观察到"。打 0.000000 会
+// 被读成"已证明安全"，与把 0.2 当真是同一个错的另一个方向。evaluate 报告里已经打
+// `unreachable`，端点不能打 0。
+void check_readiness_encoding() {
+    ThresholdCheck c;
+    c.threshold = 0.45f;
+    c.est.gallery = 5; c.est.sampled = 5; c.est.pairs = 10;
+    // check_recognize_threshold 的规则：estimable = gallery>=2 && pairs>0，
+    // certifiable = estimable && above>0。这里按同一规则手填，锁的是**编码**不是算术。
+    c.estimable = true;
+    c.far_1n_resolution = 0.72;
+
+    c.est.above = 0; c.est.pair_rate = 0.0; c.est.far_1n = 0.0; c.certifiable = false;
+    const std::string none = recognize_audit_fields(c, "thresh");
+    check(none.find("\"far_1n_estimate\":null") != std::string::npos,
+          "an unobserved tail is null, never 0.000000");
+    check(none.find("\"far_1n_estimate\":0") == std::string::npos,
+          "no bare zero estimate anywhere in the payload");
+    check(none.find("\"far_1n_resolution\":0.720000") != std::string::npos &&
+              none.find("\"far_1n_above\":0") != std::string::npos &&
+              none.find("\"far_1n_pairs\":10") != std::string::npos,
+          "the certifiable floor and the raw counts ride along, so a reader can bound it");
+    check(none.find("\"far_1n_certifiable\":false") != std::string::npos,
+          "the payload says the estimate is not certifiable");
+
+    c.est.above = 3; c.est.pair_rate = 0.05; c.est.far_1n = 0.4013; c.certifiable = true;
+    const std::string some = recognize_audit_fields(c, "recognize_thresh");
+    check(some.find("\"far_1n_estimate\":0.401300") != std::string::npos,
+          "an observed tail is a number");
+    check(some.find("\"far_1n_certifiable\":true") != std::string::npos,
+          "and it is labelled certifiable");
+    check(some.find("\"recognize_thresh\":0.4500") != std::string::npos &&
+              none.find("\"thresh\":0.4500") != std::string::npos,
+          "one encoder serves both the nested /readyz key and the flat audit key");
+
+    // 库不足两人：没有配对，分辨率本身也无意义——不能掉出一个假 0.0。
+    ThresholdCheck empty;
+    check(recognize_audit_fields(empty).find("\"far_1n_resolution\":null") != std::string::npos,
+          "no pairs -> resolution is null too");
+}
+
 }  // namespace
 
 int main() {
@@ -240,6 +283,8 @@ int main() {
     check_independence_model();
     std::printf("pair rate -> 1:N rate (the startup self-check's arithmetic)\n");
     check_pair_rate_to_one_n();
+    std::printf("readiness / startup fields (never a bare 0 for an unmeasured tail)\n");
+    check_readiness_encoding();
 
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;

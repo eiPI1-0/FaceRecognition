@@ -24,7 +24,7 @@ curl -X POST -H 'Content-Type: application/json' \
 | `POST /v1/embed` | 512-d embedding of one face (`face_index`, default 0) |
 | `POST /v1/compare` | `{"a":[...],"b":[...]}` → cosine |
 | `GET /v1/people` | enrolled person ids (never embeddings or photos) |
-| `GET /healthz` / `GET /readyz` | liveness / readiness (`/readyz` also reports cache hits/misses) |
+| `GET /healthz` / `GET /readyz` | liveness / readiness. `/readyz` also reports cache hits/misses and the threshold block — `far_1n_estimate` is `null` when this gallery cannot measure the tail, with `far_1n_resolution` and the `above`/`pairs` counts next to it ([evaluation.md](evaluation.md)) |
 
 `/v1/identify` accepts a request-level detector size — more pixels through the detector for
 group photos and distant faces:

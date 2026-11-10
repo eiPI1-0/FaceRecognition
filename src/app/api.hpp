@@ -133,11 +133,23 @@ struct ThresholdCheck {
     // 这个库能证的**最小** 1:N 误接受率（把一个配对算进去时的值）。far_1n 低于它
     // 就只是"没观察到"，不是"已证明"。
     double far_1n_resolution = 0.0;
+    // far_1n 是不是一个**测量值**：库里观察到过至少一个 >= 阈值的跨人配对才算。
+    // above == 0 时 far_1n == 0 不代表"安全"，只代表 pairs 个配对里没观察到，能证的
+    // 下限是 far_1n_resolution。打印方必须能把这两种 0 分开——0.000000 会被读成
+    // "已证明安全"，那和把 0.2 当真是同一个错误，只是方向相反。
+    bool certifiable = false;
     std::string human;             // 一行话（banner / stderr）
     std::string fields;            // log.event 的 fields（对象成员列表）
 };
 
 ThresholdCheck check_recognize_threshold(const Gallery& gallery, const PipelineConfig& cfg);
+
+// "阈值 + 库规模"这组字段的唯一一种编码：/readyz、serve 的 startup 审计行、mcp 的
+// startup 审计行共用它（三处手写列表的结局一定是其中一处过时，而 /readyz 是唯一
+// 能在事后回答"当时那个库上这个阈值意味着什么"的地方）。
+// far_1n 不可证时打 **null**，并附上分辨率与原始计数（above/pairs），让消费者自己
+// 算上界；thresh_key 让 /readyz 的嵌套块与审计行的顶层键各自自然。
+std::string recognize_audit_fields(const ThresholdCheck& c, const char* thresh_key = "recognize_thresh");
 
 // ---------------------------------------------------------------------------
 // JSON 序列化（stdout / HTTP 响应共用一份，避免两个外壳输出不一致）

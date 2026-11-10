@@ -375,11 +375,10 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
            // 阈值与库规模必须同屏：它们是一对，分开看就会误读（0.45 在 2 人库与
            // 2000 人库不是同一个安全级别）。指纹则让"滚动重启窗口里两个实例的库
            // 不一致"变成可观测的事，而不是事后猜。
-           << ",\"recognize\":{\"thresh\":" << format_float(cfg.recogn_thresh, 4)
-           << ",\"gallery_persons\":" << thresh.est.gallery
-           << ",\"far_1n_estimate\":" << format_float(thresh.est.far_1n, 6)
-           // 与 estimate 同屏：0 只有在高于这个分辨率时才是信息。
-           << ",\"far_1n_resolution\":" << format_float(thresh.far_1n_resolution, 6)
+           // 这组字段的编码在 app 层的一个函数里，与两个 startup 审计行共用同一份；
+           // 不可证的尾概率打 null，分辨率与 above/pairs 同屏给出（0 只有在高于
+           // 分辨率时才是信息）。手写三份列表的后果一定是一份过时。
+           << ",\"recognize\":{" << recognize_audit_fields(thresh, "thresh")
            << ",\"gallery_fingerprint\":\"" << json_escape(pool.fingerprint()) << "\"}}";
         set_json(res, 200, os.str());
     });
@@ -558,9 +557,10 @@ int run_server(const PipelineConfig& cfg, const ServerOptions& opt) {
     {
         std::ostringstream os;
         os << "\"host\":\"" << json_escape(opt.host) << "\",\"port\":"
-           << opt.port << ",\"workers\":" << workers << ",\"persons\":" << pool.gallery_size()
-           << ",\"recognize_thresh\":" << format_float(cfg.recogn_thresh, 4)
-           << ",\"far_1n_estimate\":" << format_float(thresh.est.far_1n, 6)
+           << opt.port << ",\"workers\":" << workers
+           // gallery_persons 由 recognize_audit_fields 给；这里再写一份 persons 就是
+           // 同一个数两个名字，迟早对不上。
+           << "," << recognize_audit_fields(thresh)
            << ",\"gallery_fingerprint\":\"" << json_escape(pool.fingerprint())
            << "\",\"detector\":\"" << json_escape(cfg.detector_model)
            << "\",\"embedder\":\"" << json_escape(cfg.embedder_model)

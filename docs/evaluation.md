@@ -75,8 +75,15 @@ Enroll more people, or run './main evaluate <dataset>' for a tighter number.
 
 `serve` logs it as a `threshold_check` event (WARN once the estimate reaches
 `recognize.self_far_warn`, default 0.01), prints it in its banner, and answers it at
-`/readyz` (`recognize.far_1n_estimate`, `far_1n_resolution`, `gallery_persons`,
-`gallery_fingerprint`); `mcp` logs the same event and prints the same sentence to **stderr** in
+`/readyz` (`recognize.thresh`, `gallery_persons`, `far_1n_estimate`, `far_1n_resolution`,
+`far_1n_above`, `far_1n_pairs`, `far_1n_certifiable`, `gallery_fingerprint`).
+When no cross-person pair in the gallery crossed the threshold, **`far_1n_estimate` is `null`,
+not `0.0`** — "not observed among N pairs" is not "does not happen", and a bare zero gets read
+as *proven safe*, which is the mirror image of the mistake that made `0.2` the default.
+`far_1n_resolution` is that gallery's certifiable floor, and `far_1n_above` / `far_1n_pairs` let
+a consumer bound the tail itself. `serve`'s and `mcp`'s `startup` audit lines carry the same
+fields, encoded by one function (`recognize_audit_fields` in `src/app/api.cpp`) so the endpoint
+and the log cannot drift apart; `tests/evaluation.cpp` pins both shapes. `mcp` logs the same event and prints the same sentence to **stderr** in
 both transports (stdout is the protocol channel). `identify` deliberately stays silent: it is one
 shot per process, so it would pay the estimate's matmul on every call and bury a caller's JSON in
 prose — read `/readyz` or a server banner instead.

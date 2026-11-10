@@ -579,14 +579,14 @@ int run_mcp(const PipelineConfig& cfg, const McpOptions& opt) {
     {
         std::ostringstream os;
         os << "\"op\":\"startup\",\"transport\":\""
-           << (opt.transport == McpTransport::Http ? "http" : "stdio") << "\",\"persons\":"
-           << pool.gallery_size() << ",\"gallery_fingerprint\":\""
+           << (opt.transport == McpTransport::Http ? "http" : "stdio") << "\""
+           << ",\"gallery_fingerprint\":\""
            << json_escape(pool.fingerprint()) << "\",\"auth\":\""
            << (access.tokens.empty() ? "off"
                                      : std::to_string(access.tokens.size()) + " token(s)")
            << "\""
-           << ",\"recognize_thresh\":" << format_float(cfg.recogn_thresh, 4)
-           << ",\"far_1n_estimate\":" << format_float(thresh.est.far_1n, 6);
+           // 与 /readyz 同一份字段编码（app 层一个函数）：不可证的尾概率打 null。
+           << "," << recognize_audit_fields(thresh);
         access.log.audit("startup", os.str());
     }
     return opt.transport == McpTransport::Http ? serve_http(pool, opt, cache, access)

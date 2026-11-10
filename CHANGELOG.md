@@ -46,6 +46,23 @@ than a strict versioning scheme.
   `self_far_1n`), and an unknown config key is a *warning + nearest-name suggestion* in a file
   but a *hard stop* from `--set`.
 
+### Fixed
+
+- **`/readyz` no longer answers `0.000000` for a 1:N tail it never observed.** Against a 2-person
+  gallery it reported `far_1n_estimate: 0.0` — which reads as *proven safe*, the mirror image of the
+  mistake that made `0.2` the default (99.7% false accepts at 610 people). It now answers `null`,
+  with `far_1n_resolution` (that gallery's certifiable floor), `far_1n_above` / `far_1n_pairs` and
+  `far_1n_certifiable: false` alongside, so a consumer can bound the tail itself. `evaluate` already
+  printed `unreachable` for this case; the endpoint was the last place that still printed a zero.
+- **One encoder for those fields** (`recognize_audit_fields`, `src/app/api.cpp`) now feeds all three
+  print sites — `/readyz`, `serve`'s `startup` audit line, `mcp`'s `startup` audit line — instead of
+  three hand-written lists that would eventually disagree. `persons` was dropped from the two audit
+  lines because the shared encoder carries `gallery_persons`: the same number under two names in one
+  line is drift waiting to happen. `tests/evaluation.cpp` gained 8 assertions pinning both shapes
+  (unobserved → `null` + floor + counts; observed → a number) and the empty-gallery case (resolution
+  is `null` too, not a fabricated `0.0`). Live check: `/readyz` and both shells' `startup` lines
+  parse as JSON and carry identical far_1n fields.
+
 ---
 
 ## v1.3.0 — 2026-11-10 — measured thresholds, one source root, one namespace
