@@ -3,8 +3,10 @@
 > **这份文档的用途**：上下文被压缩、或换一个会话接手时，**从这里接着做**。
 > 诊断、取舍、文件映射、CMake 草案、验证配方、进度台账都在这里；不要重新论证方案。
 >
-> **状态**：`P0 完成（只记录基线）` → 下一步 **P1.1**。
-> **基线**：git `7d7d27f`（v1.2.0 之后），写就本文件时工作树干净，`ctest` 4/4 绿。
+> **状态**：**本计划已完成并定版 `v1.3.0`**（P1 `acc6903` → P3.5 `0f0959a`，逐条见 §10 台账）。
+> 下一步：无。P4+ 的四条候选在 §12，**未列入本计划**，每条都带"为什么现在不做"——要动就另开小计划。
+> **基线**：git `7d7d27f`（v1.2.0 之后）。重构后实测：`ctest` 5/5（0.71 s，无需权重）、
+> clean build **22.74 s**（基线 32.86 s）、改一个子命令重编 1.4-1.9 s（基线 11.55 s）。
 >
 > **铁律**：每个 Phase 结束必须满足
 > 1) `make && ctest` 全绿（P1 起是 5 个测试，含 `layers`）；
@@ -23,7 +25,7 @@
 把所有编译单元收进**一个源码根** `src/`，用**目录表达层**、用**构建图表达依赖**、
 用**ctest 断言规则**；根目录只剩构建文件、公开文档、配置示例和四个目录。
 
-**状态：已达成**（P1 `acc6903` / P2 `a6e3ce7` / P3.1 `9536f3f` / P3.2 `c6338e9` / P3.4 本次提交）。
+**状态：已达成**（P1 `acc6903` / P2 `a6e3ce7` / P3.1 `9536f3f` / P3.2 `c6338e9` / P3.4 `a021182` / P3.5 `0f0959a` / docs `b3e78ca`）。
 P4+ 的候选在 §12，**未列入本计划**——要做就先开新的小计划，别顺手做大动作。
 
 ---
@@ -795,15 +797,15 @@ git revert --no-commit <P3 的 commit>     # 只退命名空间
 | P1.4 | `scripts/check_layers.py` + ctest `layers`（§4.6） | ✅ 21 sources ok；三类负例已实测会失败 | `acc6903` |
 | P1.5 | 文档同步（README/AGENTS/PLAN/CHANGELOG，§4.7） | ✅ README 分层表 + AGENTS 新增 Layout 节 + PLAN §7/§14 + CHANGELOG 一条 | `acc6903` |
 | P1.6 | 验证 §7 → commit | ✅ ctest 5/5 0.73 s；clean build 30.10 s（基线 32.86 s）；identify 1.000/0.0226；blank→`faces:[]` rc0；`./main 1` rc255；dump==example；serve 200×3 + 日志行全 parse；mcp stdio 4 工具 | `acc6903` |
-| P2.1 | 抽 `cli/args.{hpp,cpp}`（§5.2） | ✅ `ConfigArgs` + 6 个 helper；`parse_queue_arg` 是模板，**定义必须留在 .hpp** | 本次提交 |
-| P2.2 | 8 个子命令一文件 + usage/`is_image_path` 归位（§5.1） | ✅ 八个命令文件 + `args.cpp` + `demo.cpp`；每个命令保留自己的 `*_usage()`，`is_image_path` 归 identify | 本次提交 |
-| P2.3 | 同上 | ✅ 全部搬过去（main.cpp 442 → **97 行**）。**偏离 §5.3**：`print_usage` 留在入口，理由写进 main.cpp 与 cli.hpp——命令名单就是入口的 `if/else`，拆到 `cli/` 必有一个说谎。`sanitize_person_name` 从 compare 块挪到 `args.cpp`（它是 enroll 的输入校验，不是比较逻辑） | 本次提交 |
-| P2.4 | 验证 §7 → commit | ✅ ctest 5/5 0.73 s；八个 `--help` 的 diff 只有 include 块；identify 1.000 / blank `faces:[]`；enroll dry-run；token；compare+verify rc0；demo rc255 + Xvfb 下窗口停住（rc124）；dump==example；serve 三探针 200 + 日志行全 parse；mcp stdio 4 工具；clean build 29.83 s | 本次提交 |
-| P3.1 | `core` 进 `namespace facerec` + 消费方限定（§6.1） | ✅ 11 个 core 文件全包进去；消费方只加 6 个 `using namespace facerec;`（`cli/*.cpp`+`tests/*.cpp`）；`args.cpp` 当时不加（无 core 依赖）——**P3.4 之后要加**，见 P3.4 行；内容不缩进，与 api.cpp 一致 | 本次提交 |
-| P3.2 | `auth.hpp` 前向声明 / `auth.cpp` 自己 include（§6.2） | ✅ 全局作用域 `namespace httplib { class Server; }`（写进 `facerec` 会编过、链接才炸）；`<httplib.h>` 现在只在 6 个文件里 | 本次提交 |
-| P3.3 | 验证 + 编译耗时对比（§6.3/§7.6） → commit | ✅ `token.cpp` **7.98 → 0.92 s**；`cli/serve` 8.68 / `cli/mcp` 8.64 / `serve/server` 9.90 不变（真的构造 Server）；clean build 29.83 → 29.02 s；ctest 5/5；鉴权路径重测全对（401/401/200 + `caller=p1` + 非 loopback rc=255） | 本次提交 |
-| P3.5 | 删掉 `cli/{serve,mcp}.cpp` 里**vestigial** 的 `#include <httplib.h>`（两个文件都不用一个 `httplib::` 名字） | ✅ `cli/serve.cpp` 8.68 → **1.40 s**、`cli/mcp.cpp` 8.64 → **1.38 s**；clean build 29.02 → **22.74 s**；`<httplib.h>` 只剩 `serve/{auth.cpp,timed_queue.hpp,server.cpp,mcp.cpp}` 四处 | 本次提交 |
-| P3.4 | `src/app/config.{hpp,cpp}` 进 `facerec`（库里最后一个全局公开头） | ✅ `cli/args.hpp` 必须写 `facerec::PipelineConfig`（头文件不写 using-directive）；`cli/args.cpp` 反过来**要**加 using——与 P3.1 那行「args.cpp 不加」相反，已在那行就地更正 | 本次提交 |
+| P2.1 | 抽 `cli/args.{hpp,cpp}`（§5.2） | ✅ `ConfigArgs` + 6 个 helper；`parse_queue_arg` 是模板，**定义必须留在 .hpp** | `a6e3ce7` |
+| P2.2 | 8 个子命令一文件 + usage/`is_image_path` 归位（§5.1） | ✅ 八个命令文件 + `args.cpp` + `demo.cpp`；每个命令保留自己的 `*_usage()`，`is_image_path` 归 identify | `a6e3ce7` |
+| P2.3 | 同上 | ✅ 全部搬过去（main.cpp 442 → **97 行**）。**偏离 §5.3**：`print_usage` 留在入口，理由写进 main.cpp 与 cli.hpp——命令名单就是入口的 `if/else`，拆到 `cli/` 必有一个说谎。`sanitize_person_name` 从 compare 块挪到 `args.cpp`（它是 enroll 的输入校验，不是比较逻辑） | `a6e3ce7` |
+| P2.4 | 验证 §7 → commit | ✅ ctest 5/5 0.73 s；八个 `--help` 的 diff 只有 include 块；identify 1.000 / blank `faces:[]`；enroll dry-run；token；compare+verify rc0；demo rc255 + Xvfb 下窗口停住（rc124）；dump==example；serve 三探针 200 + 日志行全 parse；mcp stdio 4 工具；clean build 29.83 s | `a6e3ce7` |
+| P3.1 | `core` 进 `namespace facerec` + 消费方限定（§6.1） | ✅ 11 个 core 文件全包进去；消费方只加 6 个 `using namespace facerec;`（`cli/*.cpp`+`tests/*.cpp`）；`args.cpp` 当时不加（无 core 依赖）——**P3.4 之后要加**，见 P3.4 行；内容不缩进，与 api.cpp 一致 | `9536f3f` |
+| P3.2 | `auth.hpp` 前向声明 / `auth.cpp` 自己 include（§6.2） | ✅ 全局作用域 `namespace httplib { class Server; }`（写进 `facerec` 会编过、链接才炸）；`<httplib.h>` 现在只在 6 个文件里 | `c6338e9` |
+| P3.3 | 验证 + 编译耗时对比（§6.3/§7.6） → commit | ✅ `token.cpp` **7.98 → 0.92 s**；`cli/serve` 8.68 / `cli/mcp` 8.64 / `serve/server` 9.90 不变（真的构造 Server）；clean build 29.83 → 29.02 s；ctest 5/5；鉴权路径重测全对（401/401/200 + `caller=p1` + 非 loopback rc=255） | `c6338e9` |
+| P3.4 | `src/app/config.{hpp,cpp}` 进 `facerec`（库里最后一个全局公开头） | ✅ `cli/args.hpp` 必须写 `facerec::PipelineConfig`（头文件不写 using-directive）；`cli/args.cpp` 反过来**要**加 using——与 P3.1 那行「args.cpp 不加」相反，已在那行就地更正 | `a021182` |
+| P3.5 | 删掉 `cli/{serve,mcp}.cpp` 里**vestigial** 的 `#include <httplib.h>`（两个文件都不用一个 `httplib::` 名字） | ✅ `cli/serve.cpp` 8.68 → **1.40 s**、`cli/mcp.cpp` 8.64 → **1.38 s**；clean build 29.02 → **22.74 s**；`<httplib.h>` 只剩 `serve/{auth.cpp,timed_queue.hpp,server.cpp,mcp.cpp}` 四处 | `0f0959a` |
 
 **恢复协议**（新会话/压缩后第一件事）：
 
