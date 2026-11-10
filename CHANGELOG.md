@@ -72,7 +72,7 @@ than a strict versioning scheme.
   and every stderr line still parses as JSON, `mcp --transport stdio` lists the same four tools, and
   `--dump-config` is byte-identical to `config.example.yml`.
 
-- **`cli` is now one file per subcommand.** `src/cli/cli.cpp` (635 lines, one 11.55 s translation
+- **`cli` is now one file per subcommand.** `src/cli/cli.cpp` (1266 lines, one 11.55 s translation
   unit) is replaced by `src/cli/args.{hpp,cpp}` (the config plumbing every command shares) and one
   file per command — `identify` `enroll` `token` `serve` `mcp` `compare` `verify` `evaluate` — plus
   `src/cli/demo.{hpp,cpp}` for the live window loop, which also absorbed `run_pipeline` and
@@ -95,8 +95,11 @@ than a strict versioning scheme.
   `namespace facerec`; only the global-scope files (`cli/*.cpp`, `tests/*.cpp`) gained a
   using-directive. Measured effect of the httplib change: `src/cli/token.cpp`, which only uses the
   token table, compiles in **0.92 s instead of 7.98 s**, and `<httplib.h>` is now included by exactly
-  six files, all of which use HTTP. Removing a transitive include bit once: `token.cpp` had been
-  getting `<fstream>` through httplib.
+  four files, all under `src/serve/`, because two `#include <httplib.h>` lines in `cli/serve.cpp` and
+  `cli/mcp.cpp` turned out to be vestigial (neither file names an `httplib::` symbol). That alone took
+  those two translation units from 8.7 s to **1.4 s** each and the clean build from 29.0 s to
+  **22.7 s**. Removing a transitive include bit once: `token.cpp` had been getting `<fstream>`
+  through httplib.
 
 ### Fixed
 

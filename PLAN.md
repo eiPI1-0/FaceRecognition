@@ -869,7 +869,7 @@ common(0) < core(1) < app(2) < serve(3) < cli(4) < src/main.cpp(5)
   `face_tracker.cpp` / `metrics.cpp` / `evaluation.cpp` 在 CMake 里各列 3 遍）；ctest 5/5（0.74 s），`identify` 自匹配 1.0 / 交叉 0.0226，`serve` 的 `/healthz`+`/readyz`+`/metrics`
   全 200 且 stderr 每行 `json.loads` 通过，`mcp --transport stdio` 四个工具在，
   `--dump-config` 与 `config.example.yml` 逐字节一致。
-- **P2（已落地，一个 commit）**：`src/cli/cli.cpp`（**635** 行，单 TU `-O3` 编译 11.55 s）按 RFPLAN §5.1
+- **P2（已落地，一个 commit）**：`src/cli/cli.cpp`（**1266** 行，单 TU `-O3` 编译 11.55 s）按 RFPLAN §5.1
   拆成 `cli/args.{hpp,cpp}` + 每个子命令一个文件 + `cli/demo.{hpp,cpp}`；`src/main.cpp` 442 → **97 行**。
   `cmd_*` 的名字与签名不变，所以分发表不动。`run_pipeline` / `recognize_frame` / `Recognizer` /
   `FrameOut` / `make_dnn_config` 一起搬进 `demo.cpp`（全仓库唯一的 `cv::imshow` 在那里）。
@@ -885,6 +885,15 @@ common(0) < core(1) < app(2) < serve(3) < cli(4) < src/main.cpp(5)
     `app/` 与 `serve/` 本来就在 `facerec` 里 → 自动解析；`cli/*.cpp` 与 `tests/*.cpp` 加
     `using namespace facerec;`（**只有 .cpp**；`args.cpp` 不加，它没有 core 依赖，空 using 会掩盖真实依赖）。
     命名空间内容不缩进，与既有 `api.cpp` 风格一致（缩进会把 diff 变成 1000 行噪音）。
+  - **P3.5** `cli/{serve,mcp}.cpp` 里两个**vestigial** 的 `#include <httplib.h>` 删掉（两个文件一个
+    `httplib::` 名字都不用；那是 P1 机械转换时留下的）。`cli/serve.cpp` 8.68 → **1.40 s**、
+    `cli/mcp.cpp` 8.64 → **1.38 s**，clean build 29.02 → **22.74 s**；`<httplib.h>` 只剩
+    `serve/{auth.cpp,timed_queue.hpp,server.cpp,mcp.cpp}`——cli 层彻底不碰 HTTP 库。
+  - **P3.4**（补做的半步）`src/app/config.{hpp,cpp}` 进 `namespace facerec`——它是库里最后一个还在全局
+    作用域的公开头。代价立刻现形：`src/cli/args.hpp` 在 `namespace cli` 里（全局链），必须写
+    `facerec::PipelineConfig`（**头文件永远不写 using-directive**）；`cli/args.cpp` 反而需要加
+    `using namespace facerec;`（它整份文件都在摆弄 `PipelineConfig`/`Knob`），与 P3.1 时「args.cpp 不加」
+    的说法相反——那条已经在这三处文档里更正。
   - **P3.2** `auth.hpp` 改为全局作用域前向声明 `namespace httplib { class Server; }`，
     `auth.cpp` 自己 include。`<httplib.h>` 现在只出现在 6 个文件里：`serve/{auth.cpp,timed_queue.hpp,server.cpp,mcp.cpp}`
     与 `cli/{serve,mcp}.cpp` —— 都是合法使用 HTTP 的地方。
