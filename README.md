@@ -89,8 +89,6 @@ the commands in this file; none of them is a benchmark I ran once and forgot.
 
 ---
 
----
-
 ## Documentation
 
 The front of this file is the pitch and the evidence. Each deep dive lives in `docs/` and is
@@ -111,7 +109,7 @@ written to the same standard: every claim names the measurement behind it.
 
 ## Quick start
 
-## Requirements
+### Requirements
 
 | | |
 |---|---|
@@ -129,7 +127,7 @@ Verified build + run environment: **openSUSE Leap 16.0**, OpenCV 4.13.0 (system
 
 ---
 
-## Build
+### Build
 
 ```sh
 git clone https://github.com/eiPI1-0/FaceRecognition
@@ -156,21 +154,19 @@ pasteable hint about the working directory. Pins, hashes and what a swap may cha
 
 ## The interfaces
 
-Six commands, one binary — `demo` is the original interactive window, the rest are for scripts, services and LLM tool calls.
-
-The binary is a multi-command tool. `demo` is the original interactive window; the other
-commands are for scripting, services and LLM tool use.
+Six commands, one binary — `demo` is the original interactive window, the rest are for scripts,
+services and LLM tool calls.
 
 ```sh
-./main identify --image <path> [options]     # one image, JSON on stdout
-./main enroll   --name <person> [--dry-run|--yes] <photo> ...
-./main serve    [--host H] [--port P] [--workers N]    # HTTP service
-./main demo     <source> [cpu|cuda|openvino] [batch|nobatch]
-./main mcp    [--transport stdio|http] [--port P]    # MCP tools for LLM clients
-./main compare  <img-a> <img-b>                      # cosine between two images' faces
-./main verify   <img> --name <person>                # is this image this person?
-./main evaluate <dataset> [--gallery-photos N] [--probe-photos N] [--csv out.csv]
-                                         # FAR/FRR + EER at 1:1 and 1:N — picks the threshold
+./main identify --image <path> [options]                     # one image in, JSON out
+./main enroll   --name <person> [--dry-run|--yes] <photo>…   # add a person, validated first
+./main serve    [--host H] [--port P] [--workers N]          # HTTP service
+./main mcp      [--transport stdio|http] [--port P]          # MCP tools for LLM clients
+./main compare  <img-a> <img-b>                              # cosine between two images' faces
+./main verify   <img> --name <person>                        # is this image this person?
+./main evaluate <dataset> [--gallery-photos N] [--probe-photos N]
+                                                           # FAR/FRR + EER at 1:1 and 1:N
+./main demo     <source> [cpu|cuda|openvino] [batch|nobatch] # the interactive window
 ```
 
 `./main <source>` without a command is still treated as `./main demo <source>`, so older
@@ -227,6 +223,17 @@ open door. Endpoints, cache, auth, audit, metrics, `deploy/`: [docs/serving.md](
 must not be reachable from a prompt-injectable caller (`tools/call enroll_person` → `-32602`).
 The tool description the model actually reads states that `"matched": null` means *unknown*.
 [docs/mcp.md](docs/mcp.md).
+
+### enroll — local only, and validated before it writes
+
+```sh
+./main enroll --name BruceLi --dry-run a.jpg b.jpg   # validate, write nothing (the default)
+./main enroll --name BruceLi --yes a.jpg b.jpg       # copy the usable photos into data/BruceLi/
+```
+
+Only photos containing a usable face are copied, an existing file is never clobbered (`_1` suffix),
+and `--name` is restricted to one safe path component. **Enrollment has no network transport** —
+neither `serve` nor `mcp` can do it — because writing a biometric template is the irreversible act.
 
 ### compare / verify / demo
 
