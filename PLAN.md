@@ -880,11 +880,24 @@ common(0) < core(1) < app(2) < serve(3) < cli(4) < src/main.cpp(5)
   行为逐字节不变：八个 `--help` 的 diff 只有 include 块增删；`identify` 1.00 / blank `faces=[]` /
   demo `rc=255` / `--dump-config` 往返 / `serve` 三探针 200 + stderr 每行可 `json.loads` /
   `mcp` 四工具 / Xvfb 下 demo 窗口停住（`rc=124`）。
-- **P3（待做，两个独立小 commit）**：`core` 进 `namespace facerec`；`auth.hpp` 停止 include
-  `<httplib.h>`（把传输类型从鉴权接口里赶出去）。两条各自可验证，见 RFPLAN §6。
-  **P2 的实测给 P3.2 降了温**：重 TU 贵在 codegen 不在 parse（token.cpp：front-end 1.68 s /
-  -O0 3.59 s / -O3 7.92 s；`#include <httplib.h>` 单独 `-fsyntax-only` 1.33 s）。所以 P3.2 按
-  **层正确性**做（serve 不该依赖 cli），不要按性能做。
+- **P3（已落地，两个 commit）**：
+  - **P3.1** `src/core/*` 整体进 `namespace facerec`（之前是半个库有名、半个没有）。消费方只动两处：
+    `app/` 与 `serve/` 本来就在 `facerec` 里 → 自动解析；`cli/*.cpp` 与 `tests/*.cpp` 加
+    `using namespace facerec;`（**只有 .cpp**；`args.cpp` 不加，它没有 core 依赖，空 using 会掩盖真实依赖）。
+    命名空间内容不缩进，与既有 `api.cpp` 风格一致（缩进会把 diff 变成 1000 行噪音）。
+  - **P3.2** `auth.hpp` 改为全局作用域前向声明 `namespace httplib { class Server; }`，
+    `auth.cpp` 自己 include。`<httplib.h>` 现在只出现在 6 个文件里：`serve/{auth.cpp,timed_queue.hpp,server.cpp,mcp.cpp}`
+    与 `cli/{serve,mcp}.cpp` —— 都是合法使用 HTTP 的地方。
+  - **更正一条我在 P2 阶段写下的错误结论**：我说过「P3.2 不是性能修，因为 httplib 的 parse 只有
+    1.33 s」。错了。实测 `token.cpp` **7.98 → 0.92 s**（它只调 `TokenTable`，从不碰 HTTP）。
+    `-fsyntax-only` 只测 parse，看不见 inline 模板的语义分析 + codegen——那才是 -O3 下 7 s 的来源。
+    **教训：不要用 `-fsyntax-only` 的数字外推编译耗时。** 保留的好结论：`cli/serve.cpp` 8.68 s、
+    `cli/mcp.cpp` 8.64 s、`serve/server.cpp` 9.90 s 不变（它们真的构造 `Server`），clean build 29.83 → 29.02 s。
+  - 副作用一条：`token.cpp` 原本靠 `<httplib.h>` 传递 `<fstream>`，改完必须自己 include——
+    删传递 include 的普遍陷阱，编译器会抓到。
+  - 验证：ctest 5/5；`identify` 1.000 / 交叉 0.022648 与 P1 逐字符一致；鉴权路径重测——
+    无 token 401 + `WWW-Authenticate: Bearer realm="facerec"`、错 token 401、对 token 200 且
+    审计里 `caller=p1`、`/healthz` 免鉴权 200、`--host 0.0.0.0` 无 token **rc=255** 拒启动。
 
 **守卫的语义**（防止后人"简化"）：`layers` 只保证**编译期** include 方向与 CMake 覆盖，不保证运行时
 依赖；边界靠"`src/` 目录名 ↔ `facerec_*` target 名"对齐来表达，不设第二份真相（没有 boundary.yaml

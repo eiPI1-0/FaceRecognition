@@ -1,5 +1,6 @@
 #include "cli/cli.hpp"
 #include <filesystem>
+#include <fstream>
 #include "cli/args.hpp"
 #include "serve/auth.hpp"
 

@@ -85,6 +85,19 @@ than a strict versioning scheme.
   `src/main.cpp`: the command list *is* the dispatch table there, and splitting them guarantees one
   of the two eventually lies.
 
+- **The recognition core is now in `namespace facerec`**, and `src/serve/auth.hpp` no longer includes
+  `<httplib.h>` — it forward-declares `httplib::Server` at **global** scope (inside `facerec` it would
+  compile and fail only at link time), and `auth.cpp` includes the header, since it defines
+  `install_access_control` and needs the complete type. Before, the library was half named / half
+  global: everything from `api` up was `facerec::`, while `Detector`, `FeatureExtractor`,
+  `Similarity`, `Face`, `PriorBox`, `FaceTracker`, `nms`, `letterbox` and the alignment helpers sat in
+  the global namespace. Consumers needed almost no edits — `app/` and `serve/` were already inside
+  `namespace facerec`; only the global-scope files (`cli/*.cpp`, `tests/*.cpp`) gained a
+  using-directive. Measured effect of the httplib change: `src/cli/token.cpp`, which only uses the
+  token table, compiles in **0.92 s instead of 7.98 s**, and `<httplib.h>` is now included by exactly
+  six files, all of which use HTTP. Removing a transitive include bit once: `token.cpp` had been
+  getting `<fstream>` through httplib.
+
 ### Fixed
 
 - The `recognize.thresh` knob comment asserted the old default "is not a per-pair number… pick

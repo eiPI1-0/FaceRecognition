@@ -1,5 +1,7 @@
 #include "serve/auth.hpp"
 
+#include <httplib.h>   // 这里需要完整类型（auth.hpp 只前向声明）
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>

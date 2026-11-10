@@ -15,7 +15,12 @@
 #include <utility>
 #include <vector>
 
-#include <httplib.h>
+// 只用到 httplib::Server 的**名字**（参数与返回值都是引用/指针），所以前向声明而不是
+// include：这样 `./main token`（只调 TokenTable）不必编译整个 HTTP 库。
+// 注意必须在**全局作用域**写 `namespace httplib { class Server; }`——写进 `facerec` 里
+// 会造出一个假的 `facerec::httplib::Server`，声明能用、链接期才找不到定义。
+// 需要完整类型的是 auth.cpp（它定义 install_access_control）与 server/mcp 那两个外壳。
+namespace httplib { class Server; }
 
 #include "common/log.hpp"
 

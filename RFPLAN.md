@@ -796,9 +796,9 @@ git revert --no-commit <P3 的 commit>     # 只退命名空间
 | P2.2 | 8 个子命令一文件 + usage/`is_image_path` 归位（§5.1） | ✅ 八个命令文件 + `args.cpp` + `demo.cpp`；每个命令保留自己的 `*_usage()`，`is_image_path` 归 identify | 本次提交 |
 | P2.3 | 同上 | ✅ 全部搬过去（main.cpp 445 → **97 行**）。**偏离 §5.3**：`print_usage` 留在入口，理由写进 main.cpp 与 cli.hpp——命令名单就是入口的 `if/else`，拆到 `cli/` 必有一个说谎。`sanitize_person_name` 从 compare 块挪到 `args.cpp`（它是 enroll 的输入校验，不是比较逻辑） | 本次提交 |
 | P2.4 | 验证 §7 → commit | ✅ ctest 5/5 0.73 s；八个 `--help` 的 diff 只有 include 块；identify 1.000 / blank `faces:[]`；enroll dry-run；token；compare+verify rc0；demo rc255 + Xvfb 下窗口停住（rc124）；dump==example；serve 三探针 200 + 日志行全 parse；mcp stdio 4 工具；clean build 29.83 s | 本次提交 |
-| P3.1 | `core` 进 `namespace facerec` + 消费方限定（§6.1） | ⬜ | |
-| P3.2 | `auth.hpp` 前向声明 / `auth.cpp` 自己 include（§6.2） | ⬜ | |
-| P3.3 | 验证 + 编译耗时对比（§6.3/§7.6） → commit | ⬜ | |
+| P3.1 | `core` 进 `namespace facerec` + 消费方限定（§6.1） | ✅ 11 个 core 文件全包进去；消费方只加 6 个 `using namespace facerec;`（`cli/*.cpp`+`tests/*.cpp`）；`args.cpp` **不加**（没有 core 依赖，空 using 会掩盖它）；内容不缩进，与 api.cpp 一致 | 本次提交 |
+| P3.2 | `auth.hpp` 前向声明 / `auth.cpp` 自己 include（§6.2） | ✅ 全局作用域 `namespace httplib { class Server; }`（写进 `facerec` 会编过、链接才炸）；`<httplib.h>` 现在只在 6 个文件里 | 本次提交 |
+| P3.3 | 验证 + 编译耗时对比（§6.3/§7.6） → commit | ✅ `token.cpp` **7.98 → 0.92 s**；`cli/serve` 8.68 / `cli/mcp` 8.64 / `serve/server` 9.90 不变（真的构造 Server）；clean build 29.83 → 29.02 s；ctest 5/5；鉴权路径重测全对（401/401/200 + `caller=p1` + 非 loopback rc=255） | 本次提交 |
 
 **恢复协议**（新会话/压缩后第一件事）：
 
@@ -813,6 +813,21 @@ grep -q 'include <httplib.h>' src/serve/auth.hpp && echo "P3.2 未做"
 
 然后从台账里**第一个 ⬜** 继续；动手前先跑一次 §7.1 确认当前状态是绿的
 （半截状态会编译失败，这本身也是定位信息）。
+
+**P3 的实测与一条更正（2026-08-22）**
+- **我上一条（P2）里的结论是错的，这里更正**：我写「重 TU 贵在 codegen 不在 header 解析，
+  所以 P3.2 不是性能修」——依据是 `#include <httplib.h>` 单独 `-fsyntax-only` 只要 1.33 s。
+  P3.2 落地后实测：`token.cpp` **7.98 → 0.92 s**（它只调 `TokenTable`，从不碰 HTTP）。
+  也就是说 httplib 那 7 s 全在**语义分析 + inline 模板的 codegen**，而 `-fsyntax-only` 恰好看不见这一段。
+  ⇒ 规则：**不要用 `-fsyntax-only` 的数字外推编译耗时**；要测就测 `-O3 -c` 全量。
+- §6.3 当初的预期（token/identify/compare/verify 降到 2-4 s 档）**方向对、幅度保守**：token 实际 0.92 s。
+- 删传递 include 的代价立刻现形：`token.cpp` 原来靠 `<httplib.h>` 传递 `<fstream>`，必须自己 include。
+  这类"隐藏传递依赖"是编译器会抓的，不是静默的——但会一次性炸出好几个，留好耐心。
+- 命名空间包法：不缩进（与 `api.cpp` 一致），否则 diff 里 1000 行纯空白会把真正的改动埋掉。
+- 鉴权必须重测（auth.hpp 是它的头）：无 token 401 + `WWW-Authenticate: Bearer realm="facerec"`；
+  错 token 401；对 token 200 且审计 `"caller":"p1"`；`/healthz` 免鉴权 200；
+  `--host 0.0.0.0` 且无 token → **rc=255** 拒启动。注意 `token` 的提示行里 token 是**截断显示**
+  （`Bearer 77223031...`），脚本要取 `token:` 那一行，取提示行会得到 8 个字符的假 token。
 
 **P2 的实测与发现（2026-08-22）**
 - cli 层单 TU：11.55 → **8.67 s**（serve.cpp）；改一个命令的重编：**1.4-1.9 s**。
