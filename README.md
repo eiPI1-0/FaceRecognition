@@ -845,9 +845,14 @@ common  →  core  →  app  →  serve  →  cli          (src/main.cpp sits on
 | 4 | `src/cli/` | the subcommand shells — one file per command (`identify`, `enroll`, `serve`, `mcp`, `token`, `compare`, `verify`, `evaluate`, plus `demo`), with the plumbing shared by them in `args.{hpp,cpp}` |
 | 5 | `src/main.cpp` | argv → subcommand dispatch, usage text, exit codes (the demo capture loop lives in `src/cli/demo.cpp`) |
 
+Everything in layers 0–3 is in `namespace facerec`; only `src/cli/` and the entry point are
+outside it, and they reach the library through `using namespace facerec;` in a **`.cpp`** —
+headers spell the qualified name (`facerec::PipelineConfig`) because a using-directive in a
+header would export the whole namespace to every includer.
+
 | Path | Role |
 |---|---|
-| `tests/` | `ctest` targets — `decode_gates`, `tracker_scenarios`, `admission`, `evaluation` — plus the `augmentation_ab` harness (needs `models/` and `data/`, so it is not in `ctest`) |
+| `tests/` | `ctest` targets — `decode_gates`, `tracker_scenarios`, `admission`, `evaluation` — plus the `augmentation_ab` harness (needs `models/` and `data/`, so it is not in `ctest`); the fifth target, `layers`, is the script below |
 | `scripts/check_layers.py` | the `layers` test: include direction above, and every `.cpp` under `src/` listed in `CMakeLists.txt` |
 | `third_party/httplib.h` | vendored cpp-httplib v0.15.3 (header-only, pthread only), reached through the `facerec_httplib` INTERFACE target so its two compile-time limits cannot drift per target |
 
@@ -981,7 +986,7 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
   through the augmentation harness, so it is not the default.
 - Five `ctest` targets cover the decode gates, the tracker harness, admission accounting, the
   evaluation report, and the source layout itself (`layers`: include direction plus "every
-  `.cpp` is listed in `CMakeLists.txt`") — all without model weights, in ~0.3 s. There is still no
+  `.cpp` is listed in `CMakeLists.txt`") — all without model weights, in ~0.7 s. There is still no
   CI runner and no lint config, and the accuracy path is exercised only by `./main evaluate`,
   which needs a real dataset and is therefore run by hand.
 
@@ -990,7 +995,7 @@ draw produced 0.848 / −0.068 / 0.916, which is not comparable).
 ## Changes
 
 See [CHANGELOG.md](CHANGELOG.md) for what this revision fixed, added and measured
-(older revisions are in `git log`; releases are tagged, latest `v1.2.0`).
+(older revisions are in `git log`; releases are tagged, latest `v1.3.0`).
 
 ## License
 
